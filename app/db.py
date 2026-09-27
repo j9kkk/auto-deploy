@@ -1,0 +1,315 @@
+"""SQLite persistence layer.
+
+A single connection guarded by a lock is used deliberately: the write volume of
+this service (a handful of rows per deploy) is far below where SQLite contention
+matters, and it keeps the concurrency story trivial to reason about.  WAL mode
+lets the API read run history while a deploy is writing its log rows.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Sequence
+
+from . import config
+
+SCHEMA_VERSION = 1
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version    INTEGER NOT NULL,
+    applied_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    username            TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash       TEXT    NOT NULL,
+    display_name        TEXT    NOT NULL DEFAULT '',
+    is_admin            INTEGER NOT NULL DEFAULT 1,
+    created_at          TEXT    NOT NULL,
+    updated_at          TEXT    NOT NULL,
+    last_login_at       TEXT,
+    password_changed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash   TEXT    NOT NULL UNIQUE,
+    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at   TEXT    NOT NULL,
+    expires_at   TEXT    NOT NULL,
+    last_seen_at TEXT,
+    ip           TEXT    NOT NULL DEFAULT '',
+    user_agent   TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                     TEXT    NOT NULL,
+    description              TEXT    NOT NULL DEFAULT '',
+
+    repo_url                 TEXT    NOT NULL,
+    repo_branch              TEXT    NOT NULL DEFAULT 'main',
+    repo_subdir              TEXT    NOT NULL DEFAULT '',
+    git_depth                INTEGER NOT NULL DEFAULT 1,
+    git_username             TEXT    NOT NULL DEFAULT '',
+    git_token                TEXT    NOT NULL DEFAULT '',
+
+    schedule_type            TEXT    NOT NULL DEFAULT 'interval',
+    schedule_expression      TEXT    NOT NULL DEFAULT '1h',
+    enabled                  INTEGER NOT NULL DEFAULT 1,
+
+    deploy_method            TEXT    NOT NULL DEFAULT 'script',
+    prepare_script           TEXT    NOT NULL DEFAULT '',
+    deploy_script            TEXT    NOT NULL DEFAULT '',
+    rollback_script          TEXT    NOT NULL DEFAULT '',
+    artifact_paths           TEXT    NOT NULL DEFAULT '',
+    target_dir               TEXT    NOT NULL DEFAULT '',
+    keep_releases            INTEGER NOT NULL DEFAULT 5,
+    service_name             TEXT    NOT NULL DEFAULT '',
+    docker_image             TEXT    NOT NULL DEFAULT '',
+    docker_command           TEXT    NOT NULL DEFAULT '',
+    docker_compose_file      TEXT    NOT NULL DEFAULT '',
+    rsync_target             TEXT    NOT NULL DEFAULT '',
+    rsync_options            TEXT    NOT NULL DEFAULT '-az --delete',
+
+    env_vars                 TEXT    NOT NULL DEFAULT '{}',
+    timeout_seconds          INTEGER NOT NULL DEFAULT 1800,
+    notify_webhook           TEXT    NOT NULL DEFAULT '',
+    skip_if_no_changes       INTEGER NOT NULL DEFAULT 1,
+    run_on_create            INTEGER NOT NULL DEFAULT 0,
+
+    created_at               TEXT    NOT NULL,
+    updated_at               TEXT    NOT NULL,
+    next_run_at              TEXT,
+    last_run_at              TEXT,
+    last_run_id              INTEGER,
+    last_status              TEXT    NOT NULL DEFAULT '',
+    run_count                INTEGER NOT NULL DEFAULT 0,
+    success_count            INTEGER NOT NULL DEFAULT 0,
+    failure_count            INTEGER NOT NULL DEFAULT 0,
+    total_duration_ms        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON tasks(enabled, next_run_at);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    task_name           TEXT    NOT NULL DEFAULT '',
+    status              TEXT    NOT NULL DEFAULT 'queued',
+    trigger             TEXT    NOT NULL DEFAULT 'manual',
+    deploy_method       TEXT    NOT NULL DEFAULT '',
+    queued_at           TEXT    NOT NULL,
+    started_at          TEXT,
+    finished_at         TEXT,
+    duration_ms         INTEGER NOT NULL DEFAULT 0,
+    exit_code           INTEGER,
+    commit_before       TEXT    NOT NULL DEFAULT '',
+    commit_after        TEXT    NOT NULL DEFAULT '',
+    commit_message      TEXT    NOT NULL DEFAULT '',
+    commit_author       TEXT    NOT NULL DEFAULT '',
+    commit_time         TEXT    NOT NULL DEFAULT '',
+    branch              TEXT    NOT NULL DEFAULT '',
+    changed_files       INTEGER NOT NULL DEFAULT 0,
+    changes_detected    INTEGER NOT NULL DEFAULT 1,
+    release_dir         TEXT    NOT NULL DEFAULT '',
+    artifact_path       TEXT    NOT NULL DEFAULT '',
+    log_path            TEXT    NOT NULL DEFAULT '',
+    log_bytes           INTEGER NOT NULL DEFAULT 0,
+    error               TEXT    NOT NULL DEFAULT '',
+    cancel_requested    INTEGER NOT NULL DEFAULT 0,
+    pid                 INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+CREATE INDEX IF NOT EXISTS idx_runs_queued ON runs(queued_at);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,
+    actor   TEXT NOT NULL DEFAULT '',
+    action  TEXT NOT NULL,
+    target  TEXT NOT NULL DEFAULT '',
+    detail  TEXT NOT NULL DEFAULT '',
+    ip      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(id DESC);
+"""
+
+
+def _connect(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+class Database:
+    """Thread-safe wrapper around one SQLite connection."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or config.DB_PATH
+        self._lock = threading.RLock()
+        self._conn = _connect(self.path)
+
+    # -- helpers ----------------------------------------------------------
+    @contextmanager
+    def write(self) -> Iterator[sqlite3.Connection]:
+        """Serialise a write transaction."""
+        with self._lock:
+            try:
+                yield self._conn
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        with self._lock:
+            cursor = self._conn.execute(sql, tuple(params))
+            rows = [dict(row) for row in cursor.fetchall()]
+            cursor.close()
+            return rows
+
+    def query_one(self, sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
+        rows = self.query(sql, params)
+        return rows[0] if rows else None
+
+    def scalar(self, sql: str, params: Sequence[Any] = (), default: Any = None) -> Any:
+        row = self.query_one(sql, params)
+        if not row:
+            return default
+        return next(iter(row.values()))
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        """Run a statement, returning ``lastrowid``."""
+        with self.write() as conn:
+            cursor = conn.execute(sql, tuple(params))
+            rowid = cursor.lastrowid
+            cursor.close()
+            return int(rowid or 0)
+
+    def execute_many(self, sql: str, params: Iterable[Sequence[Any]]) -> None:
+        with self.write() as conn:
+            conn.executemany(sql, [tuple(p) for p in params])
+
+    def execute_rowcount(self, sql: str, params: Sequence[Any] = ()) -> int:
+        with self.write() as conn:
+            cursor = conn.execute(sql, tuple(params))
+            count = cursor.rowcount
+            cursor.close()
+            return int(count)
+
+    def commit(self) -> None:
+        with self.write():
+            pass
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # -- schema -----------------------------------------------------------
+    def init_schema(self) -> None:
+        with self.write() as conn:
+            conn.executescript(SCHEMA)
+            current = conn.execute(
+                "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+            if current is None:
+                conn.execute(
+                    "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
+                )
+            else:
+                self._migrate(conn, int(current["version"]))
+
+    def _migrate(self, conn: sqlite3.Connection, current: int) -> None:
+        """Apply additive migrations for databases created by older builds."""
+        if current >= SCHEMA_VERSION:
+            return
+        if current < 1:
+            conn.execute(
+                "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
+            )
+
+    def schema_version(self) -> int:
+        try:
+            return int(self.scalar("SELECT MAX(version) FROM schema_version", default=0) or 0)
+        except sqlite3.Error:
+            return 0
+
+
+# ---------------------------------------------------------------------------
+# Row helpers
+# ---------------------------------------------------------------------------
+
+TASK_JSON_FIELDS = ("env_vars",)
+
+
+def decode_task(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Convert a raw task row into API shape (ints as bools, JSON decoded)."""
+    if row is None:
+        return None
+    task = dict(row)
+    task["enabled"] = bool(task.get("enabled"))
+    task["skip_if_no_changes"] = bool(task.get("skip_if_no_changes"))
+    task["run_on_create"] = bool(task.get("run_on_create"))
+    raw_env = task.get("env_vars") or "{}"
+    try:
+        parsed = json.loads(raw_env)
+        task["env_vars"] = parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        task["env_vars"] = {}
+    task["has_token"] = bool(task.get("git_token"))
+    # Never leak the stored credential; the UI only needs to know one is set.
+    task.pop("git_token", None)
+    return task
+
+
+def decode_run(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    run = dict(row)
+    run["changes_detected"] = bool(run.get("changes_detected"))
+    run["cancel_requested"] = bool(run.get("cancel_requested"))
+    return run
+
+
+def encode_env_vars(env: Any) -> str:
+    if isinstance(env, str):
+        stripped = env.strip()
+        if not stripped:
+            return "{}"
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = _parse_key_value_lines(stripped)
+        env = parsed
+    if not isinstance(env, dict):
+        return "{}"
+    cleaned = {str(k): str(v) for k, v in env.items() if str(k).strip()}
+    return json.dumps(cleaned, ensure_ascii=False, sort_keys=True)
+
+
+def _parse_key_value_lines(text: str) -> dict[str, str]:
+    """Accept ``KEY=value`` lines as a convenience for the UI textarea."""
+    result: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key:
+            result[key] = value.strip()
+    return result
