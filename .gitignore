@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 测试与覆盖率产物
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 运行时数据（数据库、工作副本、发布、日志）
+data/
+
+# 编辑器与操作系统
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/

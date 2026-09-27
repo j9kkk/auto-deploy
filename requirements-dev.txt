@@ -1,0 +1,8 @@
+# 开发与测试依赖（运行服务本身不需要这些）。
+# 安装：.venv/bin/pip install -r requirements-dev.txt
+
+# tests/selfcheck.py 的 API 端到端部分需要 TestClient，它依赖 httpx。
+httpx>=0.27
+
+# 静态检查。
+pyflakes>=3.2

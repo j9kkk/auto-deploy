@@ -1,0 +1,5 @@
+# AutoDeploy runtime dependencies.
+# The service is otherwise pure standard library, so this list stays short.
+fastapi>=0.110,<1.0
+uvicorn>=0.27,<1.0
+python-multipart>=0.0.9
