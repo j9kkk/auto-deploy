@@ -187,7 +187,125 @@ def ensure_dirs() -> None:
 
 
 def workspace_dir(task_id: int) -> Path:
+    """工作目录：按 id 定位（历史行为），新代码请用 :func:`workspace_dir_for_task`。"""
     return WORKSPACES_DIR / f"task-{task_id}"
+
+
+def _sanitize_dirname(name: str) -> str:
+    """把任务名转成文件系统安全的目录名。
+
+    保留中文等 Unicode 字母以便目录可读；只清除路径分隔符、控制字符与
+    各平台保留字符。空结果回退为 'task'。
+    """
+    cleaned_chars: list[str] = []
+    for ch in name:
+        code = ord(ch)
+        if code < 32 or code == 127:  # 控制字符
+            cleaned_chars.append("-")
+        elif ch in '/\\:*?"<>|':  # 跨平台非法/保留字符
+            cleaned_chars.append("-")
+        elif ch == " ":
+            cleaned_chars.append("-")
+        else:
+            cleaned_chars.append(ch)
+    cleaned = "".join(cleaned_chars).strip("-.")
+    # 清洗后只剩标点（或为空）时回退为 'task'，避免产生全符号目录名。
+    if not cleaned or not any(ch.isalnum() for ch in cleaned):
+        return "task"
+    # Windows 保留名（CON/PRN/...）即使带扩展名也非法，统一加前缀规避。
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+    if cleaned.upper() in reserved:
+        cleaned = f"_{cleaned}"
+    return cleaned[:80] or "task"
+
+
+CLAIM_FILE = ".autodeploy-owner"
+
+
+def _claimed_by(directory: Path, task_id: Any) -> bool:
+    """目录内的认领标记是否指向该任务。"""
+    try:
+        return (directory / CLAIM_FILE).read_text(encoding="utf-8").strip() == str(task_id)
+    except OSError:
+        return False
+
+
+def _claim(directory: Path, task_id: Any) -> None:
+    """把目录标记为该任务所有。"""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / CLAIM_FILE).write_text(str(task_id), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def workspace_dir_for_task(task: dict[str, Any]) -> Path:
+    """以「任务名」命名的工作目录；同名冲突时追加任务 id 保证唯一。
+
+    任务创建/首次运行时会通过认领标记（目录内 ``.autodeploy-owner`` 文件）
+    把目录与任务 id 绑定，因此同一任务每次解析结果一致、不同任务目录互不
+    相同，且不受其他任务目录存在与否的影响。
+    """
+    base = _sanitize_dirname(str(task.get("name") or ""))
+    task_id = task.get("id")
+    candidate = WORKSPACES_DIR / base
+    if candidate.exists():
+        if _claimed_by(candidate, task_id):
+            return candidate  # 任务名目录本就属于该任务
+        return WORKSPACES_DIR / f"{base}-{task_id}"
+    # 任务名目录不存在：若旧目录已持有认领标记（从旧布局升级途中），
+    # 任务名可直接用于后续迁移。
+    return candidate
+
+
+def migrate_workspace_to_name(task: dict[str, Any], *, log: Any = None) -> Path:
+    """把 ``task-<id>`` 旧工作目录改名为以任务名命名的新目录。
+
+    返回该任务当前应使用的工作目录。改名是幂等的：旧目录不存在时直接
+    返回既有目录。改名前目标位置若已存在且属于其他任务，则改用带任务
+    id 后缀的目录，绝不覆盖别人的数据。
+    """
+    task_id = int(task.get("id") or 0)
+    old = WORKSPACES_DIR / f"task-{task_id}"
+    base = _sanitize_dirname(str(task.get("name") or ""))
+    candidate = WORKSPACES_DIR / base
+    if old == candidate:
+        return candidate
+    if old.exists():
+        if candidate.exists():
+            if _claimed_by(candidate, task_id):
+                # 任务名目录已是本任务的（此前迁移过）：保留它，
+                # 清掉重复出现的旧目录并返回已认领目录。
+                try:
+                    old.rmdir()
+                except OSError:
+                    pass
+                return candidate
+            # 任务名目录被其他任务占用：改用带 id 后缀的目录名。
+            candidate = WORKSPACES_DIR / f"{base}-{task_id}"
+        try:
+            old.rename(candidate)
+        except OSError:
+            if log:
+                log(f"! 工作目录改名失败，继续使用 {old.name}")
+            return old
+        _claim(candidate, task_id)
+        if log:
+            log(f"工作目录已由 {old.name} 更名为 {candidate.name}")
+        return candidate
+    # 旧目录不存在：从未运行过，或早已迁移。确保认领标记存在——
+    # 首次 clone 前先占住名字；目录被外部删除也能自动重建认领。
+    if not candidate.exists() or not _claimed_by(candidate, task_id):
+        if not candidate.exists():
+            _claim(candidate, task_id)
+            return candidate
+        if _claimed_by(candidate, task_id):
+            return candidate
+    return workspace_dir_for_task(task)
 
 
 def releases_dir(task_id: int) -> Path:

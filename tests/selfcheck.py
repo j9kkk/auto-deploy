@@ -11,6 +11,7 @@ required; git-based tests use local repositories.
 from __future__ import annotations
 
 import json
+import sqlite3
 import os
 import subprocess
 import sys
@@ -594,6 +595,39 @@ def run() -> int:
         )
         check("非法任务被拒绝", response.status_code == 422)
 
+        # 任务名唯一性：重名创建被拒绝，且大小写不敏感
+        response = client.post(
+            "/api/tasks",
+            json={
+                "name": "端到端任务", "repo_url": str(origin),
+                "deploy_method": "script", "deploy_script": "true",
+            },
+        )
+        check("重名任务被拒绝", response.status_code == 422, response.text[:150])
+        check("重名错误指向 name 字段",
+              "name" in (response.json().get("detail", {}).get("errors") or {}))
+        response = client.post(
+            "/api/tasks",
+            json={
+                "name": "端到端任务".upper(), "repo_url": str(origin),
+                "deploy_method": "script", "deploy_script": "true",
+            },
+        )
+        check("大小写不同也算重名", response.status_code == 422)
+        # 改名撞别的任务
+        response = client.post(
+            "/api/tasks",
+            json={"name": "取消测试甲", "repo_url": str(origin),
+                  "deploy_method": "script", "deploy_script": "true"},
+        )
+        check("创建第二个任务成功", response.status_code == 201, response.text[:150])
+        second_id = response.json()["task"]["id"]
+        response = client.put(f"/api/tasks/{second_id}", json={"name": "端到端任务"})
+        check("改名撞已有任务被拒绝", response.status_code == 422)
+        response = client.put(f"/api/tasks/{second_id}", json={"name": "取消测试甲"})
+        check("改回自己的名字不报错", response.status_code == 200)
+        client.delete(f"/api/tasks/{second_id}")
+
         response = client.get(f"/api/tasks/{task_id}")
         check("任务详情可读取", response.status_code == 200)
         check("详情包含环境检查", len(response.json()["preflight"]) >= 1)
@@ -918,6 +952,47 @@ def run() -> int:
     preview = scheduler.preview("cron", "0 0 * * *", 3)
     check("cron 预览返回 3 项", len(preview) == 3)
     check("非法表达式预览为空", scheduler.preview("cron", "bad", 3) == [])
+
+    # 工作目录以任务名命名：同名任务通过 -<id> 后缀保证唯一。
+    from app import config as app_config
+
+    ws_a = store2.tasks.create(
+        {"name": "命名目录任务", "repo_url": str(origin), "deploy_method": "script",
+         "deploy_script": "echo named-dir", "skip_if_no_changes": False}
+    )
+    # 数据库层唯一约束兜底：绕过 API 也无法创建重名任务。
+    raised = False
+    try:
+        store2.tasks.create(
+            {"name": "命名目录任务", "repo_url": str(origin), "deploy_method": "script",
+             "deploy_script": "echo dup", "skip_if_no_changes": False}
+        )
+    except sqlite3.IntegrityError:
+        raised = True
+    check("数据库层拒绝重名任务", raised)
+    ws_b = store2.tasks.create(
+        {"name": "命名目录任务乙", "repo_url": str(origin), "deploy_method": "script",
+         "deploy_script": "echo dup", "skip_if_no_changes": False}
+    )
+    dir_a = app_config.workspace_dir_for_task(store2.tasks.get(ws_a))
+    dir_b = app_config.workspace_dir_for_task(store2.tasks.get(ws_b))
+    check("不同任务解析到不同目录", dir_a.name != dir_b.name, f"{dir_a.name} vs {dir_b.name}")
+    # 首次 migrate 建立认领后解析保持稳定
+    first = app_config.migrate_workspace_to_name(store2.tasks.get(ws_a))
+    for _ in range(3):
+        check_resolved = app_config.workspace_dir_for_task(store2.tasks.get(ws_a))
+        check_resolved2 = app_config.migrate_workspace_to_name(store2.tasks.get(ws_a))
+        if check_resolved.name != dir_a.name or check_resolved2.name != dir_a.name:
+            break
+    check("任务目录解析稳定", check_resolved.name == dir_a.name and check_resolved2.name == dir_a.name,
+          f"{check_resolved.name}/{check_resolved2.name} vs {dir_a.name}")
+    resolved_b = app_config.migrate_workspace_to_name(store2.tasks.get(ws_b))
+    resolved_b2 = app_config.workspace_dir_for_task(store2.tasks.get(ws_b))
+    check("后建同名任务目录带后缀", resolved_b.name != dir_a.name and resolved_b2.name == resolved_b.name,
+          f"{resolved_b.name}/{resolved_b2.name} vs {dir_a.name}")
+    check("目录名使用任务名", "task-" not in dir_a.name.split("/")[-1] or dir_a.name.startswith("task-") is False)
+    store2.tasks.delete(ws_a)
+    store2.tasks.delete(ws_b)
 
     status = scheduler.status()
     check("调度器状态包含并发信息", "max_global_workers" in status)

@@ -318,6 +318,10 @@ def sync_checkout(
     if not git_dir.exists():
         info.is_first_clone = True
         workspace.parent.mkdir(parents=True, exist_ok=True)
+        # 认领标记不属于仓库内容：非 git 目录被清空重克隆时也要保留，
+        # 否则任务名到目录的归属关系会丢失。
+        owner_file = workspace / ".autodeploy-owner"
+        saved_owner = owner_file.read_text(encoding="utf-8") if owner_file.exists() else None
         if workspace.exists() and any(workspace.iterdir()):
             # A leftover directory that is not a checkout would make `git clone`
             # fail, so clear it before cloning.
@@ -345,6 +349,12 @@ def sync_checkout(
             if "Remote branch" in result.output and "not found" in result.output:
                 raise GitError(f"远程分支 {branch!r} 不存在")
             raise GitError(result.error or "git clone 失败")
+        if saved_owner is not None:
+            # 恢复目录认领标记（重克隆把它随旧目录一起清掉了）。
+            try:
+                (workspace / ".autodeploy-owner").write_text(saved_owner, encoding="utf-8")
+            except OSError:
+                pass
         info.result = result
     else:
         info.previous_commit = rev_parse(workspace, "HEAD", env=env, timeout=60)
@@ -379,7 +389,8 @@ def sync_checkout(
                 raise GitError(reset.error or "git reset 失败")
         # Clean untracked files so the next build starts from a known state.
         clean = _run_git(
-            ["clean", "-fdx", "-e", ".autodeploy-cache"],
+            # 排除认领标记与缓存目录，clean 不得删除服务自身的管理文件。
+            ["clean", "-fdx", "-e", ".autodeploy-owner", "-e", ".autodeploy-cache"],
             cwd=workspace,
             env=env,
             timeout=300,

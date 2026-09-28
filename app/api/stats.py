@@ -223,6 +223,9 @@ def cleanup_task_files(
     removed: list[str] = []
     for path in (
         config.workspace_dir(task_id),
+        # 名字目录（带/不带 -id 后缀）一并清理。
+        config.WORKSPACES_DIR / config._sanitize_dirname(str(row.get("name") or "")),
+        config.WORKSPACES_DIR / f"{config._sanitize_dirname(str(row.get('name') or ''))}-{task_id}",
         config.releases_dir(task_id),
         config.artifacts_dir(task_id),
     ):

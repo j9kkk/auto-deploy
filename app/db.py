@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS tasks (
     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
-    name                     TEXT    NOT NULL,
+    name                     TEXT    NOT NULL UNIQUE,
     description              TEXT    NOT NULL DEFAULT '',
 
     repo_url                 TEXT    NOT NULL,
@@ -241,6 +241,94 @@ class Database:
             conn.execute(
                 "INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,)
             )
+        if current < 2:
+            self._migrate_v1_to_v2(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
+            (SCHEMA_VERSION,),
+        )
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        """v2: 任务名唯一约束。
+
+        SQLite 无法直接给已有列加 UNIQUE，只能整表重建。重建前先把重名任务
+        改名为「原名-2」「原名-3」…，保证迁移在任何存量数据上都能成功。
+        """
+        duplicates = conn.execute(
+            """
+            SELECT name, COUNT(*) AS total FROM tasks
+            GROUP BY name COLLATE NOCASE HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for row in duplicates:
+            name = row["name"]
+            tasks = conn.execute(
+                "SELECT id, name FROM tasks WHERE name = ? COLLATE NOCASE ORDER BY id",
+                (name,),
+            ).fetchall()
+            for index, task in enumerate(tasks[1:], start=2):
+                candidate = f"{name}-{index}"
+                suffix = index
+                while conn.execute(
+                    "SELECT 1 FROM tasks WHERE name = ? COLLATE NOCASE", (candidate,)
+                ).fetchone():
+                    suffix += 1
+                    candidate = f"{name}-{suffix}"
+                conn.execute(
+                    "UPDATE tasks SET name = ?, updated_at = datetime('now') WHERE id = ?",
+                    (candidate, task["id"]),
+                )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS tasks_new (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                     TEXT    NOT NULL UNIQUE,
+                description              TEXT    NOT NULL DEFAULT '',
+                repo_url                 TEXT    NOT NULL,
+                repo_branch              TEXT    NOT NULL DEFAULT 'main',
+                repo_subdir              TEXT    NOT NULL DEFAULT '',
+                git_depth                INTEGER NOT NULL DEFAULT 1,
+                git_username             TEXT    NOT NULL DEFAULT '',
+                git_token                TEXT    NOT NULL DEFAULT '',
+                schedule_type            TEXT    NOT NULL DEFAULT 'interval',
+                schedule_expression      TEXT    NOT NULL DEFAULT '1h',
+                enabled                  INTEGER NOT NULL DEFAULT 1,
+                deploy_method            TEXT    NOT NULL DEFAULT 'script',
+                prepare_script           TEXT    NOT NULL DEFAULT '',
+                deploy_script            TEXT    NOT NULL DEFAULT '',
+                rollback_script          TEXT    NOT NULL DEFAULT '',
+                artifact_paths           TEXT    NOT NULL DEFAULT '',
+                target_dir               TEXT    NOT NULL DEFAULT '',
+                keep_releases            INTEGER NOT NULL DEFAULT 5,
+                service_name             TEXT    NOT NULL DEFAULT '',
+                docker_image             TEXT    NOT NULL DEFAULT '',
+                docker_command           TEXT    NOT NULL DEFAULT '',
+                docker_compose_file      TEXT    NOT NULL DEFAULT '',
+                rsync_target             TEXT    NOT NULL DEFAULT '',
+                rsync_options            TEXT    NOT NULL DEFAULT '-az --delete',
+                env_vars                 TEXT    NOT NULL DEFAULT '{}',
+                timeout_seconds          INTEGER NOT NULL DEFAULT 1800,
+                notify_webhook           TEXT    NOT NULL DEFAULT '',
+                skip_if_no_changes       INTEGER NOT NULL DEFAULT 1,
+                run_on_create            INTEGER NOT NULL DEFAULT 0,
+                created_at               TEXT    NOT NULL,
+                updated_at               TEXT    NOT NULL,
+                next_run_at              TEXT,
+                last_run_at              TEXT,
+                last_run_id              INTEGER,
+                last_status              TEXT    NOT NULL DEFAULT '',
+                run_count                INTEGER NOT NULL DEFAULT 0,
+                success_count            INTEGER NOT NULL DEFAULT 0,
+                failure_count            INTEGER NOT NULL DEFAULT 0,
+                total_duration_ms        INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO tasks_new
+                SELECT * FROM tasks;
+            DROP TABLE tasks;
+            ALTER TABLE tasks_new RENAME TO tasks;
+            CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON tasks(enabled, next_run_at);
+            """
+        )
 
     def schema_version(self) -> int:
         try:

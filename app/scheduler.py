@@ -130,7 +130,7 @@ class Scheduler:
         baseline = ""
         try:
             baseline = gitops.current_commit(
-                config.workspace_dir(task_id),
+                config.workspace_dir_for_task(task),
                 token=str(task.get("git_token") or ""),
                 username=str(task.get("git_username") or ""),
             )
@@ -297,21 +297,37 @@ class Scheduler:
         return removed
 
     def _prune_orphan_workspaces(self) -> None:
-        """Remove workspaces whose task no longer exists."""
-        known = {int(task["id"]) for task in self.store.tasks.list_all()}
+        """Remove workspaces whose task no longer exists.
+
+        目录名有两种形态：旧的 ``task-<id>`` 与新的「任务名」（唯一性冲突时
+        带``-<id>``后缀）。任何既匹配不到现存任务、又不能安全判定为现役
+        目录的条目都会被清理。以任务名命名的目录不做模糊匹配，只有当
+        ``workspace_dir_for_task`` 与旧 id 目录都无法对应到现存任务时才删。
+        """
+        tasks = self.store.tasks.list_all()
+        known_ids = {int(task["id"]) for task in tasks}
+        known_dirs = {config.workspace_dir_for_task(task).name for task in tasks}
+        known_dirs |= {f"task-{task_id}" for task_id in known_ids}
         root = config.WORKSPACES_DIR
         if not root.exists():
             return
         for entry in root.iterdir():
-            if not entry.is_dir() or not entry.name.startswith("task-"):
+            if not entry.is_dir():
                 continue
-            try:
-                task_id = int(entry.name.split("-", 1)[1])
-            except (IndexError, ValueError):
+            if entry.name in known_dirs:
                 continue
-            if task_id not in known:
-                cleanup_path(entry)
-                logger.info("已清理孤立工作目录 %s", entry.name)
+            # 旧命名：task-<id>，id 必须是现存任务才是合法目录。
+            if entry.name.startswith("task-"):
+                try:
+                    task_id = int(entry.name.split("-", 1)[1])
+                except (IndexError, ValueError):
+                    task_id = None
+                if task_id in known_ids:
+                    continue
+            # 名字目录可能因改名前残留（同名不同 id 后缀），不匹配现存
+            # 目录名就视为孤儿。
+            cleanup_path(entry)
+            logger.info("已清理孤立工作目录 %s", entry.name)
 
     # -- status ------------------------------------------------------------
     def status(self) -> dict[str, Any]:
@@ -371,16 +387,21 @@ def workspace_summary(store: Store) -> list[dict[str, Any]]:
         except OSError:
             releases = []
         active = current_release(root, link)
+        workspace_path = config.workspace_dir_for_task(task)
+        if not workspace_path.exists():
+            # 名字目录还不存在（尚未运行）时回退显示旧目录，避免统计为 0。
+            legacy = config.workspace_dir(task_id)
+            workspace_path = legacy if legacy.exists() else workspace_path
         rows.append(
             {
                 "task_id": task_id,
                 "name": task.get("name"),
-                "workspace": str(config.workspace_dir(task_id)),
+                "workspace": str(workspace_path),
                 "releases_root": str(root),
                 "releases": len(releases),
                 "current": active.name if active else "",
                 "artifacts": len(list(config.artifacts_dir(task_id).glob("*"))),
-                "workspace_bytes": directory_size(config.workspace_dir(task_id)),
+                "workspace_bytes": directory_size(workspace_path),
                 "artifacts_bytes": directory_size(config.artifacts_dir(task_id)),
             }
         )

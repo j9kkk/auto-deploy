@@ -262,7 +262,8 @@ class DeployRunner:
                 log(f"! {check_result['message']}")
                 raise DeployError(check_result["message"])
 
-        workspace = config.workspace_dir(task_id)
+        # 工作目录以任务名命名；老目录 task-<id> 首次运行时自动改名迁移。
+        workspace = config.migrate_workspace_to_name(task, log=log)
         releases_root, current_link = resolve_release_paths(task)
         artifacts_root = config.artifacts_dir(task_id)
         creds_dir = gitops.temp_credential_dir(config.TMP_DIR / f"task-{task_id}")

@@ -221,6 +221,21 @@ class TaskRepository:
     def get(self, task_id: int) -> dict[str, Any] | None:
         return self.db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))
 
+    def name_taken(self, name: str, *, exclude_id: int | None = None) -> bool:
+        """任务名是否已被占用（大小写不敏感；``exclude_id`` 用于改名场景）。"""
+        if not str(name or "").strip():
+            return False
+        if exclude_id is None:
+            row = self.db.query_one(
+                "SELECT 1 FROM tasks WHERE name = ? COLLATE NOCASE", (str(name),)
+            )
+        else:
+            row = self.db.query_one(
+                "SELECT 1 FROM tasks WHERE name = ? COLLATE NOCASE AND id != ?",
+                (str(name), exclude_id),
+            )
+        return row is not None
+
     def get_decoded(self, task_id: int) -> dict[str, Any] | None:
         return decode_task(self.get(task_id))
 

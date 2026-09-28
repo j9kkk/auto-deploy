@@ -50,8 +50,13 @@ def _decorate(task: dict[str, Any], service: Service) -> dict[str, Any]:
     if runs:
         enriched["last_run"] = runs[0]
     # Report whether the checkout exists so the UI can offer a first run hint.
-    workspace = config.workspace_dir(int(task["id"]))
+    workspace = config.workspace_dir_for_task(task)
+    if not (workspace / ".git").exists():
+        legacy = config.workspace_dir(int(task["id"]))
+        if (legacy / ".git").exists():
+            workspace = legacy
     enriched["workspace_exists"] = (workspace / ".git").exists()
+    enriched["workspace"] = str(workspace)
     enriched["releases_root"], enriched["current_link"] = (
         str(part) for part in resolve_release_paths(task)
     )
@@ -85,6 +90,13 @@ def create_task(
         body = validate_task_payload(payload)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
+
+    # 任务名全局唯一：它同时用作工作目录名与各处展示标识。
+    if service.store.tasks.name_taken(body.get("name", "")):
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "参数校验失败", "errors": {"name": "任务名已被使用，请换一个名称"}},
+        )
 
     task_id = service.store.tasks.create(body)
     service.scheduler.reschedule(task_id)
@@ -150,6 +162,13 @@ def update_task(
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
 
+    # 改名不得与其它任务重名（自己除外）。
+    if "name" in body and service.store.tasks.name_taken(body["name"], exclude_id=task_id):
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "参数校验失败", "errors": {"name": "任务名已被其他任务使用"}},
+        )
+
     if not service.store.tasks.update(task_id, body):
         # Nothing changed, which is not an error.
         pass
@@ -190,6 +209,9 @@ def delete_task(
     if purge:
         targets = [
             config.workspace_dir(task_id),
+            # 名字目录可能带或不带 -id 后缀，两种形态都清理。
+            config.WORKSPACES_DIR / config._sanitize_dirname(str(row.get("name") or "")),
+            config.WORKSPACES_DIR / f"{config._sanitize_dirname(str(row.get('name') or ''))}-{task_id}",
             config.releases_dir(task_id),
             config.artifacts_dir(task_id),
         ]
@@ -344,7 +366,7 @@ def task_preflight(
         "current_target": (
             str(current_release(releases_root, current_link) or "")
         ),
-        "workspace": str(config.workspace_dir(task_id)),
+        "workspace": str(config.workspace_dir_for_task(decode_task(row) or {})),
         "disk": disk_usage(config.DATA_DIR),
         "next_run_at": row.get("next_run_at"),
         "schedule_description": describe_task_schedule(decode_task(row) or {}),
