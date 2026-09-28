@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import config
+from . import __version__ as VERSION
 from .api import auth as auth_routes
 from .api import runs as run_routes
 from .api import settings as settings_routes
@@ -26,9 +27,6 @@ from .api import tasks as task_routes
 from .service import Service
 
 logger = logging.getLogger("autodeploy")
-
-VERSION = "1.0.1"
-
 
 def create_app(service: Service | None = None) -> FastAPI:
     """Build the ASGI application around a ``Service`` instance."""

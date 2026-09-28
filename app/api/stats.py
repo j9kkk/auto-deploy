@@ -10,6 +10,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
+from .. import __version__ as VERSION
 from .. import config
 from ..deployer import METHOD_LABELS, cleanup_path
 from ..runner import STATUS_LABELS
@@ -30,9 +31,6 @@ def health(service: Service = Depends(get_service)) -> dict[str, Any]:
         "time": iso(utcnow()),
         "scheduler_running": service.scheduler.running,
     }
-
-
-VERSION = "1.0.0"
 
 
 @router.get("/dashboard")
