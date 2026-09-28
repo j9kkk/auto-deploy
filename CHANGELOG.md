@@ -50,9 +50,10 @@
 
 ### 变更
 
-- `scripts/install.sh` 安装完成提示中加入 Docker 部署方式的加组说明
-  （`usermod -aG docker`）与卸载命令，避免
-  `permission denied ... /var/run/docker.sock` 报错后才排查。
+- `scripts/install.sh` 安装时自动把服务账号加入 docker 组（Docker 部署方式需要，
+  否则报 `permission denied ... /var/run/docker.sock`）。检测到 docker 未安装时
+  跳过并提示后续步骤；加入失败时降级为警告，不中止安装。加组发生在服务启动前，
+  无需再手工重启。
 
 [1.0.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.0.1
 [1.0.0]: https://github.com/j9kkk/git-deploy/releases/tag/v1.0.0

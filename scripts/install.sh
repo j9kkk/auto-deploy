@@ -64,6 +64,35 @@ EOF
   }
 fi
 
+# Docker 部署方式（docker build / docker compose）需要访问
+# /var/run/docker.sock，该 socket 只允许 root 与 docker 组成员读写。
+# 直接把服务账号加入 docker 组，免去用户装完再手工处理。
+DOCKER_HINT=""
+if command -v docker >/dev/null 2>&1; then
+  if getent group docker >/dev/null 2>&1; then
+    if id -nG "$RUN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+      log "用户 $RUN_USER 已在 docker 组，跳过"
+    else
+      log "将 $RUN_USER 加入 docker 组（Docker 部署方式需要）"
+      usermod -aG docker "$RUN_USER" || {
+        DOCKER_HINT="警告: 加入 docker 组失败，请手工执行: sudo usermod -aG docker $RUN_USER"
+        warn "$DOCKER_HINT"
+      }
+    fi
+  else
+    # docker 命令存在但组不存在（极少数发行版如此），建组后再加。
+    log "创建 docker 组并将 $RUN_USER 加入"
+    groupadd --system docker 2>/dev/null || true
+    usermod -aG docker "$RUN_USER" || {
+      DOCKER_HINT="警告: 加入 docker 组失败，请手工执行: sudo usermod -aG docker $RUN_USER"
+      warn "$DOCKER_HINT"
+    }
+  fi
+else
+  DOCKER_HINT="提示: 未检测到 docker；如以后要用 Docker 部署方式，安装 docker 后执行: sudo usermod -aG docker $RUN_USER && sudo systemctl restart $SERVICE_NAME"
+  log "${DOCKER_HINT}"
+fi
+
 # --- files -----------------------------------------------------------------
 log "复制程序文件到 $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
@@ -154,12 +183,10 @@ cat <<EOF
   卸载：sudo $ROOT_DIR/scripts/uninstall.sh          （保留数据）
         sudo $ROOT_DIR/scripts/uninstall.sh --purge  （连数据一起删）
 
-  如任务要使用 Docker 部署方式（docker build / docker compose），
-  需要把服务账号加入 docker 组，否则会报
-  "permission denied ... /var/run/docker.sock"：
-
-      sudo usermod -aG docker $RUN_USER
-      sudo systemctl restart $SERVICE_NAME
+  Docker 部署方式（docker build / docker compose）所需的服务账号
+  docker 组权限已自动配置。
+${DOCKER_HINT:+
+  $DOCKER_HINT}
 
   注意：docker 组权限等价于 root，且本服务可执行任意部署脚本，
   请勿将控制台直接暴露到公网。

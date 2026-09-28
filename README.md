@@ -109,8 +109,10 @@ journalctl -u autodeploy -f
 
 ### Docker 部署方式
 
-安装脚本创建的 `autodeploy` 账号默认没有 Docker 权限，任务使用 Docker /
-Docker Compose 部署方式前需要加组：
+安装脚本会自动把 `autodeploy` 账号加入 docker 组（服务启动前完成，无需手工操作），
+任务可直接使用 Docker / Docker Compose 部署方式。
+
+如果安装时机器上还没有 Docker，之后再安装的话需要补一次加组：
 
 ```bash
 sudo usermod -aG docker autodeploy
