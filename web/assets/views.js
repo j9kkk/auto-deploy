@@ -681,6 +681,9 @@ AD.views = {};
       try { AD.state.defaults = await AD.api.get('/api/settings/defaults'); }
       catch (err) { AD.state.defaults = { repo_branch: 'main', timeout_seconds: 1800, keep_releases: 5 }; }
     }
+    // 凭据下拉需要最新列表：在别处刚创建/删除后应立刻反映出来。
+    try { AD.state.credentials = (await AD.api.get('/api/credentials')).credentials || []; }
+    catch (err) { AD.state.credentials = AD.state.credentials || []; }
     const defaults = AD.state.defaults;
     const t = task || {};
     const isEdit = Boolean(taskId);
@@ -722,11 +725,23 @@ AD.views = {};
           <input type="number" id="f-git_depth" min="0" max="10000" value="${a(t.git_depth !== undefined ? t.git_depth : 1)}">
           <div class="hint">1 = 浅克隆（最快）；0 = 完整历史</div>
         </div>
+        <div class="field span-2">
+          <label>凭据</label>
+          <select id="f-credential_id">
+            <option value="">不使用（公开仓库或任务内令牌）</option>
+            ${(AD.state.credentials || []).map((c) =>
+              `<option value="${c.id}"${String(t.credential_id) === String(c.id) ? ' selected' : ''}>${e(c.name)}（${e(c.kind_label || c.kind)}）</option>`).join('')}
+          </select>
+          <div class="hint">
+            在「凭据」页面集中管理；选择后优先于下方任务内令牌
+            ${(AD.state.credentials || []).length ? '' : '（当前还没有凭据，可先到「凭据」页面创建）'}
+          </div>
+        </div>
         <div class="field">
-          <label>访问令牌</label>
+          <label>任务内访问令牌（可选）</label>
           <input type="password" id="f-git_token" autocomplete="new-password"
                  placeholder="${isEdit ? (t.has_token ? '已配置，留空表示不修改' : '未配置') : '私有仓库才需要'}">
-          <div class="hint">用于私有仓库；以 GIT_ASKPASS 传递，不会写入命令行或日志</div>
+          <div class="hint">仅该任务使用；以 GIT_ASKPASS 传递，不会写入命令行或日志</div>
           ${isEdit && t.has_token ? '<div class="checkbox-row" style="margin-top:6px"><input type="checkbox" id="f-clear_token"><label for="f-clear_token">清除已保存的令牌</label></div>' : ''}
         </div>
       </div>
@@ -1001,6 +1016,11 @@ AD.views = {};
       notify_webhook: value('#f-notify_webhook'),
       skip_if_no_changes: checked('#f-skip_if_no_changes'),
     };
+
+    const credentialNode = backdrop.querySelector('#f-credential_id');
+    if (credentialNode) {
+      payload.credential_id = credentialNode.value ? Number(credentialNode.value) : null;
+    }
 
     const tokenNode = backdrop.querySelector('#f-git_token');
     if (tokenNode && tokenNode.value) payload.git_token = tokenNode.value;
@@ -1620,6 +1640,49 @@ AD.views = {};
       </div>
 
       <div class="panel">
+        <div class="panel-head"><h2>网络代理</h2>
+          <div class="spacer"></div>
+          <span class="faint">当前：${e(data.proxy_description || '未启用')}</span>
+        </div>
+        <div class="checkbox-row">
+          <input type="checkbox" id="s-proxy_enabled"${s.proxy_enabled ? ' checked' : ''}>
+          <label for="s-proxy_enabled">为 Git 操作启用代理</label>
+        </div>
+        <div class="hint" style="margin-bottom:12px">
+          内网或跨境访问 GitHub 不稳定时启用。代理以环境变量下发给 git，
+          不会写入进程命令行，日志中的密码亦会被脱敏。
+        </div>
+        <div class="grid cols-2">
+          <div class="field">
+            <label>代理地址</label>
+            <input type="text" id="s-proxy_url" value="${a(s.proxy_url || '')}"
+                   placeholder="http://proxy.corp.local:8080 或 socks5://127.0.0.1:1080">
+            <div class="hint">支持 http / https / socks5</div>
+          </div>
+          <div class="field">
+            <label>不使用代理的地址（no_proxy）</label>
+            <input type="text" id="s-proxy_no_proxy" value="${a(s.proxy_no_proxy || '')}"
+                   placeholder="localhost,127.0.0.1,.corp.local">
+            <div class="hint">逗号分隔；内网仓库应在此列出，否则会绕经代理而失败</div>
+          </div>
+          <div class="field">
+            <label>代理用户名</label>
+            <input type="text" id="s-proxy_username" value="${a(s.proxy_username || '')}" placeholder="可选">
+          </div>
+          <div class="field">
+            <label>代理密码</label>
+            <input type="password" id="s-proxy_password" autocomplete="new-password"
+                   placeholder="${s.proxy_password_set ? '已设置，留空表示不修改' : '可选'}">
+          </div>
+        </div>
+        <div class="checkbox-row">
+          <input type="checkbox" id="s-proxy_for_scripts"${s.proxy_for_scripts ? ' checked' : ''}>
+          <label for="s-proxy_for_scripts">构建脚本也使用该代理</label>
+        </div>
+        <div class="hint">勾选后 prepare/deploy 脚本中的 npm、pip 等也能联网；内网构建源通常不需要</div>
+      </div>
+
+      <div class="panel">
         <div class="row">
           <button class="primary" id="settings-save">保存设置</button>
           <button id="settings-reload">重新载入</button>
@@ -1653,7 +1716,15 @@ AD.views = {};
         queue_while_running: panel.querySelector('#s-queue_while_running').checked,
         trust_proxy_headers: panel.querySelector('#s-trust_proxy_headers').checked,
         secure_cookies: panel.querySelector('#s-secure_cookies').checked,
+        proxy_enabled: panel.querySelector('#s-proxy_enabled').checked,
+        proxy_url: panel.querySelector('#s-proxy_url').value.trim(),
+        proxy_username: panel.querySelector('#s-proxy_username').value.trim(),
+        proxy_no_proxy: panel.querySelector('#s-proxy_no_proxy').value.trim(),
+        proxy_for_scripts: panel.querySelector('#s-proxy_for_scripts').checked,
       };
+      // 密码留空表示保持原值，因此只有填了才提交。
+      const proxyPassword = panel.querySelector('#s-proxy_password').value;
+      if (proxyPassword) payload.proxy_password = proxyPassword;
       Object.keys(payload).forEach((key) => { if (payload[key] === undefined) delete payload[key]; });
 
       AD.setBusy(event.currentTarget, true, '保存中…');
@@ -1854,4 +1925,241 @@ AD.views = {};
       </div>
     `;
   }
+
+  // ======================================================================
+  // 凭据管理
+  // ======================================================================
+  AD.views.credentials = async function (container) {
+    const data = await AD.api.get('/api/credentials');
+    const items = data.credentials || [];
+
+    container.innerHTML = `
+      <div class="view-header">
+        <h1>凭据</h1>
+        <span class="badge neutral">${items.length} 个</span>
+        <div class="spacer"></div>
+        <button class="primary" id="cred-new">+ 新建凭据</button>
+      </div>
+
+      <div class="alert info">
+        凭据集中管理后，多个任务可复用同一份令牌，轮换时只需改一处。
+        密钥内容仅在保存时提交，之后不会再回传到浏览器。
+      </div>
+
+      ${items.length ? `<div class="panel"><div class="table-wrap"><table>
+        <thead><tr>
+          <th>名称</th><th>类型</th><th>账号 / 指纹</th><th>可用性</th><th>被引用</th><th class="right">操作</th>
+        </tr></thead>
+        <tbody>${items.map(credentialRow).join('')}</tbody>
+      </table></div></div>`
+      : `<div class="panel"><div class="empty">
+           <div class="big">🔑</div><h3>还没有凭据</h3>
+           <p class="faint">私有仓库或 SSH 地址需要凭据；公开仓库可以跳过</p>
+           <button class="primary" id="cred-new-empty">+ 新建凭据</button>
+         </div></div>`}
+    `;
+
+    container.querySelector('#cred-new')?.addEventListener('click', () => AD.openCredentialForm(null));
+    container.querySelector('#cred-new-empty')?.addEventListener('click', () => AD.openCredentialForm(null));
+
+    container.querySelectorAll('[data-cred-edit]').forEach((b) =>
+      b.addEventListener('click', () => AD.openCredentialForm(Number(b.dataset.credEdit))));
+    container.querySelectorAll('[data-cred-test]').forEach((b) =>
+      b.addEventListener('click', () => AD.testCredential(Number(b.dataset.credTest))));
+    container.querySelectorAll('[data-cred-delete]').forEach((b) =>
+      b.addEventListener('click', () => AD.deleteCredential(Number(b.dataset.credDelete))));
+  };
+
+  function credentialRow(item) {
+    const tested = item.last_tested_at
+      ? (item.last_test_ok
+          ? `<span class="badge on">可用</span>`
+          : `<span class="badge failed">不可用</span>`)
+        + `<div class="faint" title="${a(item.last_test_error || '')}">${e(AD.formatRelative(item.last_tested_at))}</div>`
+      : '<span class="faint">未测试</span>';
+
+    const identity = item.kind === 'ssh_key'
+      ? `<span class="mono" style="font-size:11px">${e(item.fingerprint || '（无指纹）')}</span>
+         <div class="faint">用户 ${e(item.username || 'git')}</div>`
+      : `<span class="mono">${e(item.username || '未指定')}</span>
+         <div class="faint">令牌 ${item.secret_length || 0} 字符</div>`;
+
+    return `<tr>
+      <td>
+        <div style="font-weight:500">${e(item.name)}</div>
+        ${item.description ? `<div class="faint truncate" style="max-width:240px">${e(item.description)}</div>` : ''}
+      </td>
+      <td><span class="badge neutral">${e(item.kind_label || item.kind)}</span></td>
+      <td>${identity}</td>
+      <td>${tested}</td>
+      <td>${item.used_by ? `<span class="badge neutral">${item.used_by} 个任务</span>` : '<span class="faint">未使用</span>'}</td>
+      <td>
+        <div class="table-actions">
+          <button class="sm" data-cred-test="${item.id}">测试</button>
+          <button class="sm" data-cred-edit="${item.id}">编辑</button>
+          <button class="sm danger" data-cred-delete="${item.id}">删除</button>
+        </div>
+      </td>
+    </tr>`;
+  }
+
+  AD.testCredential = async function (credentialId) {
+    const repoUrl = await AD.prompt({
+      title: '测试凭据',
+      label: '用于测试的仓库地址',
+      placeholder: 'https://github.com/owner/repo.git 或 git@github.com:owner/repo.git',
+      hint: '同一个令牌对不同仓库的权限可能不同，请用真实地址测试。测试不会修改任何仓库内容。',
+    });
+    if (!repoUrl) return;
+    const toast = AD.toast('正在测试，请稍候…', 'info', 30000);
+    try {
+      const result = await AD.api.post(`/api/credentials/${credentialId}/test`, { repo_url: repoUrl });
+      if (result.ok) AD.toastSuccess(result.message);
+      else AD.toastError(result.message);
+      AD.render('credentials');
+    } catch (err) {
+      AD.toastError(err.message);
+    }
+  };
+
+  AD.deleteCredential = async function (credentialId) {
+    let detail = '该操作不可撤销。';
+    let force = false;
+    try {
+      const info = await AD.api.get(`/api/credentials/${credentialId}`);
+      const used = info.credential.used_by || 0;
+      if (used > 0) {
+        // 有任务在引用时，删除会让这些任务静默失去凭据，必须明确告知。
+        const names = (info.credential.tasks || []).map((t) => t.name).join('、');
+        detail = `仍有 ${used} 个任务在使用该凭据（${names}）。删除后这些任务将回退使用任务内配置的令牌，可能导致部署失败。`;
+        force = true;
+      }
+    } catch (err) { /* 拿不到详情就直接问 */ }
+
+    const confirmed = await AD.confirm({
+      title: '删除凭据',
+      message: '确定要删除该凭据吗？',
+      detail,
+      confirmText: force ? '仍然删除' : '删除',
+      danger: true,
+    });
+    if (!confirmed) return;
+    try {
+      await AD.api.del(`/api/credentials/${credentialId}${force ? '?force=true' : ''}`);
+      AD.toastSuccess('凭据已删除');
+      AD.render('credentials');
+    } catch (err) { AD.toastError(err.message); }
+  };
+
+  AD.openCredentialForm = async function (credentialId) {
+    let item = null;
+    if (credentialId) {
+      const data = await AD.api.get(`/api/credentials/${credentialId}`);
+      item = data.credential;
+    }
+    const kinds = await AD.api.get('/api/credentials/kinds');
+    const t = item || {};
+    const isEdit = Boolean(credentialId);
+
+    const body = `
+      <div id="cred-error" class="alert error hidden"></div>
+      <div class="field">
+        <label>名称<span class="req">*</span></label>
+        <input type="text" id="c-name" value="${a(t.name || '')}" placeholder="例如：GitHub 只读令牌">
+        <div class="hint">用于在任务里辨认，建议写清用途与范围</div>
+      </div>
+      <div class="field">
+        <label>类型<span class="req">*</span></label>
+        <select id="c-kind"${isEdit ? ' disabled' : ''}>
+          ${kinds.kinds.map((k) => `<option value="${a(k.value)}"${(t.kind || 'https_token') === k.value ? ' selected' : ''}>${e(k.label)}</option>`).join('')}
+        </select>
+        <div class="hint" id="c-kind-hint"></div>
+        ${isEdit ? '<div class="hint">类型不可修改；如需更换请新建凭据</div>' : ''}
+      </div>
+      <div class="field" id="c-username-wrap">
+        <label>用户名</label>
+        <input type="text" id="c-username" value="${a(t.username || '')}">
+        <div class="hint" id="c-username-hint"></div>
+      </div>
+      <div class="field">
+        <label id="c-secret-label">密钥<span class="req">*</span></label>
+        <textarea id="c-secret" rows="5" placeholder=""></textarea>
+        <div class="hint" id="c-secret-hint"></div>
+      </div>
+      <div class="field hidden" id="c-passphrase-wrap">
+        <label>私钥口令</label>
+        <input type="password" id="c-passphrase" autocomplete="new-password">
+        <div class="hint">私钥没有口令时留空</div>
+      </div>
+      <div class="field">
+        <label>备注</label>
+        <input type="text" id="c-description" value="${a(t.description || '')}" placeholder="可选">
+      </div>
+    `;
+
+    const backdrop = AD.Modal.open({
+      title: isEdit ? '编辑凭据：' + t.name : '新建凭据',
+      body,
+      footer: '<button data-close>取消</button>'
+        + `<button class="primary" id="cred-save">${isEdit ? '保存' : '创建'}</button>`,
+    });
+
+    const kindSelect = backdrop.querySelector('#c-kind');
+    const applyKind = () => {
+      const kind = kindSelect.value;
+      const meta = kinds.kinds.find((k) => k.value === kind) || {};
+      backdrop.querySelector('#c-kind-hint').textContent = meta.hint || '';
+      const secretLabel = backdrop.querySelector('#c-secret-label');
+      const secretInput = backdrop.querySelector('#c-secret');
+      secretLabel.innerHTML = e(meta.secret_label || '密钥') + '<span class="req">*</span>';
+      secretInput.placeholder = meta.secret_placeholder || '';
+      secretInput.rows = kind === 'ssh_key' ? 6 : 2;
+      backdrop.querySelector('#c-username-hint').textContent = kind === 'ssh_key'
+        ? 'SSH 地址通常使用 git，留空则默认 git' : 'GitHub 使用 x-access-token；留空则使用默认值';
+      backdrop.querySelector('#c-username-wrap').classList.toggle('hidden', false);
+      backdrop.querySelector('#c-passphrase-wrap').classList.toggle('hidden', kind !== 'ssh_key');
+      if (isEdit) {
+        secretInput.placeholder = t.has_secret ? '已保存，留空表示不修改' : '';
+        secretInput.required = false;
+      }
+    };
+    kindSelect.addEventListener('change', applyKind);
+    applyKind();
+
+    backdrop.querySelector('#cred-save').addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      const payload = {
+        name: backdrop.querySelector('#c-name').value.trim(),
+        username: backdrop.querySelector('#c-username').value.trim(),
+        description: backdrop.querySelector('#c-description').value.trim(),
+      };
+      if (!isEdit) payload.kind = kindSelect.value;
+      const secret = backdrop.querySelector('#c-secret').value;
+      if (secret) payload.secret = secret;
+      const passphrase = backdrop.querySelector('#c-passphrase')?.value || '';
+      if (passphrase) payload.passphrase = passphrase;
+
+      if (!payload.name) { credError(backdrop, '请填写凭据名称'); return; }
+      if (!isEdit && !secret) { credError(backdrop, '请填写密钥内容'); return; }
+
+      AD.setBusy(button, true, '保存中…');
+      try {
+        if (isEdit) await AD.api.put(`/api/credentials/${credentialId}`, payload);
+        else await AD.api.post('/api/credentials', payload);
+        AD.toastSuccess(isEdit ? '凭据已保存' : '凭据已创建');
+        AD.Modal.close();
+        AD.render('credentials');
+      } catch (err) {
+        credError(backdrop, err.message);
+        AD.setBusy(button, false);
+      }
+    });
+  };
+
+  function credError(backdrop, message) {
+    const box = backdrop.querySelector('#cred-error');
+    box.textContent = message;
+    box.classList.remove('hidden');
+  }
+
 })(window.AD);

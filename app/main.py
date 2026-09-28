@@ -20,6 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import config
 from . import __version__ as VERSION
 from .api import auth as auth_routes
+from .api import credentials as credential_routes
 from .api import runs as run_routes
 from .api import settings as settings_routes
 from .api import stats as stats_routes
@@ -58,6 +59,7 @@ def create_app(service: Service | None = None) -> FastAPI:
 
     # --- API routes -----------------------------------------------------
     app.include_router(auth_routes.router)
+    app.include_router(credential_routes.router)
     app.include_router(task_routes.router)
     app.include_router(run_routes.router)
     app.include_router(stats_routes.router)

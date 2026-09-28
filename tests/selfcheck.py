@@ -894,6 +894,93 @@ def run() -> int:
         check("退出后无法访问", response.status_code == 401)
 
     # ------------------------------------------------------------------
+    section("凭据与代理")
+
+    from app.config import Settings, describe_proxy, proxy_env, proxy_url_with_auth
+    from app.gitops import resolve_credential
+    from app.store import decode_credential, ssh_key_fingerprint
+
+    # --- 凭据解析优先级：全局凭据 > 任务内令牌 ---
+    task_with_token = {"git_username": "u", "git_token": "task-token"}
+    check("无全局凭据时回退任务内令牌",
+          resolve_credential(task_with_token, None).token == "task-token")
+    picked = resolve_credential(task_with_token, {
+        "kind": "https_token", "username": "ci", "secret": "global", "name": "G"})
+    check("全局凭据优先于任务内令牌", picked.token == "global" and picked.name == "G")
+    ssh = resolve_credential({"git_token": ""}, {
+        "kind": "ssh_key", "username": "git", "secret": "KEY", "passphrase": "pp", "name": "S"})
+    check("SSH 凭据被识别", ssh.is_ssh and ssh.private_key == "KEY" and ssh.passphrase == "pp")
+    check("凭据 repr 不含秘密",
+          "global" not in repr(picked) and "KEY" not in repr(ssh))
+
+    # --- secret 不外泄 ---
+    decoded = decode_credential({"id": 1, "name": "n", "kind": "https_token",
+                                 "username": "u", "secret": "s3cr3t", "description": ""})
+    check("解码后不含 secret 明文", "secret" not in decoded and decoded["has_secret"])
+    check("解码后给出密钥长度", decoded["secret_length"] == 6)
+    check("SSH 指纹可计算",
+          ssh_key_fingerprint("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END-----").startswith("SHA256:")
+          or ssh_key_fingerprint("AAAA") == "")
+    check("空私钥指纹为空", ssh_key_fingerprint("") == "")
+
+    # --- 代理 URL 与脱敏 ---
+    st = Settings()
+    check("未启用代理时环境为空", proxy_env(st) == {})
+    st.proxy_enabled = True
+    st.proxy_url = "http://proxy.local:8080"
+    env_on = proxy_env(st)
+    check("启用后同时设置大小写代理变量",
+          env_on.get("http_proxy") == env_on.get("HTTPS_PROXY") == "http://proxy.local:8080")
+    check("no_proxy 一并下发", bool(env_on.get("no_proxy")))
+    st.proxy_username = "u@corp"
+    st.proxy_password = "p:ss@word"
+    auth_url = proxy_url_with_auth(st)
+    check("代理凭证做百分号编码",
+          "u%40corp" in auth_url and "p%3Ass%40word" in auth_url, auth_url)
+    check("代理描述不含密码明文", "p:ss" not in describe_proxy(st) and "***" in describe_proxy(st))
+    st.proxy_for_scripts = False
+    check("关闭脚本代理后脚本环境不含代理", proxy_env(st, for_scripts=True) == {})
+    check("Git 环境仍含代理", bool(proxy_env(st)))
+
+    # --- 代理校验规则（API 层同源函数）---
+    from app.validation import ValidationError as VErr
+    from app.validation import validate_proxy_settings
+    try:
+        validate_proxy_settings({"proxy_enabled": True}, Settings())
+        check("启用代理但无地址被拒绝", False)
+    except VErr as exc:
+        check("启用代理但无地址被拒绝", "proxy_url" in exc.errors)
+    check("已有地址时可只开启开关",
+          validate_proxy_settings({"proxy_enabled": True},
+                                  Settings(proxy_url="http://x:1")).get("proxy_enabled") is True)
+    try:
+        validate_proxy_settings({"proxy_url": "proxy.local:8080"}, Settings())
+        check("非法代理地址被拒绝", False)
+    except VErr as exc:
+        check("非法代理地址被拒绝", "proxy_url" in exc.errors)
+    try:
+        validate_proxy_settings({"proxy_url": "http://u:p@proxy.local:8080"}, Settings())
+        check("代理地址内嵌密码被拒绝（避免日志泄露）", False)
+    except VErr as exc:
+        check("代理地址内嵌密码被拒绝（避免日志泄露）", "proxy_url" in exc.errors)
+
+    # --- 连通性探测：走代理时探测代理本身 ---
+    import socket
+    import threading as _threading
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    proxy_port = server.getsockname()[1]
+    _threading.Thread(target=lambda: server.accept(), daemon=True).start()
+    from app.gitops import check_reachable
+    check("代理可达时不再误报目标不可达",
+          check_reachable("https://10.255.255.1:443/x.git",
+                          proxy_url=f"http://127.0.0.1:{proxy_port}", timeout=2) is None)
+    proxy_down = check_reachable("https://github.com/a/b.git",
+                                 proxy_url="http://127.0.0.1:9", timeout=2)
+    check("代理不可达时明确指出代理问题", proxy_down is not None and "代理" in proxy_down, str(proxy_down))
+
+    # ------------------------------------------------------------------
     section("调度器行为")
     from app.runner import DeployRunner
     from app.scheduler import Scheduler

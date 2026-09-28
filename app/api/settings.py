@@ -39,6 +39,11 @@ def read_settings(
         },
         "editable_bools": list(EDITABLE_BOOL_SETTINGS),
         "readonly": ["host", "port", "base_url", "shell", "timezone"],
+        "proxy_fields": [
+            "proxy_enabled", "proxy_url", "proxy_username",
+            "proxy_password", "proxy_no_proxy", "proxy_for_scripts",
+        ],
+        "proxy_description": config.describe_proxy(service.settings),
         "config_path": str(config.settings_path()),
         "data_dir": str(config.DATA_DIR),
     }

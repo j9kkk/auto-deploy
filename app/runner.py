@@ -267,13 +267,33 @@ class DeployRunner:
         releases_root, current_link = resolve_release_paths(task)
         artifacts_root = config.artifacts_dir(task_id)
         creds_dir = gitops.temp_credential_dir(config.TMP_DIR / f"task-{task_id}")
+        # 代理以环境变量下发（不走 git -c，避免密码出现在进程列表里）。
+        proxy = config.proxy_env(settings)
+
+        # 凭据：优先用任务引用的全局凭据，否则回退到任务自带的令牌。
+        credential_row = None
+        credential_id = task.get("credential_id")
+        if credential_id:
+            credential_row = self.store.credentials.get(int(credential_id))
+            if credential_row is None:
+                log(f"! 引用的凭据 #{credential_id} 不存在，将尝试任务自带的令牌")
+        credential = gitops.resolve_credential(task, credential_row)
+        if credential_row is not None:
+            log(f"凭据: {credential_row.get('name', '')}（{gitops.KIND_LABELS.get(str(credential_row.get('kind')), '')}）")
+        elif credential.has_secret:
+            log("凭据: 使用任务内配置的令牌")
 
         log("--- 阶段: 拉取代码 ---")
         log(f"仓库: {redact(task['repo_url'])}  分支: {task['repo_branch']}")
+        if proxy:
+            log(f"代理: {config.describe_proxy(settings)}")
         before = (task.get("_last_commit") or "").strip()
         if not before:
             before = gitops.current_commit(
-                workspace, token=_token(task), username=task.get("git_username", "")
+                workspace,
+                token=credential.token,
+                username=credential.username,
+                proxy=proxy,
             )
             if before:
                 log(f"当前工作副本: {before[:8]}")
@@ -283,8 +303,11 @@ class DeployRunner:
             branch=task["repo_branch"],
             workspace=workspace,
             depth=int(task.get("git_depth") or 1),
-            token=_token(task),
-            username=task.get("git_username", ""),
+            token=credential.token,
+            username=credential.username,
+            credential=credential,
+            proxy=proxy,
+            home=creds_dir,
             tmp_dir=creds_dir,
             timeout=int(settings.git_timeout_seconds),
             log=log,
@@ -340,6 +363,8 @@ class DeployRunner:
             # Share the live handle list so a cancel request reaches the
             # process a deploy stage is currently running.
             handles=active.handles,
+            # 构建脚本（npm/pip 等）也可能需要联网，代理按开关注入。
+            proxy=config.proxy_env(settings, for_scripts=True),
         )
 
         method = ctx.deploy_method

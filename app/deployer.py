@@ -90,6 +90,8 @@ class DeployContext:
     # Live process handles, so a cancellation request can kill what is running.
     handles: list[Any] = field(default_factory=list)
     last_exit_code: int | None = None
+    # 代理环境变量：注入到所有脚本，让构建过程也能联网。
+    proxy: dict[str, str] = field(default_factory=dict)
 
     def exec(
         self,
@@ -101,10 +103,14 @@ class DeployContext:
         label: str | None = None,
     ) -> CommandResult:
         """Run a command with this context's logging and cancellation wiring."""
+        resolved_env = env if env is not None else self.script_env()
+        # 代理附加在最后：即使调用方传了自己的 env，也仍然带上代理设置。
+        if self.proxy:
+            resolved_env = {**resolved_env, **self.proxy}
         result = run_command(
             args,
             cwd=cwd,
-            env=env if env is not None else self.script_env(),
+            env=resolved_env,
             timeout=_timeout_for(self, timeout),
             log=self.log,
             label=label,
@@ -468,7 +474,7 @@ def run_script_stage(
     result = ctx.exec(
         shell_command(body, shell=config.load_settings().shell),
         cwd=cwd,
-        env=env,
+        env={**env, **ctx.proxy},
         timeout=_timeout_for(ctx, timeout),
         label=stage,
     )

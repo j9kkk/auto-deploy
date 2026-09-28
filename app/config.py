@@ -76,6 +76,23 @@ class Settings:
     # Seconds between SIGTERM and SIGKILL when stopping a run.
     kill_grace_seconds: int = 10
 
+    # --- network proxy ----------------------------------------------------
+    # Applied to git operations and (optionally) deploy scripts. Kept as
+    # environment variables rather than `git -c http.proxy=...` so a proxy
+    # password never appears in the process list.
+    proxy_enabled: bool = False
+    # e.g. http://proxy.corp.local:8080 or socks5://127.0.0.1:1080
+    proxy_url: str = ""
+    proxy_username: str = ""
+    proxy_password: str = ""
+    # Hosts/domains that must bypass the proxy (comma separated), e.g. the
+    # internal GitLab. Without this every internal fetch would go through the
+    # external proxy and fail.
+    proxy_no_proxy: str = "localhost,127.0.0.1,::1"
+    # Also export the proxy to prepare/deploy/rollback scripts, so that
+    # `npm install` / `pip install` inside a build can reach the network.
+    proxy_for_scripts: bool = True
+
     # --- retention --------------------------------------------------------
     run_retention_days: int = 30
     run_retention_count: int = 500
@@ -318,3 +335,73 @@ def artifacts_dir(task_id: int) -> Path:
 
 def run_log_path(run_id: int) -> Path:
     return LOGS_DIR / f"run-{run_id}.log"
+
+
+# ---------------------------------------------------------------------------
+# 代理
+# ---------------------------------------------------------------------------
+
+def proxy_url_with_auth(settings: "Settings") -> str:
+    """把账号密码拼进代理 URL（git/curl 都接受这种形式）。
+
+    密码做百分号编码，避免密码里的 ``@`` / ``:`` 破坏 URL 结构。
+    """
+    url = (settings.proxy_url or "").strip()
+    if not url:
+        return ""
+    user = (settings.proxy_username or "").strip()
+    password = settings.proxy_password or ""
+    if not user:
+        return url
+    from urllib.parse import quote
+
+    credentials = quote(user, safe="")
+    if password:
+        credentials += ":" + quote(password, safe="")
+    # 在 scheme:// 之后插入凭证。
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return f"{credentials}@{url}"
+    return f"{scheme}://{credentials}@{rest}"
+
+
+def proxy_env(settings: "Settings", *, for_scripts: bool = False) -> dict[str, str]:
+    """构造代理相关的环境变量；未启用时返回空 dict。
+
+    ``for_scripts=True`` 时额外尊重「同时用于构建脚本」开关：
+    curl/git 这类工具必须走代理，而构建脚本（npm/pip）是否走代理由运维决定，
+    内网构建源通常不需要。
+    """
+    if not settings.proxy_enabled:
+        return {}
+    if for_scripts and not settings.proxy_for_scripts:
+        return {}
+    url = proxy_url_with_auth(settings)
+    if not url:
+        return {}
+    env = {
+        "http_proxy": url,
+        "https_proxy": url,
+        "HTTP_PROXY": url,
+        "HTTPS_PROXY": url,
+    }
+    no_proxy = (settings.proxy_no_proxy or "").strip()
+    if no_proxy:
+        env["no_proxy"] = no_proxy
+        env["NO_PROXY"] = no_proxy
+    return env
+
+
+def describe_proxy(settings: "Settings") -> str:
+    """给界面显示的代理描述，绝不包含密码。"""
+    if not settings.proxy_enabled:
+        return "未启用"
+    url = (settings.proxy_url or "").strip()
+    if not url:
+        return "已启用但未填写地址"
+    user = (settings.proxy_username or "").strip()
+    if user:
+        scheme, sep, rest = url.partition("://")
+        host = rest if sep else url
+        return f"{scheme}://{user}:***@{host}" if sep else f"{user}:***@{host}"
+    return url

@@ -171,6 +171,15 @@ def validate_task_payload(
         out["git_username"] = _clean_str(
             payload.get("git_username", existing.get("git_username", "")), limit=200
         )
+    if has("credential_id") or not partial:
+        raw_cred = payload.get("credential_id", existing.get("credential_id"))
+        if raw_cred in (None, "", 0, "0"):
+            out["credential_id"] = None
+        else:
+            try:
+                out["credential_id"] = int(raw_cred)
+            except (TypeError, ValueError):
+                errors["credential_id"] = "凭据选择无效"
     if has("git_token"):
         token = _clean_str(payload.get("git_token"), limit=2000)
         # An empty value that is explicitly sent means "keep what is stored",
@@ -407,6 +416,131 @@ def describe_task_schedule(task: Mapping[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 凭据
+# ---------------------------------------------------------------------------
+
+CREDENTIAL_KINDS = ("https_token", "ssh_key")
+PRIVATE_KEY_MAX = 100_000
+
+
+def validate_credential_payload(
+    payload: Mapping[str, Any],
+    *,
+    partial: bool = False,
+    existing: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """校验凭据创建/更新请求。
+
+    ``secret`` 留空表示保持原值（编辑时不回显密钥，因此也不会被覆盖）。
+    """
+    existing = dict(existing or {})
+    errors: dict[str, str] = {}
+    out: dict[str, Any] = {}
+
+    def has(key: str) -> bool:
+        return key in payload
+
+    if has("name") or not partial:
+        name = _clean_str(payload.get("name") or existing.get("name"), limit=120)
+        if not name:
+            errors["name"] = "凭据名称不能为空"
+        out["name"] = name
+    if has("description") or not partial:
+        out["description"] = _clean_str(
+            payload.get("description", existing.get("description", "")), limit=1000
+        )
+    if has("kind") or not partial:
+        kind = _clean_str(payload.get("kind") or existing.get("kind") or "https_token", limit=32).lower()
+        if kind not in CREDENTIAL_KINDS:
+            errors["kind"] = f"凭据类型必须是 {sorted(CREDENTIAL_KINDS)} 之一"
+        out["kind"] = kind
+    else:
+        out["kind"] = _clean_str(existing.get("kind") or "https_token", limit=32).lower()
+
+    if has("username") or not partial:
+        out["username"] = _clean_str(
+            payload.get("username", existing.get("username", "")), limit=200
+        )
+
+    # secret 可以显式提交；留空则不改动。
+    if has("secret"):
+        raw_secret = str(payload.get("secret") or "")
+        if raw_secret:
+            limit = PRIVATE_KEY_MAX if out.get("kind") == "ssh_key" else 4000
+            if len(raw_secret) > limit:
+                errors["secret"] = f"密钥内容过长（上限 {limit} 字符）"
+            out["secret"] = raw_secret
+            if out.get("kind") == "ssh_key":
+                out["username"] = out.get("username") or "git"
+    elif not partial:
+        out["secret"] = ""
+
+    if has("passphrase"):
+        out["passphrase"] = str(payload.get("passphrase") or "")
+
+    # 类型相关的必填校验：仅在有足够信息时判断。
+    kind = out.get("kind") or existing.get("kind") or "https_token"
+    secret_present = bool(out.get("secret") or existing.get("secret"))
+    if not errors:
+        if kind == "ssh_key" and not secret_present:
+            errors["secret"] = "SSH 凭据需要提供私钥内容"
+        elif kind == "https_token" and not secret_present:
+            errors["secret"] = "HTTPS 凭据需要提供访问令牌"
+
+    if errors:
+        raise ValidationError(errors)
+    return out
+
+
+def validate_proxy_settings(
+    payload: Mapping[str, Any], current_proxy: Any = None
+) -> dict[str, Any]:
+    """校验代理相关设置。"""
+    errors: dict[str, str] = {}
+    out: dict[str, Any] = {}
+
+    if "proxy_enabled" in payload:
+        out["proxy_enabled"] = _clean_bool(payload["proxy_enabled"], False)
+    if "proxy_url" in payload:
+        url = _clean_str(payload["proxy_url"], limit=500)
+        if url and not re.match(r"^(https?|socks5h?)://", url, re.IGNORECASE):
+            errors["proxy_url"] = "代理地址需以 http://、https:// 或 socks5:// 开头"
+        if url and "@" in url.split("://", 1)[-1]:
+            # 凭证有独立输入框；写在 URL 里容易被日志打印出来。
+            errors["proxy_url"] = "请勿在代理地址中直接填写账号密码，使用下方的用户名/密码字段"
+        out["proxy_url"] = url
+    if "proxy_username" in payload:
+        username = _clean_str(payload["proxy_username"], limit=200)
+        if any(ch in username for ch in "\n\r"):
+            errors["proxy_username"] = "代理用户名不能包含换行"
+        out["proxy_username"] = username
+    if "proxy_password" in payload:
+        out["proxy_password"] = str(payload["proxy_password"] or "")
+    if "proxy_no_proxy" in payload:
+        no_proxy = _clean_str(payload["proxy_no_proxy"], limit=2000)
+        for part in no_proxy.split(","):
+            if any(ch in part for ch in " \t\n"):
+                errors["proxy_no_proxy"] = "no_proxy 内各项之间不要含空格或换行"
+                break
+        out["proxy_no_proxy"] = no_proxy
+    if "proxy_for_scripts" in payload:
+        out["proxy_for_scripts"] = _clean_bool(payload["proxy_for_scripts"], True)
+
+    # 启用代理但没填地址是常见误操作，必须拦住。
+    # 注意要考虑「本次没提交 proxy_url，但库里已有地址」的情况，因此用
+    # payload 与既有值合并后的结果来判断。
+    if "proxy_enabled" in payload:
+        enabled = out.get("proxy_enabled")
+        merged_url = out.get("proxy_url", payload.get("proxy_url", getattr(current_proxy, "proxy_url", "")))
+        if enabled and not str(merged_url or "").strip():
+            errors["proxy_url"] = "启用代理后必须填写代理地址"
+
+    if errors:
+        raise ValidationError(errors)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
@@ -478,6 +612,12 @@ def validate_settings(payload: Mapping[str, Any], current: Settings) -> dict[str
         if not shell.startswith("/"):
             errors["shell"] = "shell 必须是绝对路径"
         out["shell"] = shell
+
+    # 代理相关设置交给专门函数校验，避免与本函数的大段逻辑混在一起。
+    try:
+        out.update(validate_proxy_settings(payload, current))
+    except ValidationError as exc:
+        errors.update(exc.errors)
 
     # A worker count above the retention-independent limit is fine, but the
     # poll interval must stay below the smallest useful interval.

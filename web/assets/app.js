@@ -3,11 +3,12 @@
 (function (AD) {
   'use strict';
 
-  const VIEWS = ['dashboard', 'tasks', 'runs', 'stats', 'settings'];
+  const VIEWS = ['dashboard', 'tasks', 'runs', 'credentials', 'stats', 'settings'];
   const HASH_TO_VIEW = {
     '': 'dashboard', '#': 'dashboard',
     '#/dashboard': 'dashboard', '#/tasks': 'tasks',
-    '#/runs': 'runs', '#/stats': 'stats', '#/settings': 'settings',
+    '#/runs': 'runs', '#/credentials': 'credentials',
+    '#/stats': 'stats', '#/settings': 'settings',
   };
 
   // ---------------------------------------------------------------- session

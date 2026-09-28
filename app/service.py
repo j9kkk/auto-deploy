@@ -182,7 +182,15 @@ class Service:
         self.scheduler.poke()
 
     def export_settings(self) -> dict[str, Any]:
-        return config.load_settings().as_dict()
+        """导出设置给界面。
+
+        **代理密码不回传**：界面只需要知道「是否已设置」，回显明文会扩大
+        泄露面（浏览器缓存、截图、日志都可能带到）。留空提交即表示保持原值。
+        """
+        data = config.load_settings().as_dict()
+        password = data.pop("proxy_password", "") or ""
+        data["proxy_password_set"] = bool(password)
+        return data
 
     # -- storage helpers ---------------------------------------------------
     def storage_report(self) -> dict[str, Any]:

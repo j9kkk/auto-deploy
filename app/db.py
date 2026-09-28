@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -50,6 +50,23 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS credentials (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL UNIQUE,
+    kind            TEXT    NOT NULL DEFAULT 'https_token',
+    username        TEXT    NOT NULL DEFAULT '',
+    secret          TEXT    NOT NULL DEFAULT '',
+    -- 仅 SSH 私钥使用：密钥口令（可空）
+    passphrase      TEXT    NOT NULL DEFAULT '',
+    description     TEXT    NOT NULL DEFAULT '',
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL,
+    -- 最近一次连通性测试结果，供界面显示凭据是否可用
+    last_tested_at  TEXT,
+    last_test_ok    INTEGER,
+    last_test_error TEXT    NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
     name                     TEXT    NOT NULL UNIQUE,
@@ -61,6 +78,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     git_depth                INTEGER NOT NULL DEFAULT 1,
     git_username             TEXT    NOT NULL DEFAULT '',
     git_token                TEXT    NOT NULL DEFAULT '',
+    -- 引用的全局凭据；为空时回退用任务自带的 git_username/git_token
+    credential_id            INTEGER REFERENCES credentials(id) ON DELETE SET NULL,
 
     schedule_type            TEXT    NOT NULL DEFAULT 'interval',
     schedule_expression      TEXT    NOT NULL DEFAULT '1h',
@@ -243,6 +262,8 @@ class Database:
             )
         if current < 2:
             self._migrate_v1_to_v2(conn)
+        if current < 3:
+            self._migrate_v2_to_v3(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
@@ -329,6 +350,23 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON tasks(enabled, next_run_at);
             """
         )
+
+    def _migrate_v2_to_v3(self, conn: sqlite3.Connection) -> None:
+        """v3: 新增全局凭据表，并给任务增加 credential_id 外键。
+
+        credentials 表本身由 SCHEMA 的 CREATE TABLE IF NOT EXISTS 建立；
+        这里只需给已存在的 tasks 表补列（SQLite 支持 ADD COLUMN）。
+        任务原有的 git_username/git_token 保持不变，作为未引用凭据时的回退。
+        """
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "credential_id" not in columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN credential_id INTEGER "
+                "REFERENCES credentials(id) ON DELETE SET NULL"
+            )
 
     def schema_version(self) -> int:
         try:

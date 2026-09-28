@@ -88,8 +88,12 @@ def validate_branch(branch: str) -> str | None:
     return None
 
 
-def _askpass_env(token: str, username: str, tmp_dir: Path) -> dict[str, str]:
-    """Create a throwaway askpass helper and return the git environment."""
+def _askpass_env(token: str, username: str, tmp_dir: Path, passphrase: str = "") -> dict[str, str]:
+    """Create a throwaway askpass helper and return the git environment.
+
+    ``passphrase`` 用于带密码的 SSH 私钥：git 在解锁密钥时会以交互方式询问，
+    此时通过 askpass 提供。
+    """
     env: dict[str, str] = {
         "GIT_TERMINAL_PROMPT": "0",
         # Never consult a system/global credential store: the service must not
@@ -97,7 +101,7 @@ def _askpass_env(token: str, username: str, tmp_dir: Path) -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_ASKPASS": "",
     }
-    if not token:
+    if not token and not passphrase:
         return env
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -109,25 +113,140 @@ def _askpass_env(token: str, username: str, tmp_dir: Path) -> dict[str, str]:
         "#!/bin/sh\n"
         'case "$1" in\n'
         '  *sername*) printf "%s\\n" "$AUTODEPLOY_GIT_USER" ;;\n'
-        '  *) printf "%s\\n" "$AUTODEPLOY_GIT_TOKEN" ;;\n'
+        '  *) printf "%s\\n" "$AUTODEPLOY_GIT_SECRET" ;;\n'
         "esac\n"
     )
     helper.write_text(script, encoding="utf-8")
     helper.chmod(stat.S_IRWXU)  # 0700: readable only by the service user.
     env["GIT_ASKPASS"] = str(helper)
     env["AUTODEPLOY_GIT_USER"] = user
-    env["AUTODEPLOY_GIT_TOKEN"] = token
+    # 密码提示既可能是 HTTPS 令牌，也可能是 SSH 私钥口令，用同一个变量承载。
+    env["AUTODEPLOY_GIT_SECRET"] = token or passphrase
     return env
+
+
+def _ssh_env(private_key: str, passphrase: str, tmp_dir: Path, known_hosts: Path) -> dict[str, str]:
+    """把 SSH 私钥写成临时文件并返回指向它的 git 环境变量。
+
+    私钥以 0600 落盘，且只在该次运行的临时目录内，运行结束后随之清理
+    （由 staging 目录的清理逻辑负责）。
+    """
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    key_path = tmp_dir / "id_deploy"
+    key_path.write_text(private_key if private_key.endswith("\n") else private_key + "\n", encoding="utf-8")
+    key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+
+    env = {
+        # GIT_SSH_COMMAND 里不内联任何秘密：私钥通过 -i 指向文件，口令走 askpass。
+        "GIT_SSH_COMMAND": (
+            f"ssh -i {shlex_quote(str(key_path))} -o IdentitiesOnly=yes "
+            f"-o StrictHostKeyChecking=accept-new "
+            f"-o UserKnownHostsFile={shlex_quote(str(known_hosts))} "
+            f"-o BatchMode={'no' if passphrase else 'yes'}"
+        ),
+    }
+    return env
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+
+    return shlex.quote(value)
+
+
+# 凭据类型的中文标签（前后端共用的单一来源）。
+KIND_LABELS = {
+    "https_token": "HTTPS 访问令牌",
+    "ssh_key": "SSH 私钥",
+    "none": "无",
+}
+
+
+class GitCredential:
+    """一次运行所需的 Git 凭证（HTTPS 令牌或 SSH 私钥）。"""
+
+    def __init__(
+        self,
+        *,
+        kind: str = "none",
+        username: str = "",
+        token: str = "",
+        private_key: str = "",
+        passphrase: str = "",
+        name: str = "",
+    ) -> None:
+        self.kind = kind or "none"
+        self.username = username
+        self.token = token
+        self.private_key = private_key
+        self.passphrase = passphrase
+        self.name = name
+
+    @property
+    def is_ssh(self) -> bool:
+        return self.kind == "ssh_key" and bool(self.private_key)
+
+    @property
+    def has_secret(self) -> bool:
+        return bool(self.token or self.private_key)
+
+    @classmethod
+    def from_task(cls, task: Mapping[str, Any]) -> "GitCredential":
+        """兼容旧行为：任务自带的 git_username/git_token。"""
+        return cls(
+            kind="https_token" if task.get("git_token") else "none",
+            username=str(task.get("git_username") or ""),
+            token=str(task.get("git_token") or ""),
+        )
+
+    def __repr__(self) -> str:  # pragma: no cover - 避免日志泄露
+        return f"GitCredential(kind={self.kind!r}, name={self.name!r}, has_secret={self.has_secret})"
+
+
+def resolve_credential(task: Mapping[str, Any], credential_row: Mapping[str, Any] | None) -> GitCredential:
+    """决定任务该用哪份凭据。
+
+    优先级：显式引用的全局凭据 > 任务自带的 git_token。
+    这样既支持集中管理，又不会让已有的任务配置失效。
+    """
+    if credential_row:
+        kind = str(credential_row.get("kind") or "https_token")
+        secret = str(credential_row.get("secret") or "")
+        if kind == "ssh_key":
+            return GitCredential(
+                kind="ssh_key",
+                username=str(credential_row.get("username") or "git"),
+                private_key=secret,
+                passphrase=str(credential_row.get("passphrase") or ""),
+                name=str(credential_row.get("name") or ""),
+            )
+        return GitCredential(
+            kind="https_token",
+            username=str(credential_row.get("username") or ""),
+            token=secret,
+            name=str(credential_row.get("name") or ""),
+        )
+    return GitCredential.from_task(task)
 
 
 def _git_env(
     *,
-    token: str,
-    username: str,
+    token: str = "",
+    username: str = "",
     tmp_dir: Path,
     extra: Mapping[str, str] | None = None,
+    credential: "GitCredential | None" = None,
+    proxy: Mapping[str, str] | None = None,
+    home: Path | None = None,
 ) -> dict[str, str]:
-    env = _askpass_env(token, username, tmp_dir)
+    """构造 git 运行环境。
+
+    ``proxy`` 以环境变量形式传入（不是 ``-c http.proxy=``），这样代理密码
+    不会出现在进程命令行里被其它用户看到。
+    """
+    cred = credential or GitCredential(kind="https_token" if token else "none",
+                                       username=username, token=token)
+    env = _askpass_env(cred.token, cred.username, tmp_dir, passphrase=cred.passphrase)
     env.update(
         {
             "GIT_CONFIG_GLOBAL": os.devnull,  # ignore ~/.gitconfig
@@ -136,6 +255,17 @@ def _git_env(
             "LANG": "C",
         }
     )
+    if cred.is_ssh:
+        known_hosts = (home or tmp_dir) / "known_hosts"
+        if not known_hosts.exists():
+            try:
+                known_hosts.parent.mkdir(parents=True, exist_ok=True)
+                known_hosts.touch()
+            except OSError:
+                pass
+        env.update(_ssh_env(cred.private_key, cred.passphrase, tmp_dir, known_hosts))
+    if proxy:
+        env.update({str(k): str(v) for k, v in proxy.items()})
     if extra:
         env.update({str(k): str(v) for k, v in extra.items()})
     return env
@@ -198,18 +328,43 @@ def check_reachable(
     repo_url: str,
     *,
     timeout: float = 8.0,
+    proxy_url: str = "",
 ) -> str | None:
-    """Probe TCP reachability of an http(s) remote.
+    """探测远端是否可达。
 
-    Returns ``None`` when reachable (or when the URL is not http-based, where a
-    probe is not meaningful), or a human-readable error.  Without this, an
-    unreachable host costs three full TCP-connect timeouts before the run
-    fails; the probe turns that into a fast, specific error.
+    返回 ``None`` 表示可达（或该地址不适用探测），否则返回可读的错误信息。
+
+    **代理场景**：配置了代理时必须探测代理本身，而不是直连目标主机——
+    否则内网环境里直连必然失败，会把「走代理能通」的仓库误判为不可达，
+    导致部署在连通性预检阶段就被中止。
     """
     target = _split_host_port(repo_url)
     if target is None:
         return None
     host, port = target
+
+    if proxy_url:
+        from urllib.parse import urlparse
+
+        try:
+            parsed = urlparse(proxy_url)
+        except ValueError:
+            return f"代理地址无法解析: {proxy_url}"
+        proxy_host = parsed.hostname
+        if proxy_host:
+            proxy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            import socket
+
+            try:
+                with socket.create_connection((proxy_host, proxy_port), timeout=timeout):
+                    # 代理可达即认为可继续：目标主机由代理去连。
+                    return None
+            except OSError as exc:
+                return (
+                    f"代理 {proxy_host}:{proxy_port} 无法连接"
+                    f"（{exc.strerror or exc}），请检查代理设置"
+                )
+
     import socket
 
     try:
@@ -292,6 +447,9 @@ def sync_checkout(
     check_cancelled: Callable[[], bool] | None = None,
     kill_grace_seconds: int = 10,
     reset_hard: bool = True,
+    credential: "GitCredential | None" = None,
+    proxy: Mapping[str, str] | None = None,
+    home: Path | None = None,
 ) -> CheckoutInfo:
     """Clone or fetch the repository, returning what the checkout now holds.
 
@@ -306,13 +464,17 @@ def sync_checkout(
 
     # Fail fast when the remote host is unreachable. Without this check, an
     # unreachable GitHub costs three ~75s TCP timeouts before the run fails.
-    unreachable = check_reachable(repo_url)
+    # 走代理时探测代理本身（见 check_reachable 的说明）。
+    unreachable = check_reachable(repo_url, proxy_url=_proxy_url_of(proxy))
     if unreachable:
         raise GitError(unreachable)
 
     workspace = Path(workspace)
     git_dir = workspace / ".git"
-    env = _git_env(token=token, username=username, tmp_dir=tmp_dir)
+    env = _git_env(
+        token=token, username=username, tmp_dir=tmp_dir,
+        credential=credential, proxy=proxy, home=home,
+    )
     info = CheckoutInfo(branch=branch)
 
     if not git_dir.exists():
@@ -420,12 +582,19 @@ def sync_checkout(
     return info
 
 
-def current_commit(workspace: Path, *, token: str = "", username: str = "", tmp_dir: Path | None = None) -> str:
+def current_commit(
+    workspace: Path,
+    *,
+    token: str = "",
+    username: str = "",
+    tmp_dir: Path | None = None,
+    proxy: Mapping[str, str] | None = None,
+) -> str:
     """Read HEAD without touching the network; used to seed a run's baseline."""
     workspace = Path(workspace)
     if not (workspace / ".git").exists():
         return ""
-    env = _git_env(token=token, username=username, tmp_dir=tmp_dir or workspace)
+    env = _git_env(token=token, username=username, tmp_dir=tmp_dir or workspace, proxy=proxy)
     return rev_parse(workspace, "HEAD", env=env, timeout=30)
 
 
@@ -507,10 +676,79 @@ def changed_files_between(
 
 
 def make_git_env(
-    *, token: str = "", username: str = "", tmp_dir: Path
+    *,
+    token: str = "",
+    username: str = "",
+    tmp_dir: Path,
+    credential: "GitCredential | None" = None,
+    proxy: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Public helper so callers can reuse the credential environment."""
-    return _git_env(token=token, username=username, tmp_dir=tmp_dir)
+    return _git_env(
+        token=token, username=username, tmp_dir=tmp_dir,
+        credential=credential, proxy=proxy,
+    )
+
+
+def _proxy_url_of(proxy: Mapping[str, str] | None) -> str:
+    """从代理环境变量里取出 URL，供连通性探测使用。"""
+    if not proxy:
+        return ""
+    return str(proxy.get("https_proxy") or proxy.get("http_proxy") or "")
+
+
+def test_credentials(
+    *,
+    repo_url: str,
+    credential: "GitCredential",
+    tmp_dir: Path,
+    timeout: int = 30,
+    proxy: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> tuple[bool, str]:
+    """用给定凭据试连仓库，返回 ``(是否成功, 说明)``。
+
+    走 ``git ls-remote``：它只协商认证并列出引用，不会写入任何本地状态，
+    因此可以在界面上安全地反复测试。凭据错误、网络不通都能给出具体原因。
+    """
+    problem = validate_repo_url(repo_url)
+    if problem:
+        return False, problem
+
+    if credential.kind == "ssh_key" and not credential.private_key:
+        return False, "SSH 凭据缺少私钥"
+    if credential.kind == "https_token" and not credential.token:
+        return False, "HTTPS 凭据缺少访问令牌"
+
+    unreachable = check_reachable(repo_url, proxy_url=_proxy_url_of(proxy))
+    if unreachable:
+        return False, unreachable
+
+    env = _git_env(
+        credential=credential,
+        proxy=proxy,
+        home=home,
+        tmp_dir=tmp_dir,
+    )
+    result = run_command(
+        ["git", *_GIT_RESILIENCE_CONFIG, "ls-remote", "--heads", "--", repo_url],
+        env=env,
+        timeout=timeout,
+    )
+    if result.ok:
+        branches = [line for line in result.output.splitlines() if line.strip()]
+        return True, f"连接成功，远端有 {len(branches)} 个分支"
+
+    output = (result.output or "").lower()
+    if "authentication failed" in output or "invalid username or password" in output:
+        return False, "认证失败：凭据无效或已过期"
+    if "permission denied" in output or "publickey" in output:
+        return False, "认证失败：密钥不被接受（可能未在仓库中登记公钥）"
+    if "not found" in output and "repository" in output:
+        return False, "仓库不存在或当前凭据无权访问"
+    if "could not read username" in output:
+        return False, "仓库需要认证，但未提供有效凭据"
+    return False, result.error or "连接失败"
 
 
 def _remove_tree(path: Path) -> None:

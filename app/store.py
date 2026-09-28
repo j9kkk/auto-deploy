@@ -19,6 +19,7 @@ from .schedule import iso, utcnow
 TASK_INSERT_COLUMNS = (
     "name", "description",
     "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username", "git_token",
+    "credential_id",
     "schedule_type", "schedule_expression", "enabled",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
     "artifact_paths", "target_dir", "keep_releases",
@@ -30,6 +31,7 @@ TASK_INSERT_COLUMNS = (
 TASK_UPDATE_COLUMNS = (
     "name", "description",
     "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username",
+    "credential_id",
     "schedule_type", "schedule_expression", "enabled",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
     "artifact_paths", "target_dir", "keep_releases",
@@ -175,6 +177,142 @@ class SessionRepository:
             ORDER BY s.id DESC
             """,
             (iso(utcnow()),),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+CREDENTIAL_KINDS = ("https_token", "ssh_key")
+
+
+def decode_credential(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """凭据对外表示：永不包含 secret 明文，只暴露是否已设置。"""
+    if row is None:
+        return None
+    item = dict(row)
+    secret = item.pop("secret", "") or ""
+    item["has_secret"] = bool(secret)
+    item["secret_length"] = len(secret)
+    # SSH 私钥的公开指纹（用于在界面上辨认是哪把钥匙）。
+    if item.get("kind") == "ssh_key" and secret:
+        item["fingerprint"] = ssh_key_fingerprint(secret)
+    return item
+
+
+def ssh_key_fingerprint(private_key: str) -> str:
+    """计算 SSH 公钥指纹，避免把私钥内容泄露给前端。"""
+    import base64
+    import hashlib
+
+    lines = [
+        line.strip()
+        for line in (private_key or "").splitlines()
+        if line.strip() and not line.startswith("-----")
+    ]
+    if not lines:
+        return ""
+    try:
+        blob = base64.b64decode("".join(lines), validate=False)
+    except (ValueError, TypeError):
+        return ""
+    digest = hashlib.sha256(blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+class CredentialRepository:
+    """全局 Git 凭据（HTTPS 令牌 / SSH 私钥）。
+
+    凭据集中存放的意义在于：多处复用的令牌只需维护一份，轮换时改一处即可，
+    并且可以在界面上主动测试是否仍然有效。
+    """
+
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    def create(self, data: dict[str, Any]) -> int:
+        now = iso(utcnow())
+        return self.db.execute(
+            """
+            INSERT INTO credentials (name, kind, username, secret, passphrase, description, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data.get("name", ""), data.get("kind", "https_token"),
+                data.get("username", ""), data.get("secret", ""),
+                data.get("passphrase", ""),
+                data.get("description", ""), now, now,
+            ),
+        )
+
+    def update(self, credential_id: int, data: dict[str, Any]) -> bool:
+        columns: list[str] = []
+        values: list[Any] = []
+        for key in ("name", "kind", "username", "description", "passphrase"):
+            if key in data:
+                columns.append(f"{key} = ?")
+                values.append(data[key])
+        # 只有显式给出 secret 时才覆盖，留空表示保持原值。
+        if data.get("secret"):
+            columns.append("secret = ?")
+            values.append(data["secret"])
+        if not columns:
+            return False
+        values += [iso(utcnow()), credential_id]
+        sql = f"UPDATE credentials SET {', '.join(columns)}, updated_at = ? WHERE id = ?"
+        return self.db.execute_rowcount(sql, values) > 0
+
+    def get(self, credential_id: int) -> dict[str, Any] | None:
+        return self.db.query_one("SELECT * FROM credentials WHERE id = ?", (credential_id,))
+
+    def get_decoded(self, credential_id: int) -> dict[str, Any] | None:
+        return decode_credential(self.get(credential_id))
+
+    def list_all(self) -> list[dict[str, Any]]:
+        return self.db.query("SELECT * FROM credentials ORDER BY name COLLATE NOCASE")
+
+    def list_decoded(self) -> list[dict[str, Any]]:
+        return [decode_credential(row) or {} for row in self.list_all()]
+
+    def name_taken(self, name: str, *, exclude_id: int | None = None) -> bool:
+        if not str(name or "").strip():
+            return False
+        if exclude_id is None:
+            row = self.db.query_one(
+                "SELECT 1 FROM credentials WHERE name = ? COLLATE NOCASE", (str(name),)
+            )
+        else:
+            row = self.db.query_one(
+                "SELECT 1 FROM credentials WHERE name = ? COLLATE NOCASE AND id != ?",
+                (str(name), exclude_id),
+            )
+        return row is not None
+
+    def delete(self, credential_id: int) -> bool:
+        return self.db.execute_rowcount(
+            "DELETE FROM credentials WHERE id = ?", (credential_id,)
+        ) > 0
+
+    def usage_count(self, credential_id: int) -> int:
+        """有多少任务正在引用该凭据（删除前提示用）。"""
+        return int(
+            self.db.scalar(
+                "SELECT COUNT(*) FROM tasks WHERE credential_id = ?",
+                (credential_id,),
+                default=0,
+            )
+            or 0
+        )
+
+    def record_test(self, credential_id: int, *, ok: bool, error: str = "") -> None:
+        self.db.execute_rowcount(
+            """
+            UPDATE credentials
+               SET last_tested_at = ?, last_test_ok = ?, last_test_error = ?
+             WHERE id = ?
+            """,
+            (iso(utcnow()), 1 if ok else 0, error[:500], credential_id),
         )
 
 
@@ -708,6 +846,7 @@ class Store:
         self.db.init_schema()
         self.users = UserRepository(self.db)
         self.sessions = SessionRepository(self.db)
+        self.credentials = CredentialRepository(self.db)
         self.tasks = TaskRepository(self.db)
         self.runs = RunRepository(self.db)
         self.audit = AuditRepository(self.db)
