@@ -894,6 +894,17 @@ def run() -> int:
         check("退出后无法访问", response.status_code == 401)
 
     # ------------------------------------------------------------------
+    section("自我更新支持")
+    install_sh = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    check("install.sh 含延迟重启授权（老安装升级后可用）",
+          "systemd-run --collect --on-active=5s /usr/bin/systemctl restart" in install_sh)
+    check("install.sh 每次重写 sudoers（升级能拿到新授权）",
+          'cat > "/etc/sudoers.d/$SERVICE_NAME"' in install_sh
+          and 'if [ ! -f "/etc/sudoers.d/$SERVICE_NAME" ]' not in install_sh)
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    check("README 含自我更新章节", "## 自我更新" in readme)
+
+    # ------------------------------------------------------------------
     section("凭据与代理")
 
     from app.config import Settings, describe_proxy, proxy_env, proxy_url_with_auth

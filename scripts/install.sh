@@ -51,18 +51,22 @@ else
 fi
 
 # The service user must be able to stop/restart services it deploys.
-log "检查 sudo 权限（用于 systemd 部署方式）"
-if [ ! -f "/etc/sudoers.d/$SERVICE_NAME" ]; then
-  cat > "/etc/sudoers.d/$SERVICE_NAME" <<EOF
+log "检查 sudo 权限（用于 systemd 部署与自我更新）"
+# sudoers 文件由本脚本生成，每次安装/升级都重写：
+# 老版本升级后必须拿到新增的授权（如自我更新的延迟重启），不能跳过。
+cat > "/etc/sudoers.d/$SERVICE_NAME" <<EOF
 # Allow AutoDeploy to restart units it deploys.
 $RUN_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart *, /usr/bin/systemctl start *, /usr/bin/systemctl stop *, /usr/bin/systemctl is-active *, /usr/bin/systemctl daemon-reload
+# 自我更新：部署脚本最后一条命令。固定无通配符（不可注入），
+# 通过 systemd 定时器把重启延迟到部署记录落库之后，且定时器
+# 位于系统 systemd 中，不在服务的 cgroup 内，重启不会误杀部署脚本。
+$RUN_USER ALL=(root) NOPASSWD: /usr/bin/systemd-run --collect --on-active=5s /usr/bin/systemctl restart $SERVICE_NAME
 EOF
-  chmod 0440 "/etc/sudoers.d/$SERVICE_NAME"
-  visudo -c -f "/etc/sudoers.d/$SERVICE_NAME" >/dev/null 2>&1 || {
-    rm -f "/etc/sudoers.d/$SERVICE_NAME"
-    log "警告: sudoers 校验失败，已跳过；如需 systemd 部署请手动配置"
-  }
-fi
+chmod 0440 "/etc/sudoers.d/$SERVICE_NAME"
+visudo -c -f "/etc/sudoers.d/$SERVICE_NAME" >/dev/null 2>&1 || {
+  rm -f "/etc/sudoers.d/$SERVICE_NAME"
+  log "警告: sudoers 校验失败，已跳过；systemd 部署与自我更新需手动配置"
+}
 
 # Docker 部署方式（docker build / docker compose）需要访问
 # /var/run/docker.sock，该 socket 只允许 root 与 docker 组成员读写。
@@ -187,6 +191,11 @@ cat <<EOF
   docker 组权限已自动配置。
 ${DOCKER_HINT:+
   $DOCKER_HINT}
+
+  自我更新：可建一个任务让本服务部署它自己（README「自我更新」）。
+  部署脚本最后一条固定命令已获授权（延迟重启，避免中断部署记录）：
+      sudo /usr/bin/systemd-run --collect --on-active=5s \
+           /usr/bin/systemctl restart $SERVICE_NAME
 
   注意：docker 组权限等价于 root，且本服务可执行任意部署脚本，
   请勿将控制台直接暴露到公网。

@@ -194,6 +194,74 @@ sudo ./scripts/uninstall.sh --purge     # 连数据目录与账号一起删除
 
 ---
 
+## 自我更新
+
+AutoDeploy 可以部署它自己：建一个任务，仓库指向本项目，部署脚本把新版本
+同步进安装目录并延迟重启服务。这也是官方推荐的升级方式——每次发版后点一次
+「运行」，服务即完成自我升级。
+
+### 任务配置
+
+| 配置项 | 值 |
+|--------|-----|
+| 仓库地址 | `https://github.com/j9kkk/git-deploy.git`（或镜像前缀） |
+| 分支 | `main`；生产环境建议填稳定 tag（如 `v1.2.1`），git 拉取 tag 名同样有效 |
+| 部署方式 | 自定义脚本 |
+| 打包路径 | `app`、`web`、`requirements.txt`、`run.sh`（每行一条） |
+| 超时 | 建议 300 秒以上（含 `pip install`） |
+
+> **打包路径必须填写**：自定义脚本方式下留空表示「纯脚本任务」，服务不会
+> 暂存任何文件，发布目录为空，脚本里就没有可同步的 `$AUTODEPLOY_RELEASE_DIR`。
+
+### 部署脚本模板
+
+```bash
+set -e
+STAGE="$AUTODEPLOY_RELEASE_DIR"
+TARGET="/opt/autodeploy"                # 安装目录，与 install.sh 一致
+BAK="/var/lib/autodeploy/self-update-backups"
+
+# 1. 备份当前版本（保留最近 3 份，升级失败可回滚）
+mkdir -p "$BAK"
+STAMP="$(date +%Y%m%d%H%M%S)"
+cp -a "$TARGET/app" "$BAK/app-$STAMP"
+cp -a "$TARGET/web" "$BAK/web-$STAMP"
+ls -1dt "$BAK"/app-* 2>/dev/null | tail -n +4 | xargs -r rm -rf
+
+# 2. 同步新版本（打包路径只含这四项；安装目录属主就是服务账号，无需 sudo）
+rsync -a --delete "$STAGE/app/"  "$TARGET/app/"
+rsync -a --delete "$STAGE/web/"  "$TARGET/web/"
+cp -f "$STAGE/requirements.txt" "$STAGE/run.sh" "$TARGET/"
+
+# 3. 更新依赖
+"$TARGET/.venv/bin/pip" install -q -r "$TARGET/requirements.txt"
+
+# 4. 延迟重启（最后一条命令，必须原样使用）
+#    5 秒后由 systemd 在本服务 cgroup 之外执行重启，
+#    让本次运行先正常落库为「成功」；直接 systemctl restart 会把
+#    部署脚本连同整个服务 cgroup 一起杀掉，运行会被记为中断。
+sudo /usr/bin/systemd-run --collect --on-active=5s \
+     /usr/bin/systemctl restart autodeploy
+
+echo "新版本已就位，服务即将重启"
+```
+
+### 局限与注意
+
+- **只更新代码与依赖**：systemd 单元、sudoers 等系统配置若有变更，仍需手动
+  重跑一次 `scripts/install.sh`（升级到 1.2.1 及以后时重跑一次即可，之后无感）。
+- **回滚**：升级失败导致服务起不来时，从备份目录恢复并重启：
+
+  ```bash
+  sudo rm -rf /opt/autodeploy/app /opt/autodeploy/web
+  sudo cp -a /var/lib/autodeploy/self-update-backups/app-<时间戳> /opt/autodeploy/app
+  sudo cp -a /var/lib/autodeploy/self-update-backups/web-<时间戳> /opt/autodeploy/web
+  sudo systemctl restart autodeploy
+  ```
+
+- **服务起不来时控制台也进不去**，所以备份与回滚命令要提前知晓，别等到出事再找。
+- 不要把自部署任务指向未验证的分支；生产建议锁定稳定 tag，升级即「改 tag → 运行」。
+
 ## 工作原理
 
 每次运行的流水线：

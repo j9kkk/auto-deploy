@@ -4,6 +4,25 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.1] - 2026-09-29
+
+支持用 AutoDeploy 部署它自己（自我更新），并修复升级时的授权缺失。
+
+### 新增
+
+- **自我更新**（README「自我更新」章节）：建一个任务指向本仓库，部署脚本
+  同步新版本到安装目录并延迟重启，即完成一次自升级；含备份保留与回滚步骤。
+- sudoers 新增一条**固定无通配符**授权，用于延迟重启：
+  `/usr/bin/systemd-run --collect --on-active=5s /usr/bin/systemctl restart <服务名>`。
+  部署脚本先正常退出、运行记录落库为成功，5 秒后由系统 systemd 在服务
+  cgroup 之外执行重启——避免自我更新时部署脚本连同服务一起被杀、
+  成功的升级被记为中断。
+
+### 变更
+
+- `install.sh` 的 sudoers 文件改为**每次安装/升级都重写**（此前只在不存在时
+  创建），否则老安装升级后拿不到新增授权。重跑一次 install.sh 即可完成升级。
+
 ## [1.2.0] - 2026-09-28
 
 新增 Git 凭据集中管理与网络代理支持，覆盖私有仓库与内网环境。
@@ -125,6 +144,7 @@
   数据库仓储层、完整 API 端到端流程（含真实部署、取消、日志增量协议）与调度器行为。
 
 
+[1.2.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.2.1
 [1.2.0]: https://github.com/j9kkk/git-deploy/releases/tag/v1.2.0
 [1.1.0]: https://github.com/j9kkk/git-deploy/releases/tag/v1.1.0
 [1.0.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.0.1
