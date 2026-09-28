@@ -27,7 +27,7 @@ from .service import Service
 
 logger = logging.getLogger("autodeploy")
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 
 def create_app(service: Service | None = None) -> FastAPI:

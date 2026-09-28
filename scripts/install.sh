@@ -151,6 +151,19 @@ cat <<EOF
       systemctl restart $SERVICE_NAME
       journalctl -u $SERVICE_NAME -f
 
+  卸载：sudo $ROOT_DIR/scripts/uninstall.sh          （保留数据）
+        sudo $ROOT_DIR/scripts/uninstall.sh --purge  （连数据一起删）
+
+  如任务要使用 Docker 部署方式（docker build / docker compose），
+  需要把服务账号加入 docker 组，否则会报
+  "permission denied ... /var/run/docker.sock"：
+
+      sudo usermod -aG docker $RUN_USER
+      sudo systemctl restart $SERVICE_NAME
+
+  注意：docker 组权限等价于 root，且本服务可执行任意部署脚本，
+  请勿将控制台直接暴露到公网。
+
   如需公网访问，建议在前面加一层 Nginx 并启用 HTTPS，
   参考 deploy/nginx.conf.example，并记得在「设置」中开启
   「仅通过 HTTPS 发送会话 Cookie」。

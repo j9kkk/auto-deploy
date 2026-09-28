@@ -107,6 +107,32 @@ journalctl -u autodeploy -f
 可用环境变量调整安装位置：`AUTODEPLOY_INSTALL_DIR`、`AUTODEPLOY_DATA_DIR`、
 `AUTODEPLOY_USER`、`AUTODEPLOY_PORT`、`AUTODEPLOY_HOST`。
 
+### Docker 部署方式
+
+安装脚本创建的 `autodeploy` 账号默认没有 Docker 权限，任务使用 Docker /
+Docker Compose 部署方式前需要加组：
+
+```bash
+sudo usermod -aG docker autodeploy
+sudo systemctl restart autodeploy    # 组变更需重启服务进程才生效
+```
+
+注意：docker 组权限等价于 root，请勿将控制台直接暴露到公网。
+
+### 卸载
+
+```bash
+sudo ./scripts/uninstall.sh --dry-run   # 预览将执行的操作，不做任何改动
+sudo ./scripts/uninstall.sh             # 停止并删除服务，保留数据目录与账号
+sudo ./scripts/uninstall.sh --purge     # 连数据目录与账号一起删除
+```
+
+默认卸载会保留 `/var/lib/autodeploy`（任务配置、运行历史、打包产物），
+确认不再需要时再用 `--purge`。无论哪种方式，**任务发布到「目标目录」的
+站点（如 `/var/www/blog`）不会被删除**，卸载开始时会把这些目录列出来。
+安装时用过非默认路径的，用同样的环境变量指定，例如
+`sudo AUTODEPLOY_DATA_DIR=/data/autodeploy ./scripts/uninstall.sh --purge`。
+
 ### 反向代理
 
 如需公网访问，请在前面加 Nginx 并启用 HTTPS，参考 [deploy/nginx.conf.example](deploy/nginx.conf.example)。

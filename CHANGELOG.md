@@ -39,4 +39,20 @@
   路径校验、发布与软链原子性、本地 Git 克隆与变更检测、命令执行与取消、
   数据库仓储层、完整 API 端到端流程（含真实部署、取消、日志增量协议）与调度器行为。
 
+## [1.0.1] - 2026-09-28
+
+### 新增
+
+- **卸载脚本** `scripts/uninstall.sh`：默认停止并删除服务但保留数据目录与账号；
+  `--purge` 在交互确认后连数据一起删除；`--dry-run` 预览全部操作。
+  卸载开始时会列出任务发布过的「目标目录」（站点），这些目录不会被删除。
+  数据库损坏时卸载仍可继续。
+
+### 变更
+
+- `scripts/install.sh` 安装完成提示中加入 Docker 部署方式的加组说明
+  （`usermod -aG docker`）与卸载命令，避免
+  `permission denied ... /var/run/docker.sock` 报错后才排查。
+
+[1.0.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.0.1
 [1.0.0]: https://github.com/j9kkk/git-deploy/releases/tag/v1.0.0
