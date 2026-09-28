@@ -69,11 +69,18 @@
 
   AD.render = async function (view) {
     const container = document.getElementById('content');
+    const previousView = AD.state.currentView;
     AD.state.currentView = view;
     document.querySelectorAll('#nav .nav-item').forEach((item) => {
       item.classList.toggle('active', item.dataset.view === view);
     });
     AD.stopLiveLog();
+    if (AD.stopAllInlineLogs) {
+      AD.stopAllInlineLogs(); // 停掉行内日志轮询（任务页重绘后会按需重启）
+      // 只在真正离开任务页时清除展开状态；任务页内部重绘需要保留它，
+      // 以便把用户正在看的展开行在渲染后恢复回来。
+      if (previousView !== 'tasks') AD.state.expandedTaskId = null;
+    }
     container.innerHTML = '<div class="loading-block"><span class="spinner"></span> 加载中…</div>';
     try {
       await AD.views[view](container);

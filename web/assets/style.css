@@ -241,6 +241,68 @@ tbody tr:hover { background: rgba(255,255,255,0.022); }
 tbody tr:last-child td { border-bottom: none; }
 .table-wrap { overflow-x: auto; margin: 0 -18px; padding: 0 18px; }
 .table-actions { display: flex; gap: 5px; justify-content: flex-end; flex-wrap: wrap; }
+.row-actions { gap: 4px; }
+
+/* ---------------------------------------------------- icon action buttons */
+.icon-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  justify-content: center;
+  color: var(--text-dim);
+}
+.icon-btn svg { width: 15px; height: 15px; display: block; }
+.icon-btn.run { background: var(--success-soft); border-color: rgba(62,207,142,0.4); color: var(--success); }
+.icon-btn.run:hover:not(:disabled) { background: rgba(62,207,142,0.24); }
+.icon-btn.stop { background: var(--danger-soft); border-color: rgba(255,95,109,0.4); color: var(--danger); }
+.icon-btn.stop:hover:not(:disabled) { background: rgba(255,95,109,0.24); }
+.icon-btn:hover:not(:disabled) { color: var(--text); }
+
+/* ------------------------------------------------- clickable task name --- */
+.task-name-link {
+  font-weight: 500;
+  color: var(--text);
+  cursor: pointer;
+  border-bottom: 1px dashed transparent;
+  transition: color .12s;
+}
+.task-name-link:hover { color: var(--accent); }
+.task-name-link.expanded { color: var(--accent); }
+.row-disabled .task-name-link { color: var(--text-dim); }
+.row-disabled .task-name-link:hover { color: var(--accent); }
+
+/* ------------------------------------------------------ disabled row ----- */
+/* 禁用行压暗方式：不用整体透明度（会把辅助文字压到 4.5:1 以下），
+ * 而是把行内辅助文字(faint)提升为 dim 色、dim 保持原色，主文字保持原色。
+ * 结果：主文字 9.1:1、辅助文字 6.8:1，均满足 WCAG AA；
+ * 操作按钮与状态徽标不变。禁用感由颜色层次 + 徽标状态传达。 */
+tr.row-disabled .task-name-cell,
+tr.row-disabled td:nth-child(2),
+tr.row-disabled td:nth-child(3),
+tr.row-disabled td:nth-child(4),
+tr.row-disabled td:nth-child(5),
+tr.row-disabled td:nth-child(6) { opacity: 0.92; }
+tr.row-disabled .faint { color: var(--text-dim); }
+tr.row-disabled .dim { color: var(--text-dim); }
+tr.row-disabled .row-actions { opacity: 1; }
+
+/* --------------------------------------------------- inline expand row --- */
+.expand-row > td {
+  padding: 0;
+  background: rgba(255,255,255,0.018);
+  border-bottom: 1px solid var(--border);
+}
+.expand-row[hidden] { display: none; }
+.task-expand { padding: 14px 18px 16px; }
+.task-expand .log-view { max-height: 340px; min-height: 140px; margin-top: 8px; }
+.task-expand .expand-log-head {
+  display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap;
+}
+.task-expand .section-title { margin-top: 14px; }
+.task-expand dl.kv { margin: 0; }
+.task-expand .mini-runs table { font-size: 12.5px; }
+.task-expand .mini-runs td, .task-expand .mini-runs th { padding: 7px 8px; }
+.task-expand .expand-toolbar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 
 /* --------------------------------------------------------------- badges -- */
 .badge {

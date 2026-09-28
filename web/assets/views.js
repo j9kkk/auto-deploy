@@ -25,6 +25,21 @@ AD.views = {};
   }
   AD.methodLabel = methodLabel;
 
+  // ---------------------------------------------------------------- icons
+  // 全部为内联 SVG（stroke 继承 currentColor），无外部资源依赖。
+  const ICONS = {
+    play: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13a.7.7 0 0 0 1.07.6l10.2-6.5a.7.7 0 0 0 0-1.2L9.07 4.9A.7.7 0 0 0 8 5.5z"/></svg>',
+    stop: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="1.6"/></svg>',
+    log: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 5.5h16M4 12h16M4 18.5h10"/></svg>',
+    edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4.5L19 9.5a2.1 2.1 0 0 0-3-3L5.5 17 4 20z"/></svg>',
+    disable: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.2"/><path d="M6 6l12 12"/></svg>',
+    enable: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+    refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v4h-4"/></svg>',
+    download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>',
+    rollback: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>',
+  };
+  AD.ICONS = ICONS;
+
   // ======================================================================
   // Dashboard
   // ======================================================================
@@ -235,6 +250,11 @@ AD.views = {};
         : AD.state.tasks;
       body.innerHTML = renderTaskTable(tasks, keyword);
       bindTaskActions(container);
+      // 状态刷新（如运行结束后的重绘）会重建表格；把之前展开的行恢复，
+      // 避免用户正在看的实时日志凭空消失。
+      if (AD.state.expandedTaskId && tasks.some((task) => task.id === AD.state.expandedTaskId)) {
+        AD.toggleTaskExpand(AD.state.expandedTaskId, { forceOpen: true });
+      }
     };
     render('');
 
@@ -286,9 +306,15 @@ AD.views = {};
       ? `${e(AD.formatTime(task.next_run_at))}<div class="faint">${e(AD.scheduleText(task))}</div>`
       : `<span class="faint">${e(task.enabled ? '仅手动触发' : '已暂停')}</span>`;
 
-    return `<tr>
-      <td style="min-width:200px">
-        <div style="font-weight:500">${e(task.name)}</div>
+    // 运行/停止共用一个位置：空闲时是播放（运行），运行中变为终止（取消）。
+    const runButton = active
+      ? `<button class="icon-btn stop" data-task-cancel="${task.id}" title="停止当前运行" aria-label="停止当前运行">${ICONS.stop}</button>`
+      : `<button class="icon-btn run" data-task-run="${task.id}" title="立即运行" aria-label="立即运行">${ICONS.play}</button>`;
+
+    return `<tr data-task-row="${task.id}" class="${task.enabled ? '' : 'row-disabled'}">
+      <td style="min-width:200px" class="task-name-cell">
+        <div class="task-name-link" data-task-toggle-expand="${task.id}"
+             title="点击展开详情与日志">${e(task.name)}</div>
         <div class="faint truncate" style="max-width:280px" title="${a(task.repo_url)}">
           ${e(task.repo_url)}<span class="dim"> @${e(task.repo_branch)}</span>
         </div>
@@ -299,13 +325,14 @@ AD.views = {};
       <td class="nowrap">${lastRun}</td>
       <td class="nowrap">${nextRun}</td>
       <td>
-        <div class="table-actions">
-          <button class="sm" data-task-run="${task.id}" title="立即运行">运行</button>
-          ${active ? `<button class="sm danger" data-task-cancel="${task.id}">停止</button>` : ''}
-          <button class="sm" data-task-open="${task.id}">详情</button>
-          <button class="sm" data-task-edit="${task.id}">编辑</button>
-          <button class="sm" data-task-toggle="${task.id}" title="${task.enabled ? '暂停调度' : '启用调度'}">
-            ${task.enabled ? '暂停' : '启用'}
+        <div class="table-actions row-actions">
+          ${runButton}
+          <button class="icon-btn" data-task-log="${task.id}" title="展开最近日志" aria-label="展开最近日志">${ICONS.log}</button>
+          <button class="icon-btn" data-task-edit="${task.id}" title="编辑任务" aria-label="编辑任务">${ICONS.edit}</button>
+          <button class="icon-btn" data-task-toggle="${task.id}"
+                  title="${task.enabled ? '禁用调度' : '启用调度'}"
+                  aria-label="${task.enabled ? '禁用调度' : '启用调度'}">
+            ${task.enabled ? ICONS.disable : ICONS.enable}
           </button>
         </div>
       </td>
@@ -319,48 +346,327 @@ AD.views = {};
     return '仅手动';
   };
 
+  // 任务页所有动作使用事件委托：监听器只挂一次，表格随状态重绘、行内
+  // 展开随启停重建都不会累积或丢失事件绑定。
   function bindTaskActions(container) {
+    if (container.dataset.taskActionsBound) return;
+    container.dataset.taskActionsBound = '1';
+
     const handle = async (button, fn) => {
       AD.setBusy(button, true);
       try { await fn(); } catch (err) { AD.toastError(err.message); } finally { AD.setBusy(button, false); }
     };
 
-    container.querySelectorAll('[data-task-run]').forEach((button) => {
-      button.addEventListener('click', () => handle(button, async () => {
-        const result = await AD.api.post(`/api/tasks/${button.dataset.taskRun}/run`);
-        AD.toastSuccess('已开始运行 #' + result.run_id);
-        AD.render('tasks');
-      }));
+    container.addEventListener('click', (event) => {
+      const run = event.target.closest('[data-task-run]');
+      if (run) {
+        handle(run, async () => {
+          const result = await AD.api.post(`/api/tasks/${run.dataset.taskRun}/run`);
+          AD.toastSuccess('已开始运行 #' + result.run_id);
+          // 运行后直接展开该行，让用户看到实时日志。
+          await AD.render('tasks');
+          AD.toggleTaskExpand(Number(run.dataset.taskRun), { forceOpen: true, runId: result.run_id });
+        });
+        return;
+      }
+      const cancel = event.target.closest('[data-task-cancel]');
+      if (cancel) {
+        handle(cancel, async () => {
+          await AD.api.post(`/api/tasks/${cancel.dataset.taskCancel}/cancel`);
+          AD.toastSuccess('已请求取消当前运行');
+          AD.render('tasks');
+        });
+        return;
+      }
+      const logBtn = event.target.closest('[data-task-log]');
+      if (logBtn) {
+        AD.toggleTaskExpand(Number(logBtn.dataset.taskLog), { forceOpen: true, focusLog: true });
+        return;
+      }
+      const nameLink = event.target.closest('[data-task-toggle-expand]');
+      if (nameLink) {
+        AD.toggleTaskExpand(Number(nameLink.dataset.taskToggleExpand));
+        return;
+      }
+      const edit = event.target.closest('[data-task-edit]');
+      if (edit) {
+        AD.openTaskForm(Number(edit.dataset.taskEdit));
+        return;
+      }
+      const toggle = event.target.closest('[data-task-toggle]');
+      if (toggle) {
+        handle(toggle, async () => {
+          const result = await AD.api.post(`/api/tasks/${toggle.dataset.taskToggle}/toggle`);
+          AD.toastSuccess(result.enabled ? '任务已启用' : '任务已禁用');
+          AD.render('tasks');
+        });
+        return;
+      }
+      const emptyNew = event.target.closest('#task-new-empty');
+      if (emptyNew) AD.openTaskForm(null);
     });
-
-    container.querySelectorAll('[data-task-cancel]').forEach((button) => {
-      button.addEventListener('click', () => handle(button, async () => {
-        await AD.api.post(`/api/tasks/${button.dataset.taskCancel}/cancel`);
-        AD.toastSuccess('已请求取消当前运行');
-        AD.render('tasks');
-      }));
-    });
-
-    container.querySelectorAll('[data-task-open]').forEach((button) => {
-      button.addEventListener('click', () => AD.openTaskDetail(Number(button.dataset.taskOpen)));
-    });
-
-    container.querySelectorAll('[data-task-edit]').forEach((button) => {
-      button.addEventListener('click', () => AD.openTaskForm(Number(button.dataset.taskEdit)));
-    });
-
-    container.querySelectorAll('[data-task-toggle]').forEach((button) => {
-      button.addEventListener('click', () => handle(button, async () => {
-        const result = await AD.api.post(`/api/tasks/${button.dataset.taskToggle}/toggle`);
-        AD.toastSuccess(result.enabled ? '任务已启用' : '任务已暂停');
-        AD.render('tasks');
-      }));
-    });
-
-    const emptyButton = container.querySelector('#task-new-empty');
-    if (emptyButton) emptyButton.addEventListener('click', () => AD.openTaskForm(null));
   }
   AD.bindTaskActions = bindTaskActions;
+
+  // ======================================================================
+  // 行内展开：详情 + 实时日志（替代原弹窗）
+  // ======================================================================
+  AD.toggleTaskExpand = async function (taskId, options) {
+    const options_ = options || {};
+    const row = document.querySelector(`tr[data-task-row="${taskId}"]`);
+    if (!row) { AD.state.expandedTaskId = null; return; }
+
+    const existing = document.getElementById(`task-expand-${taskId}`);
+    const nameLink = row.querySelector('.task-name-link');
+    if (existing && !options_.forceOpen) {
+      existing.remove();
+      nameLink.classList.remove('expanded');
+      AD.stopInlineLog(taskId);
+      AD.state.expandedTaskId = null;
+      return;
+    }
+
+    // 只保留一个展开行，展开新的收起旧的。
+    document.querySelectorAll('.expand-row').forEach((node) => node.remove());
+    document.querySelectorAll('.task-name-link.expanded').forEach((node) => node.classList.remove('expanded'));
+    Object.keys(AD.state.inlineLogTimers || {}).forEach((key) => AD.stopInlineLog(Number(key)));
+    AD.state.expandedTaskId = taskId;
+
+    const placeholder = document.createElement('tr');
+    placeholder.className = 'expand-row';
+    placeholder.id = `task-expand-${taskId}`;
+    placeholder.innerHTML = `<td colspan="7"><div class="task-expand">
+      <div class="loading-block" style="padding:22px"><span class="spinner"></span> 加载中…</div>
+    </div></td>`;
+    row.after(placeholder);
+    nameLink.classList.add('expanded');
+
+    let data;
+    try { data = await AD.api.get(`/api/tasks/${taskId}`); }
+    catch (err) {
+      placeholder.remove();
+      nameLink.classList.remove('expanded');
+      AD.state.expandedTaskId = null;
+      AD.toastError(err.message);
+      return;
+    }
+    if (!document.getElementById(`task-expand-${taskId}`)) return; // 已被收起
+
+    const t = data.task;
+    const runs = data.runs || [];
+    const checks = data.preflight || [];
+    const activeRun = runs.find((run) => run.status === 'queued' || run.status === 'running');
+    const lastRun = runs[0];
+
+    placeholder.querySelector('td > .task-expand').innerHTML = `
+      <div class="expand-toolbar">
+        <span class="badge ${t.enabled ? 'on' : 'off'}">${t.enabled ? '已启用' : '已禁用'}</span>
+        <span class="badge neutral">${e(methodLabel(t.deploy_method))}</span>
+        <span class="faint">${e(AD.scheduleText(t))}</span>
+        ${nextRunInline(t)}
+        <div class="spacer"></div>
+        <button class="sm" data-inline-edit="${t.id}">${ICONS.edit} 编辑</button>
+        <button class="sm" data-inline-rollback="${t.id}">${ICONS.rollback} 回滚上一版本</button>
+        <button class="sm" data-inline-artifacts="${t.id}">${ICONS.download} 产物</button>
+        ${activeRun ? `<button class="sm danger" data-inline-cancel="${activeRun.id}">取消 #${activeRun.id}</button>`
+                    : `<button class="sm" data-inline-run="${t.id}">${ICONS.play} 运行</button>`}
+      </div>
+
+      <dl class="kv">
+        <dt>仓库</dt><dd class="mono">${e(t.repo_url)} <span class="dim">@${e(t.repo_branch)}</span>${t.repo_subdir ? ' / ' + e(t.repo_subdir) : ''}</dd>
+        <dt>发布目录</dt><dd class="mono truncate" title="${a(t.releases_root || '')}">${e(t.releases_root || '—')}</dd>
+        <dt>环境检查</dt><dd>${checks.map((c) =>
+          `<span class="badge ${c.ok ? 'on' : 'failed'}" title="${a(c.message)}">${c.ok ? '✓' : '✗'} ${e(c.name)}</span>`).join(' ') || '<span class="faint">—</span>'}</dd>
+      </dl>
+
+      <div class="expand-log-head">
+        <strong style="font-size:13px">执行日志</strong>
+        <span class="faint" data-inline-logmeta></span>
+        <div class="spacer"></div>
+        ${lastRun ? `<a class="faint" href="/api/runs/${lastRun.id}/log?download=true">下载日志</a>` : ''}
+      </div>
+      <div class="log-view" data-inline-log><span class="log-empty">${lastRun ? '加载中…' : '该任务还没有运行记录'}</span></div>
+
+      <div class="section-title">最近运行</div>
+      <div class="mini-runs">${renderInlineRuns(runs, taskId)}</div>
+    `;
+
+    // --- 工具条动作 -----------------------------------------------
+    const root = placeholder.querySelector('.task-expand');
+    const busyGuard = async (button, fn) => {
+      AD.setBusy(button, true);
+      try { await fn(); } catch (err) { AD.toastError(err.message); } finally { AD.setBusy(button, false); }
+    };
+    const inline = async (selector, fn) => {
+      const button = root.querySelector(selector);
+      if (!button) return;
+      button.addEventListener('click', () => busyGuard(button, fn));
+    };
+    root.querySelector('[data-inline-edit]')?.addEventListener('click', () => AD.openTaskForm(taskId));
+    inline('[data-inline-run]', async () => {
+      const result = await AD.api.post(`/api/tasks/${taskId}/run`);
+      AD.toastSuccess('已开始运行 #' + result.run_id);
+      AD.toggleTaskExpand(taskId, { forceOpen: true, runId: result.run_id });
+    });
+    inline('[data-inline-cancel]', async () => {
+      await AD.api.post(`/api/runs/${root.querySelector('[data-inline-cancel]').dataset.inlineCancel}/cancel`);
+      AD.toastSuccess('已请求取消');
+      AD.toggleTaskExpand(taskId, { forceOpen: true });
+    });
+    inline('[data-inline-rollback]', async () => {
+      const result = await AD.api.post(`/api/tasks/${taskId}/rollback`);
+      AD.toastSuccess(result.message);
+    });
+    root.querySelector('[data-inline-artifacts]')?.addEventListener('click', async () => {
+      try {
+        const artifacts = await AD.api.get(`/api/tasks/${taskId}/artifacts`);
+        if (!artifacts.artifacts.length) { AD.toast('暂无打包产物', 'info'); return; }
+        const list = artifacts.artifacts.map((item) =>
+          `<li><a href="${a(item.url)}" download>${e(item.name)}</a>
+           <span class="faint">${e(AD.formatBytes(item.size))} · ${e(AD.formatRelative(item.modified_at))}</span></li>`).join('');
+        AD.Modal.open({
+          title: '打包产物',
+          size: 'narrow',
+          body: `<ul class="release-list">${list}</ul>`,
+          footer: '<button data-close>关闭</button>',
+        });
+      } catch (err) { AD.toastError(err.message); }
+    });
+
+    // --- 日志：实时轮询，与弹窗版同一套增量协议 ---------------------
+    const logEl = root.querySelector('[data-inline-log]');
+    const metaEl = root.querySelector('[data-inline-logmeta]');
+    const targetRunId = options_.runId || (activeRun ? activeRun.id : (lastRun ? lastRun.id : null));
+    startInlineLog(taskId, targetRunId, logEl, metaEl);
+  };
+
+  function nextRunInline(task) {
+    if (!task.enabled) return '<span class="faint">已禁用调度</span>';
+    if (!task.next_run_at) return '<span class="faint">仅手动触发</span>';
+    const when = new Date(String(task.next_run_at).endsWith('Z') ? task.next_run_at : task.next_run_at + 'Z');
+    const seconds = Math.max(0, Math.round((when.getTime() - Date.now()) / 1000));
+    return `<span class="faint">下次：${e(AD.formatTime(task.next_run_at))}（${e(AD.formatCountdown(seconds))}后）</span>`;
+  }
+
+  function renderInlineRuns(runs, taskId) {
+    if (!runs.length) return '<p class="faint">还没有运行记录；点击右上角「运行」开始第一次部署。</p>';
+    return `<table><thead><tr>
+        <th>#</th><th>状态</th><th>提交</th><th>触发</th><th>耗时</th><th>时间</th><th></th>
+      </tr></thead><tbody>${runs.slice(0, 8).map((run) => `<tr>
+        <td class="mono dim">${run.id}</td>
+        <td><span class="badge ${e(run.status)}">${run.status === 'running' || run.status === 'queued' ? `<span class="dot ${e(run.status)}"></span>` : ''}${e(AD.statusLabel(run.status))}</span></td>
+        <td class="mono dim truncate" style="max-width:200px" title="${a(run.commit_message || '')}">${run.commit_after ? e(AD.shortCommit(run.commit_after)) + ' ' + e(run.commit_message || '') : '—'}</td>
+        <td class="dim">${e(AD.triggerLabel(run.trigger))}</td>
+        <td class="dim nowrap">${e(AD.formatDuration(run.duration_ms))}</td>
+        <td class="dim nowrap">${e(AD.formatRelative(run.queued_at))}</td>
+        <td class="right"><button class="sm" data-run-log="${run.id}">详情</button></td>
+      </tr>`).join('')}</tbody></table>
+      <div class="faint" style="margin-top:6px">共 ${runs.length} 条记录</div>`;
+  }
+
+  // 行内实时日志：每个任务独立计时器，离开页面/收起时清理。
+  AD.state.inlineLogTimers = {};
+
+  AD.stopInlineLog = function (taskId) {
+    const timer = AD.state.inlineLogTimers[taskId];
+    if (timer) { clearInterval(timer); delete AD.state.inlineLogTimers[taskId]; }
+  };
+
+  AD.stopAllInlineLogs = function () {
+    Object.keys(AD.state.inlineLogTimers).forEach((key) => AD.stopInlineLog(Number(key)));
+  };
+
+  function startInlineLog(taskId, runId, logEl, metaEl) {
+    if (!runId) return;
+    let lineCount = 0;
+    let started = false;
+
+    const paint = (lines, reset) => {
+      if (reset) { logEl.innerHTML = ''; lineCount = 0; }
+      if (!lines.length && !logEl.childElementCount) {
+        logEl.innerHTML = '<span class="log-empty">暂无日志输出</span>';
+        return;
+      }
+      logEl.insertAdjacentHTML('beforeend',
+        lines.map((line) => `<div class="log-line">${colorize(line)}</div>`).join(''));
+      while (logEl.childElementCount > 800) logEl.removeChild(logEl.firstChild); // 防止长日志撑爆 DOM
+      if (metaEl) metaEl.textContent = '共 ' + lineCount + ' 行 · 运行 #' + runId;
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+
+    const poll = async () => {
+      try {
+        const result = await AD.api.get(`/api/runs/${runId}/tail?after=${lineCount}`);
+        if (result.reset) { paint(result.lines || [], true); lineCount = (result.lines || []).length; }
+        else if (result.lines && result.lines.length) { paint(result.lines, false); lineCount = result.total; }
+        if (!result.active) {
+          AD.stopInlineLog(taskId);
+          // 状态落定：原地更新这一行的运行/停止图标，不重建表格
+          //（重建会销毁正在查看的展开行）。
+          refreshTaskRowInPlace(taskId);
+        }
+      } catch (err) { AD.stopInlineLog(taskId); }
+    };
+
+    const timer = setInterval(poll, 1200);
+    AD.state.inlineLogTimers[taskId] = timer;
+    // 首屏：先取一次快照，之后走增量。
+    (async () => {
+      try {
+        const detail = await AD.api.get(`/api/runs/${runId}`);
+        paint(detail.run.log_tail || [], true);
+        lineCount = (detail.run.log_tail || []).length;
+        if (!detail.run.is_active) AD.stopInlineLog(taskId);
+      } catch (err) { /* 轮询会重试 */ }
+    })();
+  }
+
+  /** 原地刷新任务行：轮询发现状态落定后更新图标与徽标，不重建整个表格。
+   *  重建表格会连带销毁用户正在查看的行内展开，所以这里只改这一行。 */
+  function refreshTaskRowInPlace(taskId) {
+    AD.api.get('/api/tasks').then((data) => {
+      const task = (data.tasks || []).find((item) => item.id === taskId);
+      const row = document.querySelector(`tr[data-task-row="${taskId}"]`);
+      if (!task || !row) return;
+      const active = task.active_run;
+
+      // 运行/停止图标
+      const cell = row.querySelector('.table-actions');
+      if (cell) {
+        const runButton = active
+          ? `<button class="icon-btn stop" data-task-cancel="${task.id}" title="停止当前运行" aria-label="停止当前运行">${ICONS.stop}</button>`
+          : `<button class="icon-btn run" data-task-run="${task.id}" title="立即运行" aria-label="立即运行">${ICONS.play}</button>`;
+        const first = cell.querySelector('.icon-btn');
+        if (first) first.outerHTML = runButton;
+      }
+
+      // 状态徽标与计数：与新表格同一套渲染逻辑，避免两者显示不一致。
+      const statusCell = row.querySelector('td:nth-child(2)');
+      if (statusCell) {
+        const statusBadge = active
+          ? `<span class="badge ${e(active.status)}"><span class="dot ${e(active.status)}"></span>${e(AD.statusLabel(active.status))}</span>`
+          : task.enabled
+            ? '<span class="badge on">已启用</span>'
+            : '<span class="badge off">已暂停</span>';
+        const stats = task.run_count
+          ? `<span class="faint">${task.success_count} 成功 / ${task.failure_count} 失败</span>`
+          : '<span class="faint">尚未运行</span>';
+        statusCell.innerHTML = `${statusBadge}<div class="faint" style="margin-top:3px">${stats}</div>`;
+      }
+
+      // 最近运行列
+      const lastRunCell = row.querySelector('td:nth-child(5)');
+      if (lastRunCell) {
+        lastRunCell.innerHTML = task.last_status
+          ? `<span class="badge ${e(task.last_status)}">${e(AD.statusLabel(task.last_status))}</span>
+             <div class="faint">${e(AD.formatRelative(task.last_run_at))}</div>`
+          : '<span class="faint">—</span>';
+      }
+
+      // 禁用行样式
+      row.classList.toggle('row-disabled', !task.enabled);
+    }).catch(() => { /* 下次轮询或手动刷新兜底 */ });
+  }
 
   // ======================================================================
   // Task form (create / edit)
