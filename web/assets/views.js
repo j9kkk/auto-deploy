@@ -250,6 +250,7 @@ AD.views = {};
             (task.name || '').toLowerCase().includes(keyword)
             || (task.repo_url || '').toLowerCase().includes(keyword))
         : AD.state.tasks;
+      AD.stopAllInlineLogs();
       body.innerHTML = renderTaskTable(tasks, keyword);
       bindTaskActions(container);
       // 状态刷新（如运行结束后的重绘）会重建表格；把之前展开的行恢复，
@@ -323,8 +324,9 @@ AD.views = {};
 
     return `<tr data-task-row="${task.id}" class="${task.enabled ? '' : 'row-disabled'}">
       <td class="task-name-cell">
-        <div class="task-name-link" data-task-edit="${task.id}"
-             title="点击编辑任务">${e(task.name)}</div>
+        <button type="button" class="task-name-link" data-task-edit="${task.id}"
+                title="点击编辑任务">${e(task.name)}</button>
+        ${task.description ? `<div class="faint truncate" title="${a(task.description)}">${e(task.description)}</div>` : ''}
         <div class="faint truncate" style="max-width:280px" title="${a(task.repo_url)}">
           ${e(task.repo_url)}<span class="dim"> @${e(task.repo_branch)}</span>
         </div>
@@ -336,11 +338,11 @@ AD.views = {};
       <td class="nowrap">${nextRun}</td>
       <td>
         <div class="table-actions row-actions">
-          ${runButton}
           <button class="icon-btn scroll-btn${expanded ? ' active' : ''}" data-task-log="${task.id}"
                   title="${expanded ? '收起日志' : '展开最近日志'}"
                   aria-label="${expanded ? '收起日志' : '展开最近日志'}"
                   aria-expanded="${expanded ? 'true' : 'false'}">${ICONS.scroll}</button>
+          ${runButton}
           ${toggleButton}
         </div>
       </td>
@@ -439,7 +441,7 @@ AD.views = {};
   AD.toggleTaskExpand = async function (taskId, options) {
     const options_ = options || {};
     const row = document.querySelector(`tr[data-task-row="${taskId}"]`);
-    if (!row) { AD.state.expandedTaskId = null; return; }
+    if (!row) { AD.stopInlineLog(taskId); AD.state.expandedTaskId = null; return; }
 
     const existing = document.getElementById(`task-expand-${taskId}`);
     const scrollBtn = row.querySelector('.scroll-btn');
@@ -447,6 +449,7 @@ AD.views = {};
       existing.remove();
       AD.stopInlineLog(taskId);
       AD.state.expandedTaskId = null;
+      delete AD.state.inlineRunSelection[taskId];
       syncScrollButton(scrollBtn, false);
       return;
     }
@@ -454,7 +457,7 @@ AD.views = {};
     // 只保留一个展开行，展开新的收起旧的。
     document.querySelectorAll('.expand-row').forEach((node) => node.remove());
     document.querySelectorAll('.scroll-btn.active').forEach((node) => syncScrollButton(node, false));
-    Object.keys(AD.state.inlineLogTimers || {}).forEach((key) => AD.stopInlineLog(Number(key)));
+    AD.stopAllInlineLogs();
     AD.state.expandedTaskId = taskId;
     syncScrollButton(scrollBtn, true);
 
@@ -469,13 +472,14 @@ AD.views = {};
     let data;
     try { data = await AD.api.get(`/api/tasks/${taskId}`); }
     catch (err) {
+      if (document.getElementById(`task-expand-${taskId}`) !== placeholder) return;
       placeholder.remove();
       AD.state.expandedTaskId = null;
       syncScrollButton(scrollBtn, false);
       AD.toastError(err.message);
       return;
     }
-    if (!document.getElementById(`task-expand-${taskId}`)) return; // 已被收起
+    if (document.getElementById(`task-expand-${taskId}`) !== placeholder) return;
 
     const t = data.task;
     const runs = data.runs || [];
@@ -490,10 +494,13 @@ AD.views = {};
         ${dedupeIn([AD.scheduleText(t), nextRunInlineText(t)]).map((text) =>
           `<span class="faint">${e(text)}</span>`).join('')}
         <div class="spacer"></div>
-        <button class="sm" data-inline-rollback="${t.id}">${ICONS.rollback} 回滚上一版本</button>
-        <button class="sm" data-inline-artifacts="${t.id}">${ICONS.download} 产物</button>
+        <button class="sm" data-inline-rollback="${t.id}">${ICONS.rollback}<span>回滚上一版本</span></button>
+        <button class="sm" data-inline-rollback-selected disabled aria-describedby="inline-rollback-reason-${t.id}">${ICONS.rollback}<span>回滚到这个版本</span></button>
+        <button class="sm" data-inline-artifacts="${t.id}">${ICONS.download}<span>产物</span></button>
         ${activeRun ? `<button class="sm danger" data-inline-cancel="${activeRun.id}">取消 #${activeRun.id}</button>` : ''}
       </div>
+      <div class="hint inline-rollback-reason" id="inline-rollback-reason-${t.id}" data-inline-rollback-reason aria-live="polite"></div>
+      ${t.workspace_error ? `<div class="alert warning">工作目录：${e(t.workspace_error)}</div>` : ''}
 
       <dl class="kv">
         <dt>仓库</dt><dd class="mono">${e(t.repo_url)} <span class="dim">@${e(t.repo_branch)}</span>${t.repo_subdir ? ' / ' + e(t.repo_subdir) : ''}</dd>
@@ -506,7 +513,7 @@ AD.views = {};
         <strong style="font-size:13px">执行日志</strong>
         <span class="faint" data-inline-logmeta></span>
         <div class="spacer"></div>
-        ${lastRun ? `<a class="faint" href="/api/runs/${lastRun.id}/log?download=true">下载日志</a>` : ''}
+        <a class="faint" data-inline-download hidden>下载日志</a>
       </div>
       <div class="log-view" data-inline-log><span class="log-empty">${lastRun ? '加载中…' : '该任务还没有运行记录'}</span></div>
 
@@ -530,22 +537,47 @@ AD.views = {};
       AD.toastSuccess('已请求取消');
       AD.toggleTaskExpand(taskId, { forceOpen: true });
     });
-    root.querySelector('[data-inline-rollback]')?.addEventListener('click', async (event) => {
-      const button = event.currentTarget;
-      // 回滚会切换线上版本，二次确认后再执行。
-      const ok = await AD.confirm({
-        title: '回滚到上一版本',
-        message: '将把线上的 current 指向上一发布版本，并可能重启服务。',
-        detail: '回滚会立即改变线上服务的内容，请确认已了解影响。',
-        confirmText: '确认回滚',
-        danger: true,
-      });
-      if (!ok) return;
-      busyGuard(button, async () => {
-        const result = await AD.api.post(`/api/tasks/${taskId}/rollback`);
+    let selectedRun = null;
+    let rollbackBusy = false;
+    const previousButton = root.querySelector('[data-inline-rollback]');
+    const selectedButton = root.querySelector('[data-inline-rollback-selected]');
+    const rollbackReason = root.querySelector('[data-inline-rollback-reason]');
+    const updateRollbackControls = () => {
+      const active = runs.some((run) => ['queued', 'running'].includes(run.status));
+      previousButton.disabled = rollbackBusy || active;
+      selectedButton.disabled = rollbackBusy || active || !selectedRun
+        || selectedRun.status !== 'success' || !selectedRun.release_dir;
+      rollbackReason.textContent = active ? '任务正在运行或排队，暂不能回滚。'
+        : !selectedRun ? '选择一条成功的执行记录后可回滚到对应版本。'
+        : selectedRun.status !== 'success' || !selectedRun.release_dir
+          ? `当前查看运行 #${selectedRun.id}，只有部署成功且保留发布目录的记录才可回滚。`
+          : `回滚目标：运行 #${selectedRun.id}${selectedRun.commit_after ? ' · ' + AD.shortCommit(selectedRun.commit_after) : ''}。执行前会校验发布目录是否仍可用。`;
+    };
+    const requestRollback = async (button, run) => {
+      if (button.disabled || rollbackBusy) return;
+      rollbackBusy = true;
+      updateRollbackControls();
+      try {
+        const ok = await AD.confirm({
+          title: run ? `回滚到运行 #${run.id}` : '回滚到上一版本',
+          message: run ? `将把 current 切换到运行 #${run.id} 的发布目录。` : '将把 current 切换到上一发布版本。',
+          detail: '使用任务当前配置执行回滚脚本，systemd 方式还会重启服务。Docker / Compose 容器和 rsync 远端不会自动重新部署，需由回滚脚本处理；数据库不会自动恢复。',
+          confirmText: '确认回滚',
+          danger: true,
+        });
+        if (!ok || !root.isConnected) return;
+        AD.setBusy(button, true);
+        const result = await AD.api.post(`/api/tasks/${taskId}/rollback`, run ? { run_id: run.id } : undefined);
         AD.toastSuccess(result.message);
-      });
-    });
+      } catch (err) { AD.toastError(err.message); }
+      finally {
+        AD.setBusy(button, false);
+        rollbackBusy = false;
+        updateRollbackControls();
+      }
+    };
+    previousButton.addEventListener('click', () => requestRollback(previousButton, null));
+    selectedButton.addEventListener('click', () => requestRollback(selectedButton, selectedRun ? { ...selectedRun } : null));
     root.querySelector('[data-inline-artifacts]')?.addEventListener('click', async () => {
       try {
         const artifacts = await AD.api.get(`/api/tasks/${taskId}/artifacts`);
@@ -565,8 +597,35 @@ AD.views = {};
     // --- 日志：实时轮询，与弹窗版同一套增量协议 ---------------------
     const logEl = root.querySelector('[data-inline-log]');
     const metaEl = root.querySelector('[data-inline-logmeta]');
-    const targetRunId = options_.runId || (activeRun ? activeRun.id : (lastRun ? lastRun.id : null));
-    startInlineLog(taskId, targetRunId, logEl, metaEl);
+    const download = root.querySelector('[data-inline-download]');
+    const selectRun = (runId, scroll = false) => {
+      selectedRun = runs.find((run) => run.id === runId) || null;
+      AD.state.inlineRunSelection[taskId] = runId;
+      download.hidden = !runId;
+      if (runId) download.href = `/api/runs/${runId}/log?download=true`;
+      root.querySelectorAll('[data-inline-run-log]').forEach((button) => {
+        const current = Number(button.dataset.inlineRunLog) === runId;
+        button.classList.toggle('active', current);
+        button.setAttribute('aria-pressed', String(current));
+        button.textContent = current ? '正在查看' : '详情';
+      });
+      updateRollbackControls();
+      startInlineLog(taskId, runId, logEl, metaEl, (detail) => {
+        if (AD.state.inlineRunSelection[taskId] !== runId) return;
+        selectedRun = { ...selectedRun, ...detail };
+        const row = runs.find((run) => run.id === runId);
+        if (row) Object.assign(row, detail);
+        updateRollbackControls();
+      });
+      if (scroll) logEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    };
+    root.querySelectorAll('[data-inline-run-log]').forEach((button) => {
+      button.addEventListener('click', () => selectRun(Number(button.dataset.inlineRunLog), true));
+    });
+    const requested = options_.runId || (options_.forceOpen ? AD.state.inlineRunSelection[taskId] : null);
+    const targetRunId = runs.some((run) => run.id === requested) ? requested
+      : (activeRun ? activeRun.id : (lastRun ? lastRun.id : null));
+    selectRun(targetRunId);
   };
 
   /** 下次执行的纯文本描述（与调度描述一起做去重，避免重复展示）。 */
@@ -602,65 +661,84 @@ AD.views = {};
         <td class="dim">${e(AD.triggerLabel(run.trigger))}</td>
         <td class="dim nowrap">${e(AD.formatDuration(run.duration_ms))}</td>
         <td class="dim nowrap">${e(AD.formatRelative(run.queued_at))}</td>
-        <td class="right"><button class="sm" data-run-log="${run.id}">详情</button></td>
+        <td class="right"><button class="sm" data-inline-run-log="${run.id}" aria-pressed="false">详情</button></td>
       </tr>`).join('')}</tbody></table>
       <div class="faint" style="margin-top:6px">共 ${runs.length} 条记录</div>`;
   }
 
-  // 行内实时日志：每个任务独立计时器，离开页面/收起时清理。
+  // 会话令牌同时保护正在等待的请求，防止切换日志后旧响应覆盖新内容。
   AD.state.inlineLogTimers = {};
+  AD.state.inlineRunSelection = {};
+  const inlineLogSessions = {};
 
   AD.stopInlineLog = function (taskId) {
     const timer = AD.state.inlineLogTimers[taskId];
-    if (timer) { clearInterval(timer); delete AD.state.inlineLogTimers[taskId]; }
+    if (timer) clearTimeout(timer);
+    delete AD.state.inlineLogTimers[taskId];
+    delete inlineLogSessions[taskId];
   };
 
   AD.stopAllInlineLogs = function () {
-    Object.keys(AD.state.inlineLogTimers).forEach((key) => AD.stopInlineLog(Number(key)));
+    Object.keys(inlineLogSessions).forEach((key) => AD.stopInlineLog(Number(key)));
   };
 
-  function startInlineLog(taskId, runId, logEl, metaEl) {
+  function startInlineLog(taskId, runId, logEl, metaEl, onRun) {
+    AD.stopInlineLog(taskId);
+    logEl.innerHTML = `<span class="log-empty">${runId ? '加载中…' : '该任务还没有运行记录'}</span>`;
+    metaEl.textContent = runId ? `运行 #${runId} · 加载中…` : '';
     if (!runId) return;
+    const session = {};
+    inlineLogSessions[taskId] = session;
+    const alive = () => inlineLogSessions[taskId] === session && logEl.isConnected;
     let lineCount = 0;
-    let started = false;
 
     const paint = (lines, reset) => {
-      if (reset) { logEl.innerHTML = ''; lineCount = 0; }
-      if (!lines.length && !logEl.childElementCount) {
-        logEl.innerHTML = '<span class="log-empty">暂无日志输出</span>';
-        return;
-      }
+      const follow = reset || logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= 32;
+      if (reset || logEl.querySelector('.log-empty')) logEl.innerHTML = '';
       logEl.insertAdjacentHTML('beforeend',
         lines.map((line) => `<div class="log-line">${colorize(line)}</div>`).join(''));
-      while (logEl.childElementCount > 800) logEl.removeChild(logEl.firstChild); // 防止长日志撑爆 DOM
-      if (metaEl) metaEl.textContent = '共 ' + lineCount + ' 行 · 运行 #' + runId;
-      logEl.scrollTop = logEl.scrollHeight;
+      while (logEl.childElementCount > 800) logEl.removeChild(logEl.firstChild);
+      if (!logEl.childElementCount) logEl.innerHTML = '<span class="log-empty">暂无日志输出</span>';
+      metaEl.textContent = `运行 #${runId} · 已读取 ${lineCount} 行（最多显示最近 800 行）`;
+      if (follow) logEl.scrollTop = logEl.scrollHeight;
     };
-
+    const fail = (err) => {
+      if (!alive()) return;
+      metaEl.textContent = `运行 #${runId} · 日志读取失败：${err.message}，点击详情重试`;
+      if (!lineCount) logEl.innerHTML = '<span class="log-empty">日志读取失败，请点击该运行的详情重试。</span>';
+      AD.stopInlineLog(taskId);
+    };
+    const schedule = () => {
+      if (alive()) AD.state.inlineLogTimers[taskId] = setTimeout(poll, 1200);
+    };
     const poll = async () => {
+      if (!alive()) return;
       try {
         const result = await AD.api.get(`/api/runs/${runId}/tail?after=${lineCount}`);
-        if (result.reset) { paint(result.lines || [], true); lineCount = (result.lines || []).length; }
-        else if (result.lines && result.lines.length) { paint(result.lines, false); lineCount = result.total; }
-        if (!result.active) {
+        if (!alive()) return;
+        lineCount = result.total;
+        paint(result.lines || [], Boolean(result.reset));
+        if (result.active) schedule();
+        else {
+          // 终态重新读取记录，取得部署结束时才写入的发布目录。
+          const detail = await AD.api.get(`/api/runs/${runId}`);
+          if (!alive()) return;
+          onRun(detail.run);
           AD.stopInlineLog(taskId);
-          // 状态落定：原地更新这一行的运行/停止图标，不重建表格
-          //（重建会销毁正在查看的展开行）。
           refreshTaskRowInPlace(taskId);
         }
-      } catch (err) { AD.stopInlineLog(taskId); }
+      } catch (err) { fail(err); }
     };
-
-    const timer = setInterval(poll, 1200);
-    AD.state.inlineLogTimers[taskId] = timer;
-    // 首屏：先取一次快照，之后走增量。
     (async () => {
       try {
         const detail = await AD.api.get(`/api/runs/${runId}`);
-        paint(detail.run.log_tail || [], true);
+        if (!alive()) return;
         lineCount = (detail.run.log_tail || []).length;
-        if (!detail.run.is_active) AD.stopInlineLog(taskId);
-      } catch (err) { /* 轮询会重试 */ }
+        paint(detail.run.log_tail || [], true);
+        onRun(detail.run);
+        if (detail.run.is_active) schedule();
+        else AD.stopInlineLog(taskId);
+      } catch (err) { fail(err); }
     })();
   }
 
@@ -679,8 +757,8 @@ AD.views = {};
         const runButton = active
           ? `<button class="icon-btn stop" data-task-cancel="${task.id}" title="停止当前运行" aria-label="停止当前运行">${ICONS.stop}</button>`
           : `<button class="icon-btn run" data-task-run="${task.id}" title="立即运行" aria-label="立即运行">${ICONS.play}</button>`;
-        const first = cell.querySelector('.icon-btn');
-        if (first) first.outerHTML = runButton;
+        const control = cell.querySelector('[data-task-run], [data-task-cancel]');
+        if (control) control.outerHTML = runButton;
       }
 
       // 状态徽标与计数：与新表格同一套渲染逻辑，避免两者显示不一致。
@@ -737,8 +815,9 @@ AD.views = {};
       <div class="section-title">基础信息</div>
       <div class="form-grid">
         <div class="field">
-          <label>任务名称<span class="req">*</span></label>
-          <input type="text" id="f-name" value="${a(t.name || '')}" placeholder="例如：博客前端">
+          <label for="f-name">任务名（唯一标识）<span class="req">*</span></label>
+          <input type="text" id="f-name" value="${a(t.name || '')}" placeholder="例如：blog_frontend" aria-describedby="task-name-hint" spellcheck="false">
+          <div id="task-name-hint" class="hint">全局唯一，不区分大小写；仅允许 1–80 个英文字母或下划线，不允许中文、数字、空格和连字符。任务名用于工作目录名称，中文说明请填写备注。${isEdit && !/^[A-Za-z_]{1,80}$/.test(t.name || '') ? ' 当前是旧版名称，可原样保留；修改名称时必须符合新规则。' : ''}</div>
         </div>
         <div class="field">
           <label>备注</label>
@@ -967,7 +1046,10 @@ AD.views = {};
     backdrop.querySelector('#form-save').addEventListener('click', async (event) => {
       const button = event.currentTarget;
       const payload = collectForm(backdrop, { isEdit });
-      if (!payload.name) { showFormError(backdrop, '请填写任务名称'); return; }
+      if ((!isEdit || payload.name !== t.name) && !/^[A-Za-z_]{1,80}$/.test(payload.name)) {
+        showFormError(backdrop, '任务名只能包含 1–80 个英文字母或下划线，且必须全局唯一；中文说明请填写备注。');
+        return;
+      }
       if (!payload.repo_url) { showFormError(backdrop, '请填写仓库地址'); return; }
 
       AD.setBusy(button, true, isEdit ? '保存中…' : '创建中…');
@@ -1032,7 +1114,7 @@ AD.views = {};
       return node ? node.checked : false;
     };
     const payload = {
-      name: value('#f-name'),
+      name: backdrop.querySelector('#f-name').value,
       description: value('#f-description'),
       repo_url: value('#f-repo_url'),
       repo_branch: value('#f-repo_branch'),
@@ -1873,7 +1955,7 @@ AD.views = {};
       <div class="panel" id="update-panel">
         <div class="panel-head"><h2>版本更新</h2>
           <div class="spacer"></div>
-          <span class="faint" id="upd-current">当前 v${e(system.version)}</span>
+          <span class="faint">程序代码更新</span>
         </div>
         <div id="upd-body">
           <div class="row">
@@ -2234,10 +2316,13 @@ AD.views = {};
   window.addEventListener('pagehide', AD.stopUpdatePanel);
 
   AD.renderUpdatePanel = function (panel) {
+    const previous = updateSession?.panel === panel ? updateSession : null;
     AD.stopUpdatePanel();
     if (!panel) return;
     const ctx = { panel, stopped: false, timer: null, failures: 0, polls: 0,
-      deadline: Date.now() + 15 * 60 * 1000, state: null };
+      deadline: Date.now() + 15 * 60 * 1000, state: previous?.state || null,
+      logView: previous?.logView || { open: false, top: 0, left: 0, follow: true },
+      logRendered: previous?.logRendered || false };
     updateSession = ctx;
     pollUpdateStatus(ctx); // 先恢复持久化状态，不用 health 推断成功。
   };
@@ -2267,17 +2352,72 @@ AD.views = {};
     const body = ctx.panel.querySelector('#upd-body');
     body.querySelector('#upd-error')?.remove();
     body.insertAdjacentHTML('beforeend', '<div id="upd-error" class="alert error">' + e(message)
-      + '</div><button id="upd-resume">重新读取状态</button>');
+      + '<div><button id="upd-resume">重新读取状态</button></div></div>');
     body.querySelector('#upd-resume')?.addEventListener('click', () => AD.renderUpdatePanel(ctx.panel));
   }
 
+  function updateConfirmed(state) {
+    return state.stage === 'done' && state.confirmed_operation_id === state.operation_id && state.operation_id
+      && state.confirmed_operation === state.operation && ['update', 'rollback'].includes(state.operation)
+      && state.boot_id && state.boot_id !== state.before_boot_id && state.pid !== state.before_pid
+      && String(state.current_version).replace(/^[vV]+/, '') === state.expected_version
+      && String(state.version).replace(/^[vV]+/, '') === state.expected_version;
+  }
+
   function drawUpdateState(ctx, state) {
-    const labels = { queued: '排队中', downloading: '下载中', backing_up: '备份代码', applying: '替换代码',
-      dependencies: '更新依赖', restarting: '等待重启确认', done: '已确认完成', failed: '失败', idle: '尚未更新' };
-    ctx.panel.querySelector('#upd-body').innerHTML = '<div class="alert info">'
-      + e(labels[state.stage] || state.stage) + (state.target_version ? ' · ' + e(versionText(state.target_version)) : '')
-      + '</div>' + (state.error ? '<div class="alert error">' + e(state.error) + '</div>' : '')
-      + '<div class="log-view" style="max-height:240px">' + (state.log || []).map(e).join('<br>') + '</div>';
+    const body = ctx.panel.querySelector('#upd-body');
+    const view = ctx.logView;
+    const rememberLog = (details, log) => {
+      if (!details || !log) return;
+      view.open = details.open;
+      // 收起的 details 没有可用尺寸，不能用它覆盖历史阅读位置。
+      if (details.open && log.clientHeight > 0) {
+        view.top = log.scrollTop;
+        view.left = log.scrollLeft;
+        view.follow = log.scrollHeight - log.clientHeight - log.scrollTop <= 32;
+      }
+    };
+    if (ctx.logRendered) rememberLog(body.querySelector('#upd-logs'), body.querySelector('#upd-log'));
+    const confirmed = updateConfirmed(state);
+    const unverified = state.stage === 'unverified' || (state.stage === 'done' && !confirmed)
+      || (state.stage === 'restarting' && !state.active);
+    const labels = { queued: '排队中', checking: '检查中', downloading: '下载中', backing_up: '备份代码', applying: '替换代码',
+      dependencies: '更新依赖', restarting: '等待重启确认', done: '已确认完成', failed: '失败',
+      error: '失败', idle: '尚未更新', unverified: '历史操作未确认' };
+    const tone = state.error || ['failed', 'error'].includes(state.stage) ? 'error'
+      : unverified ? 'warning' : confirmed ? 'success' : state.active ? 'info' : 'neutral';
+    const label = unverified ? '历史操作未确认' : labels[state.stage] || state.stage || '状态未知';
+    const logs = state.log || [];
+    body.innerHTML = '<div class="upd-current">当前运行版本：<strong>'
+      + e(state.current_version ? versionText(state.current_version) : '未知') + '</strong></div>'
+      + '<div id="upd-operation" class="alert ' + tone + '">'
+      + (state.active ? '当前操作状态：' : '上次操作状态：') + e(label)
+      + (state.target_version ? ' · 目标版本 ' + e(versionText(state.target_version)) : '')
+      + (state.legacy_stage && state.legacy_stage !== state.stage ? ' · 原记录阶段：' + e(state.legacy_stage === 'done' ? '完成（未经确认）' : labels[state.legacy_stage] || state.legacy_stage) : '')
+      + (state.error ? '<div class="upd-operation-error">' + e(state.error) + '</div>' : '') + '</div>'
+      + (state.notice ? '<div class="alert warning">' + e(state.notice) + '</div>'
+        : unverified ? '<div class="alert warning">缺少目标版本及操作的完整确认，不能判定成功或自动刷新；可重新读取状态或检查更新。</div>' : '')
+      + '<details id="upd-logs" class="upd-logs"' + (view.open ? ' open' : '') + '>'
+      + '<summary>操作日志（' + logs.length + ' 条）<span class="dim"> · 展开 / 收起</span></summary>'
+      + '<div id="upd-log" class="log-view" tabindex="0" aria-label="更新操作日志">'
+      + (logs.length ? logs.map(e).join('\n') : '暂无日志') + '</div></details>';
+    const details = body.querySelector('#upd-logs');
+    const log = body.querySelector('#upd-log');
+    const restoreLog = () => {
+      if (!details.open) return;
+      log.scrollTop = view.follow ? Math.max(0, log.scrollHeight - log.clientHeight) : view.top;
+      log.scrollLeft = view.left;
+    };
+    restoreLog();
+    details.addEventListener('toggle', () => {
+      if (!updateAlive(ctx) || body.querySelector('#upd-logs') !== details) return;
+      view.open = details.open;
+      restoreLog();
+    });
+    log.addEventListener('scroll', () => {
+      if (updateAlive(ctx) && body.querySelector('#upd-log') === log) rememberLog(details, log);
+    });
+    ctx.logRendered = true;
   }
 
   async function pollUpdateStatus(ctx) {
@@ -2293,13 +2433,7 @@ AD.views = {};
       }
       ctx.state = state;
       drawUpdateState(ctx, state);
-      if (state.stage === 'done') {
-        const confirmed = state.confirmed_operation_id === state.operation_id && state.operation_id
-          && state.confirmed_operation === state.operation && ['update', 'rollback'].includes(state.operation)
-          && state.boot_id && state.boot_id !== state.before_boot_id && state.pid !== state.before_pid
-          && String(state.current_version).replace(/^[vV]+/, '') === state.expected_version
-          && String(state.version).replace(/^[vV]+/, '') === state.expected_version;
-        if (!confirmed) { updateError(ctx, '后端未确认目标版本及操作，不能自动刷新'); return; }
+      if (updateConfirmed(state)) {
         const key = 'autodeploy-reloaded-' + state.operation_id;
         try {
           if (!sessionStorage.getItem(key)) {
@@ -2321,10 +2455,20 @@ AD.views = {};
 
   async function updateControls(ctx, state) {
     const body = ctx.panel.querySelector('#upd-body');
-    body.insertAdjacentHTML('beforeend', '<div class="field"><label>更新源（只使用可信仓库）</label>'
-      + '<input id="upd-repo"><button id="upd-check">保存更新源并强制检查</button></div>'
-      + '<div id="upd-check-result"></div>'
-      + (state.can_rollback ? '<button id="upd-rollback">回滚上一版本</button>' : ''));
+    const rollbackReason = state.backup_notice || (state.can_rollback
+      ? '备份仅包含代码，数据库和 Python 依赖不会回滚。'
+      : '没有通过结构及版本校验的代码备份，无法自动回滚。');
+    body.insertAdjacentHTML('beforeend', '<div class="field upd-source"><label for="upd-repo">更新源（只使用可信仓库）</label>'
+      + '<div class="upd-source-row"><input id="upd-repo" type="url" placeholder="https://github.com/组织/仓库">'
+      + '<button id="upd-check">保存更新源并强制检查</button></div></div>'
+      + '<section class="upd-check-section" aria-labelledby="upd-check-title"><h3 id="upd-check-title">本次检查结果</h3>'
+      + '<div id="upd-check-result" aria-live="polite"><div class="dim">尚未检查；上次操作状态不代表本次检查结果。</div></div></section>'
+      + '<div class="upd-recovery"><button id="upd-read-state">重新读取状态</button>'
+      + '<button id="upd-rollback"' + (state.can_rollback ? '' : ' disabled aria-describedby="upd-rollback-reason"')
+      + '>回滚上一版本</button></div>'
+      + '<div id="upd-rollback-reason" class="upd-rollback-reason">' + e(rollbackReason) + '</div>');
+    body.querySelector('#upd-read-state').addEventListener('click', () => AD.renderUpdatePanel(ctx.panel));
+    if (state.can_rollback) body.querySelector('#upd-rollback').addEventListener('click', () => startUpdateOperation(ctx, 'rollback'));
     try {
       const settings = await updateRequest(ctx, '/api/settings');
       if (!updateAlive(ctx)) return;
@@ -2333,19 +2477,21 @@ AD.views = {};
     if (!updateAlive(ctx)) return;
     body.querySelector('#upd-check').addEventListener('click', async (event) => {
       event.target.disabled = true;
+      const result = body.querySelector('#upd-check-result');
+      result.innerHTML = '<div class="dim">正在保存更新源并检查…</div>';
       try {
         await updateRequest(ctx, '/api/settings', 'PUT', { update_repo: body.querySelector('#upd-repo').value.trim() });
         const check = await updateRequest(ctx, '/api/system/update/check?force=true');
         if (!updateAlive(ctx)) return;
         if (check.error) throw new Error(check.error);
-        const result = body.querySelector('#upd-check-result');
-        result.innerHTML = '<div>当前 ' + e(versionText(check.current)) + '，最新 ' + e(versionText(check.latest)) + '</div>'
-          + (check.update_available ? '<button id="upd-start">更新到 ' + e(versionText(check.latest)) + '</button>' : '<div>已是最新版本</div>');
+        result.innerHTML = '<div>检查时运行版本 ' + e(versionText(check.current)) + '，更新源最新版本 ' + e(versionText(check.latest)) + '</div>'
+          + (check.update_available ? '<button id="upd-start">更新到 ' + e(versionText(check.latest)) + '</button>' : '<div>本次检查未发现可用更新</div>');
         result.querySelector('#upd-start')?.addEventListener('click', () => startUpdateOperation(ctx, 'update', check.latest));
-      } catch (err) { updateError(ctx, err.message); }
+      } catch (err) {
+        if (updateAlive(ctx)) result.innerHTML = '<div class="alert error">本次检查失败：' + e(err.message) + '</div>';
+      }
       finally { if (updateAlive(ctx)) event.target.disabled = false; }
     });
-    body.querySelector('#upd-rollback')?.addEventListener('click', () => startUpdateOperation(ctx, 'rollback'));
   }
 
   async function startUpdateOperation(ctx, operation, target) {

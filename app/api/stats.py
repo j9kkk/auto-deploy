@@ -221,10 +221,7 @@ def cleanup_task_files(
 
     removed: list[str] = []
     for path in (
-        config.workspace_dir(task_id),
-        # 名字目录（带/不带 -id 后缀）一并清理。
-        config.WORKSPACES_DIR / config._sanitize_dirname(str(row.get("name") or "")),
-        config.WORKSPACES_DIR / f"{config._sanitize_dirname(str(row.get('name') or ''))}-{task_id}",
+        *config.owned_workspace_dirs(row),
         config.releases_dir(task_id),
         config.artifacts_dir(task_id),
     ):
@@ -304,7 +301,7 @@ def self_update_status(
     return {
         **state,
         "active": state.get("stage") in ACTIVE_STAGES,
-        "can_rollback": service.selfupdate.latest_backup() is not None,
+        **service.selfupdate.backup_status(),
         "current_version": VERSION,
     }
 
