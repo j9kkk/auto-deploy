@@ -4,6 +4,25 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.5] - 2026-09-29
+
+修复一键更新无法自动重启的真正原因（此前的判断有误）。
+
+### 修复
+
+- **改用「自我退出 + systemd 拉起」完成重启，不再依赖 sudo**。
+  真正的原因是 systemd 单元自带 ``NoNewPrivileges=true``，它会阻止 sudo 提权
+  （报 ``The "no new privileges" flag is set, which prevents sudo from running
+  as root``），因此此前基于 ``sudo systemctl`` / ``sudo systemd-run`` 的两条
+  重启路径在本服务的单元配置下**从未成功过**，才会始终提示手动重启。
+  单元本就配置了 ``Restart=always``，进程主动退出即会被 systemd 拉起，
+  这条路径**不需要任何特权**，也不受 NoNewPrivileges 影响。
+- 重启策略优先级：单元带 ``Restart=always`` → 自我退出（首选）；
+  否则才退回 sudo 路径。
+- ``_sudo_refused`` 增加 ``no new privileges`` 等特征，避免此类失败被
+  误判为「命令已发出、进程随服务重启」而错报成功。
+- 修正单元文件路径拼接：systemd 单元名需带 ``.service`` 后缀。
+
 ## [1.3.4] - 2026-09-29
 
 任务列表交互优化。
@@ -240,6 +259,7 @@
   数据库仓储层、完整 API 端到端流程（含真实部署、取消、日志增量协议）与调度器行为。
 
 
+[1.3.5]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.5
 [1.3.4]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.4
 [1.3.3]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.3
 [1.3.2]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.2

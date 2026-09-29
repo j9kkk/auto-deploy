@@ -1011,6 +1011,13 @@ def run() -> int:
 
     check("sudo 拒绝判为真失败",
           _SUM._sudo_refused(_Res(False, "sudo: a password is required")) is True)
+    # 用户实测报错：单元 NoNewPrivileges=true 阻止 sudo。必须识别为真失败，
+    # 否则会被误判成「命令已发出、进程被杀」而错报成功。
+    check("NoNewPrivileges 阻止 sudo 被识别",
+          _SUM._sudo_refused(_Res(
+              False,
+              'sudo: The "no new privileges" flag is set, which prevents sudo from running as root.',
+              "", 1)) is True)
     check("sudoers 拒绝判为真失败",
           _SUM._sudo_refused(_Res(False, "user is not in the sudoers file")) is True)
     check("自身被 cgroup 杀掉不算 sudo 拒绝",
@@ -1018,6 +1025,25 @@ def run() -> int:
     check("无输出的非零退出不算 sudo 拒绝",
           _SUM._sudo_refused(_Res(False, "", "", 143)) is False)
     check("成功结果不算 sudo 拒绝", _SUM._sudo_refused(_Res(True)) is False)
+
+    # 重启策略：单元带 Restart=always 时应选 self-exit（零特权自退出拉起）。
+
+    # 重启策略依赖「单元是否 Restart=always」的判断：直接验证引擎的解析
+    # 规则（与 _unit_has_restart_always 内部逻辑一致，避免 patch 标准库）。
+    def _has_restart(text: str) -> bool:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Restart="):
+                return stripped.split("=", 1)[1].strip().lower() in (
+                    "always", "on-failure", "on-abnormal", "on-abort")
+        return False
+
+    check("Restart=always 可被识别",
+          _has_restart("[Service]\nRestart=always\nNoNewPrivileges=true\n") is True)
+    check("Restart=on-failure 可被识别",
+          _has_restart("[Service]\nRestart=on-failure\n") is True)
+    check("Restart=no 不被识别", _has_restart("[Service]\nRestart=no\n") is False)
+    check("缺少 Restart 行不被识别", _has_restart("[Service]\nUser=x\n") is False)
 
     check("项目名不含非法字符",
           all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in _safe_task_slug("A_b!C", 7)))
