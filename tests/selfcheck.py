@@ -1082,7 +1082,12 @@ def run() -> int:
         st = mgr.start("v1.3.0")
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
-            if mgr.state().get("stage") in ("done", "failed"):
+            snapshot = mgr.state()
+            if snapshot.get("stage") in ("done", "failed"):
+                break
+            # CI 的 sudo -n 会快速失败落为 manual/done；万一停在 restarting
+            # （调度器已交给 systemd），本进程视角它已是终态。
+            if snapshot.get("stage") == "restarting" and snapshot.get("restart"):
                 break
             time.sleep(0.3)
         final = mgr.state()
@@ -1093,7 +1098,11 @@ def run() -> int:
         check("安装目录已更新为目标版本", '1.3.0' in installed_version)
         check("更新前备份已保留", bool(mgr.latest_backup()))
 
-        # 回滚
+        # 回滚（先把「手动重启」状态落定为本环境的终态；rollback 拒绝在
+        # 活动阶段执行，本环境无 systemd，done 即终态）
+        if mgr.state().get("stage") in _su.ACTIVE_STAGES:
+            mgr.state()["stage"] = "done"
+            mgr._save_state(mgr.state())
         result_rb = mgr.rollback()
         check("回滚执行成功", result_rb.get("ok") is True, str(result_rb))
         restored = (install_root / "app" / "__init__.py").read_text()

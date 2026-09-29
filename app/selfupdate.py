@@ -429,6 +429,8 @@ class SelfUpdateManager:
     def _finish(self, state: dict[str, Any], root: Path, backup: Path, log: Callable[[str], None]) -> None:
         """重启策略与收尾。"""
         strategy, service = self._restart_plan()
+        # CI/容器里常有 systemd-run 但 sudo 无免密凭据；sudo -n 会立即失败，
+        # 不会挂起。真正要防的是策略可用却卡住：给重启命令较短的超时。
         self._set_stage(state, "restarting")
         if strategy == "deferred":
             log(f"已调度延迟重启（{service}，5 秒后由 systemd 执行）")
