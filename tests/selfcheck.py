@@ -652,6 +652,26 @@ def run() -> int:
         )
         check("非法调度预览返回错误", not response.json()["ok"])
 
+        # 自更新准入保护通过真实 API 路由验证，不触发任何重启。
+        from unittest.mock import patch as api_patch
+        with api_patch.object(service.selfupdate, '_restart_plan', return_value=('unsupported', '')):
+            response = client.post('/api/system/self-update', json={'target_version': 'v2.0.0'})
+            check('API 不支持重启明确返回冲突', response.status_code == 409 and '不支持' in response.json()['detail'])
+        service.selfupdate._save_state({'stage': 'applying', 'log': ['测试日志'], 'operation_id': 'api-check'})
+        response = client.get('/api/system/self-update/status')
+        check('API 状态返回操作标识与日志', response.json()['active'] and response.json()['operation_id'] == 'api-check')
+        response = client.post(f'/api/tasks/{task_id}/run')
+        check('API 更新期间拒绝新部署', response.status_code == 409)
+        response = client.post(f'/api/tasks/{task_id}/rollback')
+        check('API 更新期间拒绝部署回滚', response.status_code == 409)
+        response = client.post('/api/system/self-update/rollback')
+        check('API 更新期间拒绝自更新回滚', response.status_code == 409)
+        response = client.post('/api/tasks', json={'name': '更新中创建', 'repo_url': str(origin),
+            'deploy_method': 'script', 'deploy_script': 'true', 'run_on_create': True})
+        check('创建后立即部署被阻止且返回警告', response.status_code == 201 and bool(response.json().get('warning')) and not response.json().get('run_id'))
+        client.delete('/api/tasks/' + str(response.json()['task']['id']))
+        service.selfupdate._save_state({'stage': 'idle', 'log': []})
+
         # --- run a real deploy --------------------------------------
         response = client.post(f"/api/tasks/{task_id}/run")
         check("手动触发运行成功", response.status_code == 200, response.text[:200])
@@ -1001,50 +1021,6 @@ def run() -> int:
     check("空名回退 task-<id>", _safe_task_slug("", 4) == "task-4")
     check("同 id 同名结果稳定", _safe_task_slug("x", 5) == _safe_task_slug("x", 5))
     check("不同任务结果不同", _safe_task_slug("x", 5) != _safe_task_slug("x", 6))
-    # 重启策略：区分「sudo 被拒」（真失败）与「命令已发出、本进程随
-    # cgroup 被杀」（重启其实成功）。
-    from app.selfupdate import SelfUpdateManager as _SUM
-
-    class _Res:
-        def __init__(self, ok, output="", error="", exit_code=0):
-            self.ok, self.output, self.error, self.exit_code = ok, output, error, exit_code
-
-    check("sudo 拒绝判为真失败",
-          _SUM._sudo_refused(_Res(False, "sudo: a password is required")) is True)
-    # 用户实测报错：单元 NoNewPrivileges=true 阻止 sudo。必须识别为真失败，
-    # 否则会被误判成「命令已发出、进程被杀」而错报成功。
-    check("NoNewPrivileges 阻止 sudo 被识别",
-          _SUM._sudo_refused(_Res(
-              False,
-              'sudo: The "no new privileges" flag is set, which prevents sudo from running as root.',
-              "", 1)) is True)
-    check("sudoers 拒绝判为真失败",
-          _SUM._sudo_refused(_Res(False, "user is not in the sudoers file")) is True)
-    check("自身被 cgroup 杀掉不算 sudo 拒绝",
-          _SUM._sudo_refused(_Res(False, "", "", -15)) is False)
-    check("无输出的非零退出不算 sudo 拒绝",
-          _SUM._sudo_refused(_Res(False, "", "", 143)) is False)
-    check("成功结果不算 sudo 拒绝", _SUM._sudo_refused(_Res(True)) is False)
-
-    # 重启策略：单元带 Restart=always 时应选 self-exit（零特权自退出拉起）。
-
-    # 重启策略依赖「单元是否 Restart=always」的判断：直接验证引擎的解析
-    # 规则（与 _unit_has_restart_always 内部逻辑一致，避免 patch 标准库）。
-    def _has_restart(text: str) -> bool:
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("Restart="):
-                return stripped.split("=", 1)[1].strip().lower() in (
-                    "always", "on-failure", "on-abnormal", "on-abort")
-        return False
-
-    check("Restart=always 可被识别",
-          _has_restart("[Service]\nRestart=always\nNoNewPrivileges=true\n") is True)
-    check("Restart=on-failure 可被识别",
-          _has_restart("[Service]\nRestart=on-failure\n") is True)
-    check("Restart=no 不被识别", _has_restart("[Service]\nRestart=no\n") is False)
-    check("缺少 Restart 行不被识别", _has_restart("[Service]\nUser=x\n") is False)
-
     check("项目名不含非法字符",
           all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in _safe_task_slug("A_b!C", 7)))
 
@@ -1079,142 +1055,135 @@ def run() -> int:
     # ------------------------------------------------------------------
     section("一键自我更新")
 
-    import shutil as _shutil
-    import threading as _threading
+    from unittest.mock import patch
+    from types import SimpleNamespace
+    from app import selfupdate as su
+    from app.scheduler import Scheduler as UpdateScheduler
+    from app.executor import run_command as safe_command
 
-    from app import selfupdate as _su
-    from app.selfupdate import compare_versions
+    def tree(path, version):
+        (path / "app").mkdir(parents=True, exist_ok=True)
+        (path / "web").mkdir(exist_ok=True)
+        (path / "app/__init__.py").write_text('__version__ = "' + version + '"\n')
+        (path / "app/main.py").write_text('')
+        (path / "web/index.html").write_text('测试')
+        (path / "requirements.txt").write_text('fastapi\nuvicorn\n')
+        (path / "run.sh").write_text('#!/bin/sh\n')
 
-    # 版本比较
-    check("版本号比较", compare_versions("1.10.0", "1.9.9") > 0)
-    check("v 前缀归一化", compare_versions("v1.2.1", "1.2.1") == 0)
-    check("预发布排在正式版之前", compare_versions("1.3.0-rc1", "1.3.0") < 0)
+    install = tmp_root / "isolated-install"
+    tree(install, "1.0.0")
+    fake_store = SimpleNamespace(runs=SimpleNamespace(count_active=lambda: 0))
+    ok = SimpleNamespace(ok=True, output="", error="")
+    calls = []
+    def command(args, **kwargs):
+        calls.append(args)
+        if args[0] == "systemctl":
+            return SimpleNamespace(ok=True, output=f"Id=autodeploy.service\nLoadState=loaded\nActiveState=active\nMainPID={os.getpid()}\nControlGroup=/system.slice/autodeploy.service\nRestart=always\nRestartPreventExitStatus=\n")
+        if "pip" in args:
+            return ok
+        raise AssertionError("自更新测试禁止真实外部命令：" + str(args))
 
-    # 最新 tag 选取：必须取语义最大的，而不是列表顺序第一个
-    origin2 = tmp_root / "update-origin"
-    origin2.mkdir(parents=True, exist_ok=True)
+    with patch.object(config, 'ROOT_DIR', install), patch.object(config, 'DATA_DIR', tmp_root / 'update-data'), \
+            patch.object(config, 'TMP_DIR', tmp_root / 'update-tmp'), \
+            patch.object(su, 'run_command', side_effect=command), patch.object(su.os, '_exit') as hard_exit:
+        mgr = su.SelfUpdateManager(fake_store)
+        with patch.object(mgr, '_cgroup_path', return_value='/system.slice/autodeploy.service'):
+            check('真实主进程与有效 always 才支持退出', mgr._restart_plan()[0] == 'self-exit')
+            for policy in ('on-failure', 'on-abnormal', 'on-abort', 'no', ''):
+                result = command(['systemctl'])
+                result.output = result.output.replace('Restart=always', 'Restart=' + policy)
+                with patch.object(su, 'run_command', return_value=result):
+                    check('拒绝重启策略 ' + policy, mgr._restart_plan()[0] == 'unsupported')
+            result = command(['systemctl'])
+            result.output = result.output.replace(f'MainPID={os.getpid()}', 'MainPID=0')
+            with patch.object(su, 'run_command', return_value=result):
+                check('拒绝非单元主进程', mgr._restart_plan()[0] == 'unsupported')
+        with patch.object(mgr, '_cgroup_path', return_value=''):
+            expect_raises('不支持环境启动前拒绝', lambda: mgr.start('v2.0.0'), RuntimeError)
+            check('不支持环境不落状态或改文件', not mgr.state_path.exists() and '1.0.0' in (install / 'app/__init__.py').read_text())
 
-    def _git(*args, cwd=origin2):
-        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
+        def download(target, tmp, settings, log, state):
+            tree(tmp / 'src', '2.0.0')
+        latest = su.UpdateCheck('1.0.0', 'v2.0.0', True, '')
+        with patch.object(mgr, '_restart_plan', return_value=('self-exit', 'autodeploy.service')), \
+                patch.object(mgr, 'check', return_value=latest), patch.object(mgr, '_download', side_effect=download), \
+                patch.object(mgr, '_exit_for_restart') as restart:
+            state = mgr.start('v2.0.0')
+            mgr._thread.join(10)
+            check('更新仅停在等待重启确认', mgr.state()['stage'] == 'restarting' and restart.called)
+            expect_raises('重复更新拒绝', lambda: mgr.start('v2.0.0'), RuntimeError)
+            expect_raises('重启中回滚拒绝', mgr.rollback, RuntimeError)
+            sched = UpdateScheduler(fake_store, None)
+            sched._lock = mgr._lock
+            sched.deployment_blocked = mgr.deployment_blocked
+            expect_raises('更新时手动部署拒绝', lambda: sched.run_now(1), RuntimeError)
+            check('更新时定时部署拒绝', not sched._dispatch({'id': 1}, trigger='schedule'))
+            saved = mgr.state()
+            with patch.object(su, 'PROCESS_BOOT_ID', 'new-boot'), patch.object(su.os, 'getpid', return_value=os.getpid()+100), patch.object(su, '__version__', '2.0.0'):
+                mgr.reconcile_on_startup()
+            check('新进程确认目标版本后完成', mgr.state()['stage'] == 'done' and mgr.state()['confirmed_operation'] == 'update')
+            mgr._save_state(saved)
+            with patch.object(su, 'PROCESS_BOOT_ID', 'new-boot'), patch.object(su, '__version__', '9.0.0'):
+                mgr.reconcile_on_startup()
+            check('版本不符明确失败', mgr.state()['stage'] == 'failed')
+            expired = dict(saved, restart_deadline=time.time()-1)
+            mgr._save_state(expired)
+            check('重启确认超时失败', mgr.state()['stage'] == 'failed')
+            mgr.rollback()
+            mgr._thread.join(10)
+            check('回滚恢复旧代码仍等待确认', '1.0.0' in (install / 'app/__init__.py').read_text() and mgr.state()['stage'] == 'restarting')
+            with patch.object(su, 'PROCESS_BOOT_ID', 'rollback-boot'), patch.object(su.os, 'getpid', return_value=os.getpid()+101), patch.object(su, '__version__', '1.0.0'):
+                mgr.reconcile_on_startup()
+            check('回滚操作独立确认', mgr.state()['stage'] == 'done' and mgr.state()['confirmed_operation'] == 'rollback')
+            with patch.object(su, 'run_command', return_value=SimpleNamespace(ok=False)):
+                mgr.start('v2.0.0')
+                mgr._thread.join(10)
+            check('依赖失败恢复代码且不误报成功', mgr.state()['stage'] == 'failed' and '1.0.0' in (install / 'app/__init__.py').read_text())
+            original_replace = su.os.replace
+            failed_once = [False]
+            def fail_replace(src, dst):
+                if Path(dst) == install / 'web' and not failed_once[0]:
+                    failed_once[0] = True
+                    raise OSError('模拟替换失败')
+                return original_replace(src, dst)
+            with patch.object(su.os, 'replace', side_effect=fail_replace):
+                mgr.start('v2.0.0')
+                mgr._thread.join(10)
+            check('部分代码替换失败可靠恢复', mgr.state()['stage'] == 'failed' and '1.0.0' in (install / 'app/__init__.py').read_text() and (install / 'web/index.html').exists())
+            bad = tmp_root / 'bad-download'
+            tree(bad, '3.0.0')
+            expect_raises('下载版本校验', lambda: mgr._validate_tree(bad, '2.0.0'), RuntimeError)
+            (bad / 'web/escape').symlink_to('/tmp')
+            expect_raises('下载软链越界拒绝', lambda: mgr._validate_tree(bad), RuntimeError)
+            expect_raises('目标路径注入拒绝', lambda: mgr.start('../../tmp'), RuntimeError)
+            mgr._save_state(dict(saved, stage='applying'))
+            mgr.reconcile_on_startup()
+            check('中断更新明确失败', mgr.state()['stage'] == 'failed')
+        check('测试绝未实际退出宿主', not hard_exit.called)
+        check('重启仅调用只读 systemctl show', all(c[1] == 'show' for c in calls if c[0] == 'systemctl' and len(c) > 1))
 
-    _git("init", "-q", "-b", "main")
-    _git("config", "user.email", "t@t")
-    _git("config", "user.name", "T")
-    (origin2 / "app").mkdir()
-    (origin2 / "web").mkdir()
-    (origin2 / "app" / "__init__.py").write_text('__version__ = "1.0.0"\n')
-    (origin2 / "app" / "main.py").write_text("x = 1\n")
-    (origin2 / "web" / "index.html").write_text("<html></html>\n")
-    (origin2 / "requirements.txt").write_text("fastapi\n")
-    (origin2 / "run.sh").write_text("#!/bin/sh\n")
-    _git("add", "-A"); _git("commit", "-qm", "v1.0.0")
-    _git("tag", "v1.0.0")
-    (origin2 / "app" / "__init__.py").write_text('__version__ = "1.2.1"\n')
-    _git("add", "-A"); _git("commit", "-qm", "v1.2.1")
-    _git("tag", "v1.2.1")
-    (origin2 / "app" / "__init__.py").write_text('__version__ = "1.3.0"\n')
-    _git("add", "-A"); _git("commit", "-qm", "v1.3.0")
-    _git("tag", "v1.3.0")
+    # 真正执行下载方法和标签校验，Git 仅操作隔离的本地仓库。
+    origin_update = tmp_root / 'safe-update-origin'
+    tree(origin_update, '2.0.0')
+    for args in (['init', '-q'], ['config', 'user.email', 'test@example.invalid'],
+                 ['config', 'user.name', '自检'], ['add', '.'], ['commit', '-qm', '测试版本'],
+                 ['tag', 'v2.0.0']):
+        result = safe_command(['git', *args], cwd=origin_update, timeout=20)
+        if not result.ok:
+            raise AssertionError(result.output)
+    download_dir = tmp_root / 'real-update-download'
+    download_dir.mkdir()
+    download_settings = SimpleNamespace(update_repo=str(origin_update), git_timeout_seconds=20)
+    with patch.object(config, 'proxy_env', return_value={}):
+        mgr._download('v2.0.0', download_dir, download_settings, lambda message: None, {})
+    check('真实下载目标标签并验证内容', mgr._validate_tree(download_dir / 'src', '2.0.0') == '2.0.0')
+    with patch.object(config, 'load_settings', return_value=download_settings), patch.object(config, 'proxy_env', return_value={}):
+        latest = mgr.check(force=True)
+        check('真实查询识别最新标签', latest.latest == 'v2.0.0')
 
-    # 检查更新（走 git ls-remote，不依赖 GitHub API）
-    os.environ["AUTODEPLOY_UPDATE_REPO"] = str(origin2)
-    from app.store import Store as _Store2
-
-    store3 = _Store2(Database(tmp_root / "upd.db"))
-    mgr = _su.SelfUpdateManager(store3)
-    result = mgr.check(force=True)
-    check("检查更新识别最新 tag", result.latest == "v1.3.0", str(result.latest))
-    # 当前代码版本号恰为 1.3.0，与最新 tag 相同 ⇒ 无更新可用（正确行为）。
-    check("同版本时无更新可用", result.update_available is False)
-    # 模拟旧版本场景：伪造当前版本更低 ⇒ 有更新可用。
-    with_patch = _su.UpdateCheck(
-        current="1.0.0", latest=result.latest,
-        update_available=compare_versions(result.latest, "1.0.0") > 0,
-        checked_at=result.checked_at)
-    check("旧版本时有更新可用", with_patch.update_available is True)
-
-    # 状态持久化
-    state = {"stage": "restarting", "log": [], "backup": "", "target_version": "v1.3.0"}
-    mgr._save_state(state)
-    check("状态文件可回读", mgr.state().get("stage") == "restarting")
-    mgr.reconcile_on_startup()
-    check("启动收尾把重启中落定为完成", mgr.state().get("stage") == "done")
-
-    # 完整流程：下载 → 备份 → 替换 → 依赖（无 systemd ⇒ 提示手动重启）
-    install_root = tmp_root / "install"
-    install_root.mkdir(parents=True, exist_ok=True)
-    for item in _su.UPDATE_ITEMS:
-        src = origin2 / item
-        dst = install_root / item
-        if src.is_dir():
-            _shutil.copytree(src, dst)
-        else:
-            _shutil.copy2(src, dst)
-    # 用 v1.0.0 的内容伪装旧安装，并把 ROOT_DIR 指向它
-    _git("checkout", "-q", "v1.0.0")
-    for item in _su.UPDATE_ITEMS:
-        src = origin2 / item
-        dst = install_root / item
-        if dst.is_dir():
-            _shutil.rmtree(dst)
-            _shutil.copytree(src, dst)
-        else:
-            _shutil.copy2(src, dst)
-
-    original_root = _su.config.ROOT_DIR
-    try:
-        _su.config.ROOT_DIR = install_root
-        st = mgr.start("v1.3.0")
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            snapshot = mgr.state()
-            stage = snapshot.get("stage")
-            if stage in ("done", "failed"):
-                break
-            # CI 上 sudo 免密可用：延迟重启会成功调度，stage 停在 restarting
-            # （restart=deferred）且 restart 由系统执行——本进程视角即终态。
-            if stage == "restarting" and snapshot.get("restart"):
-                break
-            time.sleep(0.3)
-        final = mgr.state()
-        # 落定（mark_settled 只处理 restarting），让后续回滚可以执行。
-        mgr.mark_settled()
-        final = mgr.state()
-        check("自更新流程完成（done 或已调度重启）",
-              final.get("stage") == "done",
-              f"stage={final.get('stage')} err={final.get('error')} log={final.get('log', [])[-3:]}")
-        check("重启策略已确定", final.get("restart") in ("manual", "deferred", "direct"),
-              str(final.get("restart")))
-        installed_version = (install_root / "app" / "__init__.py").read_text()
-        check("安装目录已更新为目标版本", '1.3.0' in installed_version)
-        check("更新前备份已保留", bool(mgr.latest_backup()))
-
-        # 回滚前落定终态：CI 上 sudo 免密可用，systemd-run 会成功调度重启，
-        # stage 停在 restarting——引擎提供 mark_settled() 收尾此状态。
-        mgr.mark_settled()
-        result_rb = mgr.rollback()
-        check("回滚执行成功", result_rb.get("ok") is True, str(result_rb))
-        restored = (install_root / "app" / "__init__.py").read_text()
-        check("回滚后恢复到更新前内容", '1.0.0' in restored, restored[:80])
-
-        # 防护：源码目录有未提交改动时拒绝自更新。
-        # 回滚（deferred 环境下）可能又把 stage 置为 restarting（已调度重启），
-        # 需先落定才能再次 start()。
-        mgr.mark_settled()
-        (install_root / "uncommitted.txt").write_text("dev work\n")
-        import subprocess as _sp
-        _sp.run(["git", "init", "-q"], cwd=install_root, check=True)
-        _sp.run(["git", "config", "user.email", "t@t"], cwd=install_root, check=True)
-        _sp.run(["git", "config", "user.name", "T"], cwd=install_root, check=True)
-        try:
-            mgr.start("v1.3.0")
-            check("未提交改动时拒绝自更新", False)
-        except RuntimeError as exc:
-            check("未提交改动时拒绝自更新", "未提交" in str(exc), str(exc))
-    finally:
-        os.environ.pop("AUTODEPLOY_UPDATE_REPO", None)
-        _su.config.ROOT_DIR = original_root
-    store3.close()
+    # Node vm 执行真实前端逻辑，不复制状态判定实现。
+    frontend = safe_command(['node', str(ROOT / 'tests/selfupdate-ui.js')], timeout=30)
+    check('前端更新状态回归', frontend.ok, frontend.output)
 
     # ------------------------------------------------------------------
     section("调度器行为")

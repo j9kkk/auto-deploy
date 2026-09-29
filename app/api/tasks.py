@@ -108,7 +108,11 @@ def create_task(
 
     result: dict[str, Any] = {"task": task}
     if body.get("run_on_create"):
-        run_id = service.scheduler.run_now(task_id, trigger="manual")
+        try:
+            run_id = service.scheduler.run_now(task_id, trigger="manual")
+        except RuntimeError as exc:
+            result["warning"] = f"任务已创建，但未开始部署：{exc}"
+            return result
         result["run_id"] = run_id
         audit(service, "run_triggered", actor=user["username"], target=f"task:{task_id}",
               detail=f"run:{run_id} 创建后立即运行", ip=client_ip(request))
@@ -249,7 +253,10 @@ def run_task(
             status_code=429,
             detail=f"并发运行数已达上限（{service.settings.max_global_workers}），请稍后再试",
         )
-    run_id = service.scheduler.run_now(task_id, trigger="manual")
+    try:
+        run_id = service.scheduler.run_now(task_id, trigger="manual")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if run_id is None:
         raise HTTPException(status_code=500, detail="无法创建运行记录")
     audit(
@@ -333,12 +340,15 @@ def rollback(
         raise HTTPException(status_code=409, detail="任务正在运行，无法回滚")
 
     lines: list[str] = []
-    ok, message = rollback_task(
-        row,
-        log=lines.append,
-        timeout=min(600, int(row.get("timeout_seconds") or 300)),
-        kill_grace_seconds=service.settings.kill_grace_seconds,
-    )
+    with service.scheduler._lock:
+        if service.selfupdate.deployment_blocked():
+            raise HTTPException(status_code=409, detail="系统正在更新或回滚，暂不能回滚部署")
+        ok, message = rollback_task(
+            row,
+            log=lines.append,
+            timeout=min(600, int(row.get("timeout_seconds") or 300)),
+            kill_grace_seconds=service.settings.kill_grace_seconds,
+        )
     audit(
         service, "rollback", actor=user["username"], target=f"task:{task_id}",
         detail=message, ip=client_ip(request),

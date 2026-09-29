@@ -2222,191 +2222,151 @@ AD.views = {};
   // ======================================================================
   // 一键更新
   // ======================================================================
+  let updateSession = null;
+  const versionText = (v) => 'v' + String(v || '').replace(/^[vV]+/, '');
+  AD.stopUpdatePanel = function () {
+    if (!updateSession) return;
+    updateSession.stopped = true;
+    clearTimeout(updateSession.timer);
+    updateSession.controller?.abort();
+    updateSession = null;
+  };
+  window.addEventListener('pagehide', AD.stopUpdatePanel);
+
   AD.renderUpdatePanel = function (panel) {
+    AD.stopUpdatePanel();
     if (!panel) return;
-    const body = panel.querySelector('#upd-body');
-    body.innerHTML = '<div class="loading-block" style="padding:18px"><span class="spinner"></span> 检查中…</div>';
-    AD.api.get('/api/system/update/check').then((check) => {
-      renderUpdateCheck(panel, check);
-    }).catch((err) => {
-      body.innerHTML = '<div class="alert error">' + e(err.message) + '</div>'
-        + updateSourceRow()
-        + '<div class="row"><button id="upd-check">重试</button></div>';
-      panel.querySelector('#upd-check').addEventListener('click', () => AD.renderUpdatePanel(panel));
-    });
+    const ctx = { panel, stopped: false, timer: null, failures: 0, polls: 0,
+      deadline: Date.now() + 15 * 60 * 1000, state: null };
+    updateSession = ctx;
+    pollUpdateStatus(ctx); // 先恢复持久化状态，不用 health 推断成功。
   };
+  const updateAlive = (ctx) => !ctx.stopped && ctx.panel.isConnected;
 
-  function renderUpdateCheck(panel, check) {
-    const body = panel.querySelector('#upd-body');
-    if (check.error) {
-      body.innerHTML = '<div class="alert warning">查询最新版本失败：' + e(check.error) + '</div>'
-        + updateSourceRow()
-        + '<div class="row"><button id="upd-check">重试</button></div>';
-      panel.querySelector('#upd-check').addEventListener('click', () => AD.renderUpdatePanel(panel));
-      return;
-    }
-    const available = check.update_available;
-    body.innerHTML = ''
-      + (available
-          ? '<div class="alert info">发现新版本 <strong>' + e(check.latest) + '</strong>'
-            + '（当前 v' + e(check.current) + '）'
-            + (check.published_at ? ' · 发布于 ' + e(AD.formatRelative(check.published_at)) : '')
-            + (check.notes_url ? ' · <a href="' + a(check.notes_url) + '" target="_blank" rel="noopener">更新说明</a>' : '')
-            + '</div>'
-          : '<div class="alert success">已是最新版本 v' + e(check.current) + '</div>')
-      + '<div class="row">'
-      + '<button class="ghost sm" id="upd-check">重新检查</button>'
-      + (available ? '<button class="primary" id="upd-start">一键更新到 ' + e(check.latest) + '</button>' : '')
-      + '</div>'
-      + '<div class="hint" style="margin-top:10px">'
-      + '更新过程：自动备份当前版本 → 下载并替换程序与依赖 → 延迟重启服务。'
-      + '</div>'
-      + updateSourceRow();
-    panel.querySelector('#upd-check').addEventListener('click', () => AD.renderUpdatePanel(panel));
-    panel.querySelector('#upd-start')?.addEventListener('click', () => {
-      startSelfUpdate(panel, check.latest);
-    });
-  }
-
-  function updateSourceRow() {
-    return '<div class="field" style="margin-top:12px">'
-      + '<label>更新源</label>'
-      + '<input type="text" id="upd-repo" placeholder="https://github.com/j9kkk/git-deploy.git">'
-      + '<div class="hint">可指向镜像或私有副本；下载走「网络代理」设置</div>'
-      + '</div>';
-  }
-
-  async function startSelfUpdate(panel, latest) {
-    const repoInput = panel.querySelector('#upd-repo');
-    const repo = repoInput ? repoInput.value.trim() : '';
-    if (repo) {
-      try { await AD.api.put('/api/settings', { update_repo: repo }); }
-      catch (err) { AD.toastError(err.message); return; }
-    }
-    const confirmed = await AD.confirm({
-      title: '一键更新到 ' + latest,
-      message: '将自动备份当前版本，下载并替换程序与依赖，然后重启服务。',
-      detail: '重启期间页面会短暂失联并自动重连；更新失败会自动回滚到更新前版本。',
-      confirmText: '开始更新',
-    });
-    if (!confirmed) return;
-    const body = panel.querySelector('#upd-body');
-    body.innerHTML = '<div class="loading-block" style="padding:18px">'
-      + '<span class="spinner"></span> 正在启动更新…</div>';
+  async function updateRequest(ctx, path, method = 'GET', payload) {
+    const controller = new AbortController();
+    ctx.controller = controller;
+    const timer = setTimeout(() => controller.abort(), 10000);
     try {
-      await AD.api.post('/api/system/self-update');
-    } catch (err) { AD.toastError(err.message); AD.renderUpdatePanel(panel); return; }
-    pollUpdateStatus(panel, latest, 0);
+      const response = await fetch(path, { method, credentials: 'same-origin', cache: 'no-store',
+        signal: controller.signal, headers: { 'Content-Type': 'application/json' },
+        body: payload === undefined ? undefined : JSON.stringify(payload) });
+      const data = await response.json();
+      if (!response.ok) {
+        const err = new Error(response.status === 401 ? '登录已过期，请重新登录后打开更新卡片恢复状态' :
+          (typeof data.detail === 'string' ? data.detail : '服务请求失败（HTTP ' + response.status + '）'));
+        err.status = response.status;
+        throw err;
+      }
+      return data;
+    } finally { clearTimeout(timer); }
   }
 
-  const UPDATE_STAGE_LABELS = {
-    queued: '排队中', checking: '检查版本', downloading: '下载新版本',
-    backing_up: '备份当前版本', applying: '替换程序文件',
-    dependencies: '更新依赖', restarting: '重启服务',
-    done: '完成', failed: '失败',
-  };
-
-  function pollUpdateStatus(panel, latest, attempt) {
-    const body = panel.querySelector('#upd-body');
-    AD.api.get('/api/system/self-update/status').then((state) => {
-      const label = UPDATE_STAGE_LABELS[state.stage] || state.stage;
-      const log = (state.log || []).slice(-6).map((l) => e(l)).join('<br>');
-      body.innerHTML = '<div class="row">'
-        + '<span class="badge ' + (state.stage === 'failed' ? 'failed' : 'running') + '">'
-        + '<span class="dot running"></span>' + e(label) + '</span>'
-        + '<strong>目标 ' + e(state.target_version || latest) + '</strong>'
-        + '</div>'
-        + (state.error ? '<div class="alert error">' + e(state.error) + '</div>' : '')
-        + '<div class="log-view" style="max-height:180px;min-height:100px;margin-top:10px">' + log + '</div>';
-
-      if (state.stage === 'failed') {
-        addRollbackButton(panel, state);
-        return;
-      }
-      if (!state.active) {
-        if (state.restart === 'manual') {
-          const cmd = state.manual_command || 'sudo systemctl restart autodeploy';
-          body.innerHTML = '<div class="alert warning">更新文件已就位，但自动重启未成功。'
-            + '请在服务器上执行以下命令加载新版本：</div>'
-            + '<div class="code-inline" style="display:block;padding:10px 12px;margin-top:8px">'
-            + e(cmd) + '</div>'
-            + '<div class="row" style="margin-top:10px">'
-            + '<button class="sm" id="upd-copy-cmd">复制命令</button>'
-            + '<button class="sm" id="upd-check">重新检查</button></div>';
-          body.querySelector('#upd-copy-cmd')?.addEventListener('click', () => AD.copyToClipboard(cmd));
-          body.querySelector('#upd-check').addEventListener('click', () => AD.renderUpdatePanel(panel));
-          return;
-        }
-        body.innerHTML = '<div class="alert success">更新完成</div>';
-        return;
-      }
-      if (state.stage === 'restarting') {
-        body.innerHTML = '<div class="alert info">服务重启中，页面将自动重连…</div>';
-        waitAndReconnect(panel, 0);
-        return;
-      }
-      setTimeout(() => pollUpdateStatus(panel, latest, attempt + 1), 1500);
-    }).catch(() => {
-      waitAndReconnect(panel, 0);
-    });
+  function updateError(ctx, message) {
+    if (!updateAlive(ctx)) return;
+    const body = ctx.panel.querySelector('#upd-body');
+    body.querySelector('#upd-error')?.remove();
+    body.insertAdjacentHTML('beforeend', '<div id="upd-error" class="alert error">' + e(message)
+      + '</div><button id="upd-resume">重新读取状态</button>');
+    body.querySelector('#upd-resume')?.addEventListener('click', () => AD.renderUpdatePanel(ctx.panel));
   }
 
-  function waitAndReconnect(panel, nth) {
-    const body = panel.querySelector('#upd-body');
-    if (nth >= 40) {
-      body.innerHTML = '<div class="alert warning">长时间未连上服务，请手动检查服务状态'
-        + '（systemctl status autodeploy）。</div>';
-      return;
+  function drawUpdateState(ctx, state) {
+    const labels = { queued: '排队中', downloading: '下载中', backing_up: '备份代码', applying: '替换代码',
+      dependencies: '更新依赖', restarting: '等待重启确认', done: '已确认完成', failed: '失败', idle: '尚未更新' };
+    ctx.panel.querySelector('#upd-body').innerHTML = '<div class="alert info">'
+      + e(labels[state.stage] || state.stage) + (state.target_version ? ' · ' + e(versionText(state.target_version)) : '')
+      + '</div>' + (state.error ? '<div class="alert error">' + e(state.error) + '</div>' : '')
+      + '<div class="log-view" style="max-height:240px">' + (state.log || []).map(e).join('<br>') + '</div>';
+  }
+
+  async function pollUpdateStatus(ctx) {
+    if (!updateAlive(ctx)) return;
+    if (++ctx.polls > 600 || Date.now() > ctx.deadline) {
+      updateError(ctx, '等待确认超时，未确认更新成功；请检查服务或重新读取状态'); return;
     }
-    fetch('/api/health', { credentials: 'same-origin' }).then((r) => {
-      if (!r.ok) throw new Error('not ready');
-      return r.json();
-    }).then((health) => {
-      setTimeout(() => {
-        AD.api.get('/api/system/self-update/status').then((state) => {
-          if (state.stage === 'done') {
-            body.innerHTML = '<div class="alert success">更新完成，当前 ' + e(health.version) + '</div>'
-              + '<div class="row"><button class="primary" id="upd-refresh">刷新页面</button>'
-              + (state.can_rollback ? '<button id="upd-rollback">回滚上一版本</button>' : '')
-              + '</div>';
-            body.querySelector('#upd-refresh').addEventListener('click', () => location.reload());
-            bindRollbackButton(panel);
-          } else {
-            pollUpdateStatus(panel, state.target_version, 0);
+    try {
+      const state = await updateRequest(ctx, '/api/system/self-update/status');
+      if (!updateAlive(ctx)) return;
+      if (ctx.operationId && ctx.operationId !== state.operation_id) {
+        updateError(ctx, '操作标识已变化，停止自动刷新，请重新读取状态'); return;
+      }
+      ctx.state = state;
+      drawUpdateState(ctx, state);
+      if (state.stage === 'done') {
+        const confirmed = state.confirmed_operation_id === state.operation_id && state.operation_id
+          && state.confirmed_operation === state.operation && ['update', 'rollback'].includes(state.operation)
+          && state.boot_id && state.boot_id !== state.before_boot_id && state.pid !== state.before_pid
+          && String(state.current_version).replace(/^[vV]+/, '') === state.expected_version
+          && String(state.version).replace(/^[vV]+/, '') === state.expected_version;
+        if (!confirmed) { updateError(ctx, '后端未确认目标版本及操作，不能自动刷新'); return; }
+        const key = 'autodeploy-reloaded-' + state.operation_id;
+        try {
+          if (!sessionStorage.getItem(key)) {
+            sessionStorage.setItem(key, '1');
+            AD.stopUpdatePanel();
+            location.reload(); return;
           }
-        }).catch(() => waitAndReconnect(panel, nth + 1));
-      }, 800);
-    }).catch(() => {
-      setTimeout(() => waitAndReconnect(panel, nth + 1), 2000);
-    });
-  }
-
-  function addRollbackButton(panel, state) {
-    const holder = panel.querySelector('#upd-body');
-    if (holder && !holder.querySelector('#upd-rollback')) {
-      holder.insertAdjacentHTML('beforeend',
-        '<div class="row" style="margin-top:10px">'
-        + (state.can_rollback ? '<button id="upd-rollback">回滚上一版本</button>' : '')
-        + '</div>');
-      bindRollbackButton(panel);
+        } catch (_) { updateError(ctx, '无法保存刷新标记，请手动刷新页面'); }
+      }
+      if (!state.active) { await updateControls(ctx, state); return; }
+    } catch (err) {
+      if (!updateAlive(ctx)) return;
+      // HTTP 错误不是重启成功；网络错误总预算不因一次连通而重置。
+      if (err.status || ++ctx.failures >= 40) { updateError(ctx, err.message || '重连预算耗尽'); return; }
+      if (!ctx.state) ctx.panel.querySelector('#upd-body').textContent = '暂时失联，正在有限重连…';
     }
+    if (updateAlive(ctx)) ctx.timer = setTimeout(() => pollUpdateStatus(ctx), 1500);
   }
 
-  function bindRollbackButton(panel) {
-    panel.querySelector('#upd-rollback')?.addEventListener('click', async () => {
-      const confirmed = await AD.confirm({
-        title: '回滚上一版本',
-        message: '将恢复最近一次备份并重启服务。',
-        confirmText: '回滚',
-        danger: true,
-      });
-      if (!confirmed) return;
+  async function updateControls(ctx, state) {
+    const body = ctx.panel.querySelector('#upd-body');
+    body.insertAdjacentHTML('beforeend', '<div class="field"><label>更新源（只使用可信仓库）</label>'
+      + '<input id="upd-repo"><button id="upd-check">保存更新源并强制检查</button></div>'
+      + '<div id="upd-check-result"></div>'
+      + (state.can_rollback ? '<button id="upd-rollback">回滚上一版本</button>' : ''));
+    try {
+      const settings = await updateRequest(ctx, '/api/settings');
+      if (!updateAlive(ctx)) return;
+      body.querySelector('#upd-repo').value = settings.settings.update_repo || '';
+    } catch (err) { updateError(ctx, err.message); }
+    if (!updateAlive(ctx)) return;
+    body.querySelector('#upd-check').addEventListener('click', async (event) => {
+      event.target.disabled = true;
       try {
-        const result = await AD.api.post('/api/system/self-update/rollback');
-        AD.toastSuccess(result.message);
-        AD.render('settings');
-      } catch (err) { AD.toastError(err.message); }
+        await updateRequest(ctx, '/api/settings', 'PUT', { update_repo: body.querySelector('#upd-repo').value.trim() });
+        const check = await updateRequest(ctx, '/api/system/update/check?force=true');
+        if (!updateAlive(ctx)) return;
+        if (check.error) throw new Error(check.error);
+        const result = body.querySelector('#upd-check-result');
+        result.innerHTML = '<div>当前 ' + e(versionText(check.current)) + '，最新 ' + e(versionText(check.latest)) + '</div>'
+          + (check.update_available ? '<button id="upd-start">更新到 ' + e(versionText(check.latest)) + '</button>' : '<div>已是最新版本</div>');
+        result.querySelector('#upd-start')?.addEventListener('click', () => startUpdateOperation(ctx, 'update', check.latest));
+      } catch (err) { updateError(ctx, err.message); }
+      finally { if (updateAlive(ctx)) event.target.disabled = false; }
     });
+    body.querySelector('#upd-rollback')?.addEventListener('click', () => startUpdateOperation(ctx, 'rollback'));
+  }
+
+  async function startUpdateOperation(ctx, operation, target) {
+    if (ctx.submitting) return;
+    ctx.submitting = true;
+    try {
+      const confirmed = await AD.confirm({ title: operation === 'update' ? '更新到 ' + versionText(target) : '回滚上一版本',
+        message: '将替换程序代码并重启服务。仅在后端确认目标版本运行后自动刷新。',
+        detail: '备份仅含代码，不回滚数据库或 Python 依赖；降级可能不兼容。',
+        confirmText: '确认执行', danger: operation === 'rollback' });
+      if (!confirmed || !updateAlive(ctx)) return;
+      const result = await updateRequest(ctx, '/api/system/self-update' + (operation === 'rollback' ? '/rollback' : ''),
+        'POST', operation === 'update' ? { target_version: target } : {});
+      if (!updateAlive(ctx)) return;
+      ctx.operationId = result.state.operation_id;
+      ctx.deadline = Date.now() + 15 * 60 * 1000;
+      ctx.polls = 0;
+      ctx.failures = 0;
+      pollUpdateStatus(ctx);
+    } catch (err) { updateError(ctx, err.message + '；请求可能已送达，可重新读取状态确认'); }
+    finally { ctx.submitting = false; }
   }
 
 })(window.AD);
