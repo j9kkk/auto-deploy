@@ -491,11 +491,29 @@ class SelfUpdateManager:
                 shutil.copy2(src, dst)
         self._log(state, "已回滚完成")
 
+    def mark_settled(self) -> None:
+        """把仍在「重启中」的更新状态落定为完成。
+
+        延迟重启成功调度后，本进程随后会被 systemd 杀掉，状态文件会停在
+        ``restarting``；下次启动由 :meth:`reconcile_on_startup` 收尾。
+        测试与手动收尾场景可直接调用本方法落定。
+        """
+        snap = self.state()
+        if snap.get("stage") == "restarting":
+            snap["stage"] = "done"
+            snap["version"] = __version__
+            self._save_state(snap)
+
     def rollback(self) -> dict[str, Any]:
         """手动回滚到最近一次备份并重启。"""
         with self._lock:
             state = self.state()
-            if state.get("stage") in ACTIVE_STAGES:
+            stage = state.get("stage")
+            # restarting 且已选定重启策略：更新文件早已写完，只是等重启；
+            # 此时回滚没有并发风险，允许执行（newer 重启会带上回滚结果）。
+            if stage in ACTIVE_STAGES and not (
+                stage == "restarting" and state.get("restart")
+            ):
                 raise RuntimeError("更新正在进行，无法回滚")
             backup = self.latest_backup()
             if backup is None:
