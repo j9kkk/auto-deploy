@@ -16,6 +16,7 @@ from typing import Any, Callable
 from . import config
 from .db import Database
 from .runner import DeployRunner
+from .selfupdate import SelfUpdateManager
 from .scheduler import Scheduler
 from .security import LoginThrottle, generate_password, hash_password, password_problem
 from .store import Store
@@ -49,6 +50,7 @@ class Service:
         self.store = Store(self.db)
         self.runner = DeployRunner(self.store)
         self.scheduler = Scheduler(self.store, self.runner)
+        self.selfupdate = SelfUpdateManager(self.store)
         self.throttle = LoginThrottle(
             self.settings.login_max_attempts, self.settings.login_lockout_seconds
         )
@@ -67,6 +69,8 @@ class Service:
         # recomputed from now, so a paused service does not fire a burst of
         # catch-up deploys the moment it comes back up.
         self.store.tasks.clear_runtime_state()
+        # 自我更新收尾：若上次更新处于「重启中」，依据状态文件落定为完成。
+        self.selfupdate.reconcile_on_startup()
 
         if self.store.users.count() == 0:
             password = initial_password or ""

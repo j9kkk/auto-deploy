@@ -992,6 +992,131 @@ def run() -> int:
     check("代理不可达时明确指出代理问题", proxy_down is not None and "代理" in proxy_down, str(proxy_down))
 
     # ------------------------------------------------------------------
+    section("一键自我更新")
+
+    import shutil as _shutil
+    import threading as _threading
+
+    from app import selfupdate as _su
+    from app.selfupdate import compare_versions
+
+    # 版本比较
+    check("版本号比较", compare_versions("1.10.0", "1.9.9") > 0)
+    check("v 前缀归一化", compare_versions("v1.2.1", "1.2.1") == 0)
+    check("预发布排在正式版之前", compare_versions("1.3.0-rc1", "1.3.0") < 0)
+
+    # 最新 tag 选取：必须取语义最大的，而不是列表顺序第一个
+    origin2 = tmp_root / "update-origin"
+    origin2.mkdir(parents=True, exist_ok=True)
+
+    def _git(*args, cwd=origin2):
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
+
+    _git("init", "-q", "-b", "main")
+    _git("config", "user.email", "t@t")
+    _git("config", "user.name", "T")
+    (origin2 / "app").mkdir()
+    (origin2 / "web").mkdir()
+    (origin2 / "app" / "__init__.py").write_text('__version__ = "1.0.0"\n')
+    (origin2 / "app" / "main.py").write_text("x = 1\n")
+    (origin2 / "web" / "index.html").write_text("<html></html>\n")
+    (origin2 / "requirements.txt").write_text("fastapi\n")
+    (origin2 / "run.sh").write_text("#!/bin/sh\n")
+    _git("add", "-A"); _git("commit", "-qm", "v1.0.0")
+    _git("tag", "v1.0.0")
+    (origin2 / "app" / "__init__.py").write_text('__version__ = "1.2.1"\n')
+    _git("add", "-A"); _git("commit", "-qm", "v1.2.1")
+    _git("tag", "v1.2.1")
+    (origin2 / "app" / "__init__.py").write_text('__version__ = "1.3.0"\n')
+    _git("add", "-A"); _git("commit", "-qm", "v1.3.0")
+    _git("tag", "v1.3.0")
+
+    # 检查更新（走 git ls-remote，不依赖 GitHub API）
+    os.environ["AUTODEPLOY_UPDATE_REPO"] = str(origin2)
+    from app.store import Store as _Store2
+
+    store3 = _Store2(Database(tmp_root / "upd.db"))
+    mgr = _su.SelfUpdateManager(store3)
+    result = mgr.check(force=True)
+    check("检查更新识别最新 tag", result.latest == "v1.3.0", str(result.latest))
+    # 当前代码版本号恰为 1.3.0，与最新 tag 相同 ⇒ 无更新可用（正确行为）。
+    check("同版本时无更新可用", result.update_available is False)
+    # 模拟旧版本场景：伪造当前版本更低 ⇒ 有更新可用。
+    with_patch = _su.UpdateCheck(
+        current="1.0.0", latest=result.latest,
+        update_available=compare_versions(result.latest, "1.0.0") > 0,
+        checked_at=result.checked_at)
+    check("旧版本时有更新可用", with_patch.update_available is True)
+
+    # 状态持久化
+    state = {"stage": "restarting", "log": [], "backup": "", "target_version": "v1.3.0"}
+    mgr._save_state(state)
+    check("状态文件可回读", mgr.state().get("stage") == "restarting")
+    mgr.reconcile_on_startup()
+    check("启动收尾把重启中落定为完成", mgr.state().get("stage") == "done")
+
+    # 完整流程：下载 → 备份 → 替换 → 依赖（无 systemd ⇒ 提示手动重启）
+    install_root = tmp_root / "install"
+    install_root.mkdir(parents=True, exist_ok=True)
+    for item in _su.UPDATE_ITEMS:
+        src = origin2 / item
+        dst = install_root / item
+        if src.is_dir():
+            _shutil.copytree(src, dst)
+        else:
+            _shutil.copy2(src, dst)
+    # 用 v1.0.0 的内容伪装旧安装，并把 ROOT_DIR 指向它
+    _git("checkout", "-q", "v1.0.0")
+    for item in _su.UPDATE_ITEMS:
+        src = origin2 / item
+        dst = install_root / item
+        if dst.is_dir():
+            _shutil.rmtree(dst)
+            _shutil.copytree(src, dst)
+        else:
+            _shutil.copy2(src, dst)
+
+    original_root = _su.config.ROOT_DIR
+    try:
+        _su.config.ROOT_DIR = install_root
+        st = mgr.start("v1.3.0")
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if mgr.state().get("stage") in ("done", "failed"):
+                break
+            time.sleep(0.3)
+        final = mgr.state()
+        check("自更新流程完成", final.get("stage") == "done",
+              f"stage={final.get('stage')} err={final.get('error')} log={final.get('log', [])[-3:]}")
+        check("无 systemd 时提示手动重启", final.get("restart") == "manual")
+        installed_version = (install_root / "app" / "__init__.py").read_text()
+        check("安装目录已更新为目标版本", '1.3.0' in installed_version)
+        check("更新前备份已保留", bool(mgr.latest_backup()))
+
+        # 回滚
+        result_rb = mgr.rollback()
+        check("回滚执行成功", result_rb.get("ok") is True, str(result_rb))
+        restored = (install_root / "app" / "__init__.py").read_text()
+        check("回滚后恢复到更新前内容", '1.0.0' in restored, restored[:80])
+
+        # 防护：源码目录有未提交改动时拒绝自更新
+        (install_root / ".git").mkdir()
+        (install_root / "uncommitted.txt").write_text("dev work\n")
+        import subprocess as _sp
+        _sp.run(["git", "init", "-q"], cwd=install_root, check=True)
+        _sp.run(["git", "config", "user.email", "t@t"], cwd=install_root, check=True)
+        _sp.run(["git", "config", "user.name", "T"], cwd=install_root, check=True)
+        try:
+            mgr.start("v1.3.0")
+            check("未提交改动时拒绝自更新", False)
+        except RuntimeError as exc:
+            check("未提交改动时拒绝自更新", "未提交" in str(exc), str(exc))
+    finally:
+        os.environ.pop("AUTODEPLOY_UPDATE_REPO", None)
+        _su.config.ROOT_DIR = original_root
+    store3.close()
+
+    # ------------------------------------------------------------------
     section("调度器行为")
     from app.runner import DeployRunner
     from app.scheduler import Scheduler

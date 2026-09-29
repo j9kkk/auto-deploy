@@ -607,6 +607,16 @@ def validate_settings(payload: Mapping[str, Any], current: Settings) -> dict[str
             errors["default_branch"] = problem
         out["default_branch"] = branch
 
+    if "update_repo" in payload:
+        from .config import UPDATE_REPO_DEFAULT
+
+        repo = _clean_str(payload["update_repo"], limit=500) or UPDATE_REPO_DEFAULT
+        # 与仓库地址校验保持一致：允许本地路径/镜像（内网或测试场景）。
+        problem = gitops.validate_repo_url(repo)
+        if problem:
+            errors["update_repo"] = problem
+        out["update_repo"] = repo
+
     if "shell" in payload:
         shell = _clean_str(payload["shell"], limit=300) or "/bin/bash"
         if not shell.startswith("/"):

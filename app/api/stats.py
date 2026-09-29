@@ -8,15 +8,16 @@ import shutil
 import sys
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from .. import __version__ as VERSION
 from .. import config
+from ..selfupdate import ACTIVE_STAGES
 from ..deployer import METHOD_LABELS, cleanup_path
 from ..runner import STATUS_LABELS
 from ..schedule import iso, utcnow
 from ..service import Service
-from .deps import audit, current_user, get_service, require_admin
+from .deps import audit, client_ip, current_user, get_service, require_admin
 
 router = APIRouter(prefix="/api", tags=["stats"])
 
@@ -282,3 +283,60 @@ def export_audit(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="audit-log.csv"'},
     )
+
+
+@router.get("/system/update/check")
+def check_update(
+    force: bool = Query(False, description="跳过缓存强制查询"),
+    service: Service = Depends(get_service),
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    """查询是否有新版本。结果缓存 10 分钟，避免频繁请求 GitHub API。"""
+    return service.selfupdate.check(force=force).as_dict()
+
+
+@router.get("/system/self-update/status")
+def self_update_status(
+    service: Service = Depends(get_service),
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    state = service.selfupdate.state()
+    return {
+        **state,
+        "active": state.get("stage") in ACTIVE_STAGES,
+        "can_rollback": service.selfupdate.latest_backup() is not None,
+        "current_version": VERSION,
+    }
+
+
+@router.post("/system/self-update")
+def start_self_update(
+    payload: dict[str, Any] | None = None,
+    request: Request = None,  # type: ignore[assignment]
+    service: Service = Depends(get_service),
+    user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    body = payload or {}
+    try:
+        state = service.selfupdate.start(body.get("target_version"))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(service, "self_update_started", actor=user["username"],
+          target="self-update", detail=f"target={state.get('target_version')}",
+          ip=client_ip(request) if request else "")
+    return {"ok": True, "state": state}
+
+
+@router.post("/system/self-update/rollback")
+def rollback_self_update(
+    request: Request = None,  # type: ignore[assignment]
+    service: Service = Depends(get_service),
+    user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    try:
+        result = service.selfupdate.rollback()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(service, "self_update_rollback", actor=user["username"],
+          target="self-update", ip=client_ip(request) if request else "")
+    return result

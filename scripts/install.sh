@@ -134,6 +134,8 @@ WorkingDirectory=$INSTALL_DIR
 Environment=AUTODEPLOY_DATA_DIR=$DATA_DIR
 Environment=AUTODEPLOY_HOST=$HOST
 Environment=AUTODEPLOY_PORT=$PORT
+# 自我更新需要知道自己的 unit 名，以便调度延迟重启。
+Environment=AUTODEPLOY_SERVICE_NAME=$SERVICE_NAME
 Environment=PYTHONUNBUFFERED=1
 # The service executes user-provided deploy scripts; keep it in its own
 # cgroup so a runaway build cannot starve the host.

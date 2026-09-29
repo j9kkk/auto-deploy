@@ -17,6 +17,9 @@ from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
+# 自我更新默认代码来源。
+UPDATE_REPO_DEFAULT = "https://github.com/j9kkk/git-deploy.git"
+
 
 def _env_str(name: str) -> str | None:
     value = os.environ.get(name)
@@ -101,6 +104,10 @@ class Settings:
     log_retention_days: int = 14
     # A single run log is truncated after this many bytes to protect the disk.
     log_max_bytes: int = 8_000_000
+
+    # --- self update ------------------------------------------------------
+    # 自我更新的代码来源；可指向镜像或私有副本（需可匿名读取或配合代理）。
+    update_repo: str = UPDATE_REPO_DEFAULT
 
     # --- misc -------------------------------------------------------------
     timezone: str = "UTC"
