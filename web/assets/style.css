@@ -32,6 +32,9 @@
 html, body {
   margin: 0;
   padding: 0;
+  /* 始终为纵向滚动条预留空间。否则展开日志使内容变高、滚动条出现时，
+     可用宽度会瞬时变化（实测 15px），整张任务表随之重排,看起来就是闪烁。 */
+  scrollbar-gutter: stable;
   background: var(--bg);
   color: var(--text);
   font-family: var(--sans);
@@ -252,6 +255,29 @@ tbody tr:last-child td { border-bottom: none; }
   color: var(--text-dim);
 }
 .icon-btn svg { width: 15px; height: 15px; display: block; }
+/* 卷轴（展开/收起日志）：展开时高亮，并提供轻微旋转反馈 */
+.icon-btn.scroll-btn svg { transition: transform .25s cubic-bezier(.16,1,.3,1); }
+.icon-btn.scroll-btn:hover svg { transform: translateY(-1px); }
+.icon-btn.scroll-btn.active {
+  background: var(--accent-soft);
+  border-color: rgba(76,141,255,0.45);
+  color: var(--accent);
+}
+
+/* 启用/禁用按钮：用底色区分当前状态（点击后状态翻转） */
+.icon-btn.state-on {
+  background: var(--success-soft);
+  border-color: rgba(62,207,142,0.4);
+  color: var(--success);
+}
+.icon-btn.state-on:hover:not(:disabled) { background: rgba(62,207,142,0.24); }
+.icon-btn.state-off {
+  background: var(--warning-soft);
+  border-color: rgba(245,181,68,0.45);
+  color: var(--warning);
+}
+.icon-btn.state-off:hover:not(:disabled) { background: rgba(245,181,68,0.28); }
+
 .icon-btn.run { background: var(--success-soft); border-color: rgba(62,207,142,0.4); color: var(--success); }
 .icon-btn.run:hover:not(:disabled) { background: rgba(62,207,142,0.24); }
 .icon-btn.stop { background: var(--danger-soft); border-color: rgba(255,95,109,0.4); color: var(--danger); }
@@ -287,12 +313,35 @@ tr.row-disabled .dim { color: var(--text-dim); }
 tr.row-disabled .row-actions { opacity: 1; }
 
 /* --------------------------------------------------- inline expand row --- */
+/* 展开行的内容是整行跨列的，不参与列宽计算；同时给任务表固定列宽，
+   避免展开/收起时浏览器重算列宽造成整表宽度跳动（闪烁）。 */
+.task-table { table-layout: fixed; width: 100%; }
+.task-table th:nth-child(1) { width: 30%; }
+.task-table th:nth-child(2) { width: 13%; }
+.task-table th:nth-child(3) { width: 10%; }
+.task-table th:nth-child(4) { width: 11%; }
+.task-table th:nth-child(5) { width: 12%; }
+.task-table th:nth-child(6) { width: 14%; }
+.task-table th:nth-child(7) { width: 10%; }
+.task-table td { overflow: hidden; }
+.task-table .task-name-cell { min-width: 0; }
+
 .expand-row > td {
   padding: 0;
   background: rgba(255,255,255,0.018);
   border-bottom: 1px solid var(--border);
 }
 .expand-row[hidden] { display: none; }
+
+/* 展开/收起过渡：高度与透明度一起过渡，避免突然撑开导致的跳动。 */
+.expand-row > td > .task-expand {
+  overflow: hidden;
+  animation: expand-in .22s ease-out;
+}
+@keyframes expand-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
 .task-expand { padding: 14px 18px 16px; }
 .task-expand .log-view { max-height: 340px; min-height: 140px; margin-top: 8px; }
 .task-expand .expand-log-head {

@@ -30,6 +30,8 @@ AD.views = {};
   const ICONS = {
     play: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13a.7.7 0 0 0 1.07.6l10.2-6.5a.7.7 0 0 0 0-1.2L9.07 4.9A.7.7 0 0 0 8 5.5z"/></svg>',
     stop: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6.5" y="6.5" width="11" height="11" rx="1.6"/></svg>',
+    // 卷轴：展开/收起日志用
+    scroll: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4.5h9.5a2 2 0 0 1 2 2v11a2 2 0 0 0 2 2H8.5a2 2 0 0 1-2-2z"/><path d="M8.5 20.5a2 2 0 0 1-2-2v-11a2 2 0 0 0-2-2"/><path d="M10.5 9h5M10.5 12.5h5"/></svg>',
     log: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 5.5h16M4 12h16M4 18.5h10"/></svg>',
     edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4.5L19 9.5a2.1 2.1 0 0 0-3-3L5.5 17 4 20z"/></svg>',
     disable: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.2"/><path d="M6 6l12 12"/></svg>',
@@ -274,7 +276,7 @@ AD.views = {};
     }
 
     return `<div class="panel">
-      <div class="table-wrap"><table>
+      <div class="table-wrap"><table class="task-table">
         <thead><tr>
           <th>任务</th><th>状态</th><th>调度</th><th>部署方式</th>
           <th>最近运行</th><th>下次执行</th><th class="right">操作</th>
@@ -311,10 +313,18 @@ AD.views = {};
       ? `<button class="icon-btn stop" data-task-cancel="${task.id}" title="停止当前运行" aria-label="停止当前运行">${ICONS.stop}</button>`
       : `<button class="icon-btn run" data-task-run="${task.id}" title="立即运行" aria-label="立即运行">${ICONS.play}</button>`;
 
+    const expanded = AD.state.expandedTaskId === task.id;
+    // 启用/禁用用颜色区分状态：启用=绿底（点击将禁用），禁用=灰/黄底（点击将启用）
+    const toggleButton = task.enabled
+      ? `<button class="icon-btn state-on" data-task-toggle="${task.id}"
+                 title="禁用调度" aria-label="禁用调度">${ICONS.disable}</button>`
+      : `<button class="icon-btn state-off" data-task-toggle="${task.id}"
+                 title="启用调度" aria-label="启用调度">${ICONS.enable}</button>`;
+
     return `<tr data-task-row="${task.id}" class="${task.enabled ? '' : 'row-disabled'}">
-      <td style="min-width:200px" class="task-name-cell">
-        <div class="task-name-link" data-task-toggle-expand="${task.id}"
-             title="点击展开详情与日志">${e(task.name)}</div>
+      <td class="task-name-cell">
+        <div class="task-name-link" data-task-edit="${task.id}"
+             title="点击编辑任务">${e(task.name)}</div>
         <div class="faint truncate" style="max-width:280px" title="${a(task.repo_url)}">
           ${e(task.repo_url)}<span class="dim"> @${e(task.repo_branch)}</span>
         </div>
@@ -327,13 +337,11 @@ AD.views = {};
       <td>
         <div class="table-actions row-actions">
           ${runButton}
-          <button class="icon-btn" data-task-log="${task.id}" title="展开最近日志" aria-label="展开最近日志">${ICONS.log}</button>
-          <button class="icon-btn" data-task-edit="${task.id}" title="编辑任务" aria-label="编辑任务">${ICONS.edit}</button>
-          <button class="icon-btn" data-task-toggle="${task.id}"
-                  title="${task.enabled ? '禁用调度' : '启用调度'}"
-                  aria-label="${task.enabled ? '禁用调度' : '启用调度'}">
-            ${task.enabled ? ICONS.disable : ICONS.enable}
-          </button>
+          <button class="icon-btn scroll-btn${expanded ? ' active' : ''}" data-task-log="${task.id}"
+                  title="${expanded ? '收起日志' : '展开最近日志'}"
+                  aria-label="${expanded ? '收起日志' : '展开最近日志'}"
+                  aria-expanded="${expanded ? 'true' : 'false'}">${ICONS.scroll}</button>
+          ${toggleButton}
         </div>
       </td>
     </tr>`;
@@ -360,12 +368,23 @@ AD.views = {};
     container.addEventListener('click', (event) => {
       const run = event.target.closest('[data-task-run]');
       if (run) {
-        handle(run, async () => {
-          const result = await AD.api.post(`/api/tasks/${run.dataset.taskRun}/run`);
-          AD.toastSuccess('已开始运行 #' + result.run_id);
-          // 运行后直接展开该行，让用户看到实时日志。
-          await AD.render('tasks');
-          AD.toggleTaskExpand(Number(run.dataset.taskRun), { forceOpen: true, runId: result.run_id });
+        const taskId = Number(run.dataset.taskRun);
+        const task = (AD.state.tasks || []).find((item) => item.id === taskId) || {};
+        // 运行会真正改动线上服务，先二次确认，避免误点。
+        AD.confirm({
+          title: '确认运行部署',
+          message: `将立即对「${task.name || '该任务'}」执行一次部署。`,
+          detail: '部署会拉取最新代码并更新线上服务，请确认当前不是发布冻结期。',
+          confirmText: '开始运行',
+        }).then((ok) => {
+          if (!ok) return;
+          return handle(run, async () => {
+            const result = await AD.api.post(`/api/tasks/${taskId}/run`);
+            AD.toastSuccess('已开始运行 #' + result.run_id);
+            // 运行后直接展开该行，让用户看到实时日志。
+            await AD.render('tasks');
+            AD.toggleTaskExpand(taskId, { forceOpen: true, runId: result.run_id });
+          });
         });
         return;
       }
@@ -380,12 +399,8 @@ AD.views = {};
       }
       const logBtn = event.target.closest('[data-task-log]');
       if (logBtn) {
-        AD.toggleTaskExpand(Number(logBtn.dataset.taskLog), { forceOpen: true, focusLog: true });
-        return;
-      }
-      const nameLink = event.target.closest('[data-task-toggle-expand]');
-      if (nameLink) {
-        AD.toggleTaskExpand(Number(nameLink.dataset.taskToggleExpand));
+        // 点击在展开与收起之间切换（不传 forceOpen，由 toggle 判断）。
+        AD.toggleTaskExpand(Number(logBtn.dataset.taskLog));
         return;
       }
       const edit = event.target.closest('[data-task-edit]');
@@ -411,26 +426,37 @@ AD.views = {};
   // ======================================================================
   // 行内展开：详情 + 实时日志（替代原弹窗）
   // ======================================================================
+  /** 同步卷轴按钮的激活态与提示文案。 */
+  function syncScrollButton(button, expanded) {
+    if (!button) return;
+    button.classList.toggle('active', Boolean(expanded));
+    button.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    const label = expanded ? '收起日志' : '展开最近日志';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+  }
+
   AD.toggleTaskExpand = async function (taskId, options) {
     const options_ = options || {};
     const row = document.querySelector(`tr[data-task-row="${taskId}"]`);
     if (!row) { AD.state.expandedTaskId = null; return; }
 
     const existing = document.getElementById(`task-expand-${taskId}`);
-    const nameLink = row.querySelector('.task-name-link');
+    const scrollBtn = row.querySelector('.scroll-btn');
     if (existing && !options_.forceOpen) {
       existing.remove();
-      nameLink.classList.remove('expanded');
       AD.stopInlineLog(taskId);
       AD.state.expandedTaskId = null;
+      syncScrollButton(scrollBtn, false);
       return;
     }
 
     // 只保留一个展开行，展开新的收起旧的。
     document.querySelectorAll('.expand-row').forEach((node) => node.remove());
-    document.querySelectorAll('.task-name-link.expanded').forEach((node) => node.classList.remove('expanded'));
+    document.querySelectorAll('.scroll-btn.active').forEach((node) => syncScrollButton(node, false));
     Object.keys(AD.state.inlineLogTimers || {}).forEach((key) => AD.stopInlineLog(Number(key)));
     AD.state.expandedTaskId = taskId;
+    syncScrollButton(scrollBtn, true);
 
     const placeholder = document.createElement('tr');
     placeholder.className = 'expand-row';
@@ -439,14 +465,13 @@ AD.views = {};
       <div class="loading-block" style="padding:22px"><span class="spinner"></span> 加载中…</div>
     </div></td>`;
     row.after(placeholder);
-    nameLink.classList.add('expanded');
 
     let data;
     try { data = await AD.api.get(`/api/tasks/${taskId}`); }
     catch (err) {
       placeholder.remove();
-      nameLink.classList.remove('expanded');
       AD.state.expandedTaskId = null;
+      syncScrollButton(scrollBtn, false);
       AD.toastError(err.message);
       return;
     }
@@ -462,14 +487,12 @@ AD.views = {};
       <div class="expand-toolbar">
         <span class="badge ${t.enabled ? 'on' : 'off'}">${t.enabled ? '已启用' : '已禁用'}</span>
         <span class="badge neutral">${e(methodLabel(t.deploy_method))}</span>
-        <span class="faint">${e(AD.scheduleText(t))}</span>
-        ${nextRunInline(t)}
+        ${dedupeIn([AD.scheduleText(t), nextRunInlineText(t)]).map((text) =>
+          `<span class="faint">${e(text)}</span>`).join('')}
         <div class="spacer"></div>
-        <button class="sm" data-inline-edit="${t.id}">${ICONS.edit} 编辑</button>
         <button class="sm" data-inline-rollback="${t.id}">${ICONS.rollback} 回滚上一版本</button>
         <button class="sm" data-inline-artifacts="${t.id}">${ICONS.download} 产物</button>
-        ${activeRun ? `<button class="sm danger" data-inline-cancel="${activeRun.id}">取消 #${activeRun.id}</button>`
-                    : `<button class="sm" data-inline-run="${t.id}">${ICONS.play} 运行</button>`}
+        ${activeRun ? `<button class="sm danger" data-inline-cancel="${activeRun.id}">取消 #${activeRun.id}</button>` : ''}
       </div>
 
       <dl class="kv">
@@ -502,20 +525,26 @@ AD.views = {};
       if (!button) return;
       button.addEventListener('click', () => busyGuard(button, fn));
     };
-    root.querySelector('[data-inline-edit]')?.addEventListener('click', () => AD.openTaskForm(taskId));
-    inline('[data-inline-run]', async () => {
-      const result = await AD.api.post(`/api/tasks/${taskId}/run`);
-      AD.toastSuccess('已开始运行 #' + result.run_id);
-      AD.toggleTaskExpand(taskId, { forceOpen: true, runId: result.run_id });
-    });
     inline('[data-inline-cancel]', async () => {
       await AD.api.post(`/api/runs/${root.querySelector('[data-inline-cancel]').dataset.inlineCancel}/cancel`);
       AD.toastSuccess('已请求取消');
       AD.toggleTaskExpand(taskId, { forceOpen: true });
     });
-    inline('[data-inline-rollback]', async () => {
-      const result = await AD.api.post(`/api/tasks/${taskId}/rollback`);
-      AD.toastSuccess(result.message);
+    root.querySelector('[data-inline-rollback]')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      // 回滚会切换线上版本，二次确认后再执行。
+      const ok = await AD.confirm({
+        title: '回滚到上一版本',
+        message: '将把线上的 current 指向上一发布版本，并可能重启服务。',
+        detail: '回滚会立即改变线上服务的内容，请确认已了解影响。',
+        confirmText: '确认回滚',
+        danger: true,
+      });
+      if (!ok) return;
+      busyGuard(button, async () => {
+        const result = await AD.api.post(`/api/tasks/${taskId}/rollback`);
+        AD.toastSuccess(result.message);
+      });
     });
     root.querySelector('[data-inline-artifacts]')?.addEventListener('click', async () => {
       try {
@@ -540,12 +569,26 @@ AD.views = {};
     startInlineLog(taskId, targetRunId, logEl, metaEl);
   };
 
-  function nextRunInline(task) {
-    if (!task.enabled) return '<span class="faint">已禁用调度</span>';
-    if (!task.next_run_at) return '<span class="faint">仅手动触发</span>';
+  /** 下次执行的纯文本描述（与调度描述一起做去重，避免重复展示）。 */
+  function nextRunInlineText(task) {
+    if (!task.enabled) return '已禁用调度';
+    if (!task.next_run_at) return '仅手动触发';
     const when = new Date(String(task.next_run_at).endsWith('Z') ? task.next_run_at : task.next_run_at + 'Z');
     const seconds = Math.max(0, Math.round((when.getTime() - Date.now()) / 1000));
-    return `<span class="faint">下次：${e(AD.formatTime(task.next_run_at))}（${e(AD.formatCountdown(seconds))}后）</span>`;
+    return `下次：${AD.formatTime(task.next_run_at)}（${AD.formatCountdown(seconds)}后）`;
+  }
+
+  /** 去除空值与重复项，保持原始顺序。 */
+  function dedupeIn(items) {
+    const seen = new Set();
+    const out = [];
+    items.forEach((item) => {
+      const text = (item || '').trim();
+      if (!text || seen.has(text)) return;
+      seen.add(text);
+      out.push(text);
+    });
+    return out;
   }
 
   function renderInlineRuns(runs, taskId) {
