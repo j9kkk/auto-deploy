@@ -75,6 +75,8 @@
     const container = document.getElementById('content');
     const previousView = AD.state.currentView;
     AD.state.currentView = view;
+    // 就地刷新回调属于上一个视图的 DOM，必须在重绘前撤销。
+    AD.state.viewRefresh = null;
     document.querySelectorAll('#nav .nav-item').forEach((item) => {
       item.classList.toggle('active', item.dataset.view === view);
     });
@@ -84,6 +86,7 @@
       // 只在真正离开任务页时清除展开状态；任务页内部重绘需要保留它，
       // 以便把用户正在看的展开行在渲染后恢复回来。
       if (previousView !== 'tasks') AD.state.expandedTaskId = null;
+      if (previousView !== 'tasks') AD.clearInlinePanelSync?.();
     }
     container.innerHTML = '<div class="loading-block"><span class="spinner"></span> 加载中…</div>';
     try {
@@ -129,7 +132,27 @@
       if (badge) { badge.className = 'badge failed'; badge.textContent = '服务不可达'; }
       return;
     }
+    // 运行状态收敛（例如部署结束、取消生效）由视图就地更新，不再整页重绘。
+    AD.pollRunStates();
   }
+
+  // ------------------------------------------------- run state convergence
+  // 当前视图注册 viewRefresh 后，这里只负责触发；视图自己决定要不要发请求
+  // 以及如何就地更新。缺省时不做任何事，登录页等场景保持零请求。
+  let runPollBusy = false;
+
+  AD.pollRunStates = async function () {
+    if (runPollBusy || !AD.state.viewRefresh || !AD.state.user) return;
+    if (document.hidden) return;
+    runPollBusy = true;
+    try {
+      await AD.state.viewRefresh();
+    } catch (err) {
+      // 轮询失败静默重试，下一次定时轮询会再试。
+    } finally {
+      runPollBusy = false;
+    }
+  };
 
   // ------------------------------------------------------------------ boot
   function bindGlobalHandlers() {

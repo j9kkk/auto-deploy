@@ -19,6 +19,7 @@ from __future__ import annotations
 import fnmatch
 import glob
 import os
+import re
 import shutil
 import tarfile
 import time
@@ -639,6 +640,15 @@ def _safe_task_slug(name: str, task_id: Any) -> str:
     return f"{slug}-{task_id}"
 
 
+def compose_project_name(task: dict[str, Any]) -> str:
+    """该任务的 compose 项目名。
+
+    部署时用它固定项目（避免每次发布新建网络），删除任务时用它精确停止
+    本项目容器——两者必须是同一个函数，否则删除会漏掉正在运行的容器。
+    """
+    return f"autodeploy-{_safe_task_slug(task.get('name') or '', task.get('id'))}"
+
+
 def deploy_docker_compose(ctx: DeployContext) -> None:
     """Bring up the compose project from the release directory."""
     if not command_exists("docker"):
@@ -662,7 +672,7 @@ def deploy_docker_compose(ctx: DeployContext) -> None:
     # 这会让每次部署都新建一个 compose 项目与一套网络——数百次运行后耗尽
     # Docker 默认地址池，报 "all predefined address pools have been fully
     # subnetted"。固定项目名让后续部署原地复用同一组网络并替换容器。
-    project_name = f"autodeploy-{_safe_task_slug(ctx.task.get('name') or '', ctx.task.get('id'))}"
+    project_name = compose_project_name(ctx.task)
     ctx.log(f"compose 项目名: {project_name}")
 
     result = ctx.exec(
@@ -755,8 +765,6 @@ def _rollback_target(
     selected_run: dict[str, Any] | None,
 ) -> tuple[Path, Path, Path | None, Path]:
     """Resolve only a stored run's direct release directory, never a client path."""
-    import re
-
     if selected_run is not None:
         if not selected_run:
             raise DeployError("指定的运行记录不存在")
@@ -974,3 +982,179 @@ def cleanup_path(path: Path) -> None:
         path.unlink(missing_ok=True)
     elif path.exists():
         shutil.rmtree(path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 删除任务：停止容器
+# ---------------------------------------------------------------------------
+
+# 删除任务时最多等待容器停止的秒数。docker 偶发卡住不应让删除请求一直挂着。
+CONTAINER_STOP_TIMEOUT_SECONDS = 120
+
+
+def _docker_available() -> bool:
+    return command_exists("docker")
+
+
+def _compose_base() -> list[str]:
+    return ["docker", "compose"] if _supports_compose_v2() else ["docker-compose"]
+
+
+def _running_compose_containers(project: str) -> list[str]:
+    """列出属于该 compose 项目、且可能仍在运行的容器名。
+
+    只认带 ``com.docker.compose.project`` 标签且项目名匹配的容器，
+    绝不触碰手工 ``docker run`` 起来的业务容器。
+    """
+    listing = run_command(
+        ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Labels}}"],
+        timeout=30,
+        log=None,
+    )
+    if not listing.ok:
+        return []
+    names: list[str] = []
+    for line in listing.output.splitlines():
+        name, _, label = line.partition("\t")
+        labels = label or ""
+        if "com.docker.compose.project" not in labels:
+            continue
+        owner = labels.split("com.docker.compose.project=")[-1].split(",")[0].strip()
+        if owner == project:
+            names.append(name.strip())
+    return [name for name in names if name]
+
+
+def stop_task_containers(
+    task: dict[str, Any],
+    *,
+    log: Callable[[str], None] | None = None,
+    timeout: int = CONTAINER_STOP_TIMEOUT_SECONDS,
+) -> list[str]:
+    """停止并移除该任务部署起来的容器，返回处理过的容器名。
+
+    仅对 docker / docker_compose 生效：
+    * ``docker_compose``：按任务固定的项目名执行 ``compose down``，覆盖
+      该项目下的全部服务与网络；
+    * ``docker``：容器由任务自定义的 ``docker_command`` 启动，无法可靠推断
+      容器名，因此执行任务内配置的**回滚脚本**（约定为停止/清理动作的位置），
+      但绝不自动猜测容器名去 ``docker rm -f``，避免误删他人容器。
+
+    任何一步失败都只记录到 ``log`` 并继续，删除任务本身不应因 Docker 环境
+    异常而失败。
+    """
+    def note(message: str) -> None:
+        if log is not None:
+            log(message)
+
+    method = str(task.get("deploy_method") or "").strip().lower()
+    if method not in {"docker", "docker_compose"}:
+        return []
+    if not _docker_available():
+        note("! 未找到 docker 命令，跳过容器清理")
+        return []
+
+    removed: list[str] = []
+    if method == "docker_compose":
+        project = compose_project_name(task)
+        # 先取一次名单：compose down 成功后容器已消失，事后查询会得到空列表。
+        before = _running_compose_containers(project)
+        note(f"--- 停止 compose 项目 {project} ---")
+        result = run_command(
+            [*_compose_base(), "-p", project, "down", "--remove-orphans", "--timeout", "10"],
+            timeout=max(30, timeout),
+            log=log,
+        )
+        if not result.ok:
+            # compose down 依赖 compose 文件；文件已被删或项目未创建时会失败，
+            # 此时退回到按标签逐个 rm -f，保证容器不会残留。
+            note(f"! compose down 未成功（{result.error}），改为按项目标签清理容器")
+            for name in before:
+                note(f"--- 强制移除容器 {name} ---")
+                removal = run_command(["docker", "rm", "-f", name], timeout=60, log=log)
+                if removal.ok:
+                    removed.append(name)
+        else:
+            removed = before
+
+    script = (task.get("rollback_script") or "").strip()
+    if method == "docker" and script:
+        # 容器由用户脚本启动，容器名只有脚本知道；用回滚脚本作为停止钩子。
+        note("--- 执行回滚脚本以停止容器 ---")
+        env = {
+            "AUTODEPLOY_TASK_ID": str(task.get("id", "")),
+            "AUTODEPLOY_TASK_NAME": str(task.get("name", "")),
+            "AUTODEPLOY_DEPLOY_METHOD": method,
+            "AUTODEPLOY_TARGET_DIR": str(task.get("target_dir") or ""),
+            "AUTODEPLOY_STAGE": "cleanup",
+        }
+        result = run_command(
+            shell_command(script, shell=config.load_settings().shell),
+            cwd=config.DATA_DIR,
+            env=env,
+            timeout=max(30, timeout),
+            log=log,
+            label="cleanup",
+            kill_grace_seconds=config.load_settings().kill_grace_seconds,
+        )
+        if not result.ok:
+            note(f"! 回滚脚本执行失败: {result.error}")
+    elif method == "docker":
+        note("! 该 Docker 任务未配置回滚脚本，无法自动停止容器；请手动确认容器状态")
+    return removed
+
+
+def purge_target_release_history(
+    task: dict[str, Any],
+    *,
+    log: Callable[[str], None] | None = None,
+) -> list[str]:
+    """删除配置了 ``target_dir`` 的任务在该目录下的发布历史。
+
+    仅删除 ``<target_dir>/releases`` 与 ``<target_dir>/current`` 这两个由本
+    服务创建的条目，**绝不删除 target_dir 本身**——它通常是站点根目录，
+    里面还有业务自己的文件，超出「删除任务」的授权范围。
+
+    安全边界：目标必须是绝对路径；``releases`` 若为软链则跳过（指向别处，
+    删除会波及无关数据）；``current`` 只在确实是软链时才解除，普通目录不动。
+    """
+    target_raw = str(task.get("target_dir") or "").strip()
+    if not target_raw:
+        return []
+
+    def note(message: str) -> None:
+        if log is not None:
+            log(message)
+
+    try:
+        target = Path(os.path.expanduser(target_raw))
+    except (OSError, ValueError):
+        note(f"! 目标目录路径无效，跳过清理: {target_raw}")
+        return []
+    # 必须绝对且不能是根目录：否则 releases 会成为 /releases 这类系统路径。
+    if not target.is_absolute() or len(target.parts) < 2:
+        note(f"! 目标目录不是可安全清理的绝对路径，跳过: {target_raw}")
+        return []
+    if target.is_symlink():
+        note(f"! 目标目录是软链，跳过清理: {target_raw}")
+        return []
+
+    releases_root, current_link = resolve_release_paths(task)
+    removed: list[str] = []
+
+    if releases_root.is_symlink():
+        note(f"! 发布目录是软链，跳过清理: {releases_root}")
+    elif releases_root.is_dir():
+        cleanup_path(releases_root)
+        removed.append(str(releases_root))
+
+    if current_link.is_symlink():
+        try:
+            current_link.unlink()
+            removed.append(str(current_link))
+        except OSError as exc:
+            note(f"! 解除 current 软链失败: {exc}")
+
+    if removed:
+        note(f"已清理目标目录下的发布历史，保留 {target}（目标目录未删除）")
+    return removed

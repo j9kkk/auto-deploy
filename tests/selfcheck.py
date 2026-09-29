@@ -411,6 +411,17 @@ def run() -> int:
     check("接受 SSH 地址", validate_repo_url("git@github.com:a/b.git") is None)
     check("接受本地路径", validate_repo_url("/srv/git/repo.git") is None)
     check("拒绝含空白的地址", validate_repo_url("https://a b/c") is not None)
+
+    # 拉取深度：0 是「完整历史」，不能被当成缺省值退化为浅克隆。
+    from app.runner import resolve_git_depth
+
+    check("深度 0 保留为完整历史", resolve_git_depth({"git_depth": 0}) == 0)
+    check("深度 0 字符串同样保留", resolve_git_depth({"git_depth": "0"}) == 0)
+    check("深度缺省回退浅克隆", resolve_git_depth({}) == 1)
+    check("深度为空回退浅克隆", resolve_git_depth({"git_depth": None}) == 1)
+    check("显式深度被保留", resolve_git_depth({"git_depth": 5}) == 5)
+    check("非法深度回退浅克隆", resolve_git_depth({"git_depth": "abc"}) == 1)
+
     check("校验合法分支", validate_branch("feature/x") is None)
     check("拒绝 .. 分支", validate_branch("a..b") is not None)
     check("拒绝选项式分支", validate_branch("-x") is not None)
@@ -432,6 +443,22 @@ def run() -> int:
           not _looks_transient("fatal: Remote branch nope not found"))
     check("解析 http 主机端口", _split_host_port("https://h/a.git") == ("h", 443))
     check("解析自定义端口", _split_host_port("http://h:8080/a") == ("h", 8080))
+
+    # 私有仓库未配凭据时，必须给出可操作提示而不是只报「命令退出码 128」。
+    from app.gitops import _credential_hint
+
+    _private_repo_output = (
+        "Cloning into '/var/lib/autodeploy/workspaces/x'...\n"
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+    )
+    check("未配凭据给出可操作提示", "未配置可用凭据" in _credential_hint(_private_repo_output))
+    check("凭据失效给出可操作提示",
+          "凭据无效或已过期" in _credential_hint("fatal: Authentication failed for 'https://x'"))
+    check("SSH 密钥被拒给出可操作提示",
+          "Deploy Keys" in _credential_hint("git@github.com: Permission denied (publickey)."))
+    check("本地权限错误不误报为密钥问题",
+          _credential_hint("fatal: could not create work tree dir '/x': Permission denied") == "")
+    check("无认证问题时不给凭据提示", _credential_hint("fatal: Remote branch nope not found") == "")
 
     # ------------------------------------------------------------------
     section("命令执行与取消")
@@ -508,6 +535,26 @@ def run() -> int:
     store.tasks.update(task_id, {"name": "renamed"})
     check("局部更新保留令牌", store.tasks.get(task_id)["git_token"] == "secret-token")
     check("局部更新生效", store.tasks.get(task_id)["name"] == "renamed")
+
+    # 编辑任务时保存令牌：曾因 git_token 不在 TASK_UPDATE_COLUMNS 而被静默丢弃，
+    # 界面上保存成功、后续部署却匿名克隆私有仓库并报 128。必须能被写入与清除。
+    store.tasks.update(task_id, {"git_token": "rotated-token"})
+    check("更新可写入任务内令牌", store.tasks.get(task_id)["git_token"] == "rotated-token")
+    store.tasks.update(task_id, {"git_token": ""})
+    check("更新可清除任务内令牌", store.tasks.get(task_id)["git_token"] == "")
+
+    # 结构护栏：校验层能产出的字段必须都能落库，否则会在某一侧被静默丢弃。
+    from app import validation as _validation
+    from app.store import TASK_INSERT_COLUMNS as _INSERT, TASK_UPDATE_COLUMNS as _UPDATE
+
+    import inspect as _inspect
+    import re as _re
+
+    _out_keys = set(_re.findall(r'out\["([a-z_]+)"\]', _inspect.getsource(_validation.validate_task_payload)))
+    check("校验输出字段均可插入", not (_out_keys - set(_INSERT)),
+          f"插入缺失: {sorted(_out_keys - set(_INSERT))}")
+    check("校验输出字段均可更新", not (_out_keys - set(_UPDATE)),
+          f"更新缺失: {sorted(_out_keys - set(_UPDATE))}")
 
     store.tasks.set_next_run(task_id, iso(datetime.utcnow() - timedelta(minutes=1)))
     check("到期任务可查询", len(store.tasks.due(iso(datetime.utcnow()))) == 1)
@@ -787,6 +834,197 @@ def run() -> int:
                   and config._claimed_by(legacy_workspace, 99998))
             for fixture in (foreign, foreign_suffix, legacy_workspace):
                 shutil.rmtree(fixture)
+
+        # --- 删除任务：停止容器 + 清空工作目录/发布产物/日志/历史存档 -----
+        from unittest.mock import patch as del_patch
+
+        from app import deployer as deployer_mod
+
+        def result_of(command, exit_code=0, output=""):
+            return deployer_mod.CommandResult(
+                command=command, exit_code=exit_code, output=output, duration_ms=1
+            )
+
+        response = client.post("/api/tasks", json={"name": "Delete_Purge", "repo_url": str(origin),
+                               "schedule_type": "manual", "deploy_method": "release"})
+        purge_id = response.json()["task"]["id"]
+        purge_row = service.store.tasks.get(purge_id)
+
+        workspace = config.workspace_dir_for_task(purge_row)
+        config._claim(workspace, purge_id)
+        (workspace / "app.py").write_text("print('x')", encoding="utf-8")
+        releases = config.releases_dir(purge_id) / "releases"
+        (releases / "20260101-000000-abcdef12").mkdir(parents=True)
+        artifacts = config.artifacts_dir(purge_id)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "bundle.tar.gz").write_bytes(b"gz")
+        temp_creds = config.temp_dir(purge_id) / ".git-credentials"
+        temp_creds.mkdir(parents=True, exist_ok=True)
+
+        purge_run = service.store.runs.create(purge_row, trigger="manual")
+        service.store.runs.mark_finished(purge_run, status="success", exit_code=0)
+        log_path = config.run_log_path(purge_run)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("部署日志", encoding="utf-8")
+        service.store.runs.set_log(purge_run, str(log_path), 12)
+
+        # 目标目录：只清理 releases 与 current，目录本身及业务文件必须保留。
+        target_dir = tmp_root / "site"
+        (target_dir / "assets").mkdir(parents=True)
+        (target_dir / "assets" / "keep.txt").write_text("业务文件", encoding="utf-8")
+        target_releases = target_dir / "releases"
+        (target_releases / "20260101-000000-abcdef12").mkdir(parents=True)
+        (target_dir / "current").symlink_to(target_releases / "20260101-000000-abcdef12")
+        client.patch(f"/api/tasks/{purge_id}", json={"target_dir": str(target_dir)})
+
+        response = client.delete(f"/api/tasks/{purge_id}")
+        payload = response.json()
+        check("删除任务返回清理明细", response.status_code == 200 and payload["ok"])
+        check("删除结果包含容器与运行记录计数",
+              "containers" in payload and payload["runs_deleted"] == 1)
+        check("删除移除工作目录", not workspace.exists())
+        check("删除移除发布产物目录", not config.releases_dir(purge_id).exists())
+        check("删除移除打包产物", not artifacts.exists())
+        check("删除移除临时凭据目录", not config.temp_dir(purge_id).exists())
+        check("删除移除运行日志", not log_path.exists())
+        check("删除清理目标目录发布历史",
+              not target_releases.exists() and not (target_dir / "current").is_symlink())
+        check("删除保留目标目录与其业务文件", (target_dir / "assets" / "keep.txt").exists())
+        check("删除后详情返回404", client.get(f"/api/tasks/{purge_id}").status_code == 404)
+        check("删除后不可重复删除", client.delete(f"/api/tasks/{purge_id}").status_code == 404)
+
+        # purge=false 只保留文件，任务记录本身仍要删除。
+        response = client.post("/api/tasks", json={"name": "Delete_Keep", "repo_url": str(origin),
+                               "schedule_type": "manual", "deploy_method": "release"})
+        keep_id = response.json()["task"]["id"]
+        keep_workspace = config.workspace_dir_for_task(service.store.tasks.get(keep_id))
+        config._claim(keep_workspace, keep_id)
+        response = client.delete(f"/api/tasks/{keep_id}?purge=false")
+        check("purge=false 仍删除任务记录", response.status_code == 200
+              and client.get(f"/api/tasks/{keep_id}").status_code == 404)
+        check("purge=false 保留工作目录", keep_workspace.exists() and bool(response.json()["kept"]))
+        shutil.rmtree(keep_workspace)
+
+        # 运行中的任务禁止删除：容器可能正在被使用。
+        response = client.post("/api/tasks", json={"name": "Delete_Guard", "repo_url": str(origin),
+                               "schedule_type": "manual", "deploy_method": "release"})
+        guard_id = response.json()["task"]["id"]
+        guard_run = service.store.runs.create(service.store.tasks.get(guard_id), trigger="manual")
+        response = client.delete(f"/api/tasks/{guard_id}")
+        check("运行中任务禁止删除", response.status_code == 409)
+        check("拒绝删除后任务仍存在", service.store.tasks.get(guard_id) is not None)
+        service.store.runs.mark_finished(guard_run, status="cancelled", exit_code=None)
+        check("运行结束后允许删除", client.delete(f"/api/tasks/{guard_id}").status_code == 200)
+
+        # 容器停止：只认本任务固定项目名标签，绝不触碰他人或手工容器。
+        compose_task = {"id": 7100, "name": "Shop_Web", "deploy_method": "docker_compose"}
+        listing = (
+            "shop-web-1\tcom.docker.compose.project=autodeploy-shop-web-7100\n"
+            "foreign-1\tcom.docker.compose.project=someone-else\n"
+            "manual-box\t\n"
+        )
+        compose_calls: list[list[str]] = []
+
+        def compose_run(args, **kwargs):
+            compose_calls.append(list(args))
+            if list(args)[:2] == ["docker", "ps"]:
+                return result_of(" ".join(args), output=listing)
+            return result_of(" ".join(args))
+
+        with del_patch.object(deployer_mod, "command_exists", return_value=True), \
+                del_patch.object(deployer_mod, "run_command", side_effect=compose_run):
+            stopped = deployer_mod.stop_task_containers(compose_task, log=lambda _m: None)
+        check("compose 任务按固定项目名停止",
+              ["docker", "compose", "-p", "autodeploy-shop-web-7100", "down",
+               "--remove-orphans", "--timeout", "10"] in compose_calls)
+        check("compose 停止返回本项目容器名", stopped == ["shop-web-1"])
+        check("compose 停止不触碰他人或手工容器",
+              all("someone-else" not in " ".join(call) and "manual-box" not in " ".join(call)
+                  for call in compose_calls))
+
+        # compose down 失败（例如文件已删除）时，退化为按标签 rm -f，避免容器残留。
+        fallback_calls: list[list[str]] = []
+
+        def fallback_run(args, **kwargs):
+            fallback_calls.append(list(args))
+            if list(args)[:2] == ["docker", "ps"]:
+                return result_of(" ".join(args), output=listing)
+            # 只让 down 失败（compose 文件已被删除的情形），版本探测仍需成功，
+            # 否则会退化成 v1 命令，测不到预期路径。
+            if "down" in list(args):
+                return result_of(" ".join(args), exit_code=1, output="no configuration file provided")
+            return result_of(" ".join(args))
+
+        with del_patch.object(deployer_mod, "command_exists", return_value=True), \
+                del_patch.object(deployer_mod, "run_command", side_effect=fallback_run):
+            stopped = deployer_mod.stop_task_containers(compose_task, log=lambda _m: None)
+        check("compose down 失败时按项目标签强制移除",
+              ["docker", "rm", "-f", "shop-web-1"] in fallback_calls)
+        check("强制移除仍忽略他人容器",
+              all("foreign-1" not in " ".join(call) and "manual-box" not in " ".join(call)
+                  for call in fallback_calls))
+        check("强制移除返回已移除容器", stopped == ["shop-web-1"])
+
+        # 纯 docker 任务用回滚脚本作为停止钩子（容器名只有用户脚本知道）。
+        shell_calls: list[list[str]] = []
+
+        def shell_run(args, **kwargs):
+            shell_calls.append(list(args))
+            return result_of(" ".join(args))
+
+        with del_patch.object(deployer_mod, "command_exists", return_value=True), \
+                del_patch.object(deployer_mod, "run_command", side_effect=shell_run):
+            deployer_mod.stop_task_containers(
+                {"id": 7200, "name": "Api_Box", "deploy_method": "docker",
+                 "rollback_script": "docker rm -f api-box"},
+                log=lambda _m: None,
+            )
+        check("docker 任务用回滚脚本停止容器",
+              any(call[0] in ("/bin/bash", "/bin/sh") and "api-box" in call[-1] for call in shell_calls))
+
+        # 非 Docker 部署方式不得触碰 docker。
+        for quiet_method in ("release", "script", "artifact", "systemd", "rsync"):
+            touched: list[list[str]] = []
+
+            def quiet_run(args, **kwargs):
+                touched.append(list(args))
+                return result_of(" ".join(args))
+
+            with del_patch.object(deployer_mod, "command_exists", return_value=True), \
+                    del_patch.object(deployer_mod, "run_command", side_effect=quiet_run):
+                deployer_mod.stop_task_containers(
+                    {"id": 7300, "name": "Quiet", "deploy_method": quiet_method},
+                    log=lambda _m: None,
+                )
+            check(f"{quiet_method} 不触发容器清理", not touched)
+
+        # 目标目录清理的安全边界：软链/根路径/无配置一律跳过。
+        check("无目标目录时不清理", deployer_mod.purge_target_release_history(
+            {"id": 7400, "name": "No_Target"}) == [])
+        link_root = tmp_root / "link-site"
+        link_root.mkdir(parents=True)
+        real_root = tmp_root / "real-releases"
+        real_root.mkdir(parents=True)
+        (real_root / "v1").mkdir()
+        (link_root / "releases").symlink_to(real_root)
+        check("目标目录发布根为软链时跳过",
+              deployer_mod.purge_target_release_history(
+                  {"id": 7401, "name": "Link_Target", "target_dir": str(link_root)}) == []
+              and real_root.exists())
+        check("目标目录为根或其下时跳过",
+              deployer_mod.purge_target_release_history(
+                  {"id": 7402, "name": "Root_Target", "target_dir": "/"}) == [])
+        normal_target = tmp_root / "normal-site"
+        (normal_target / "releases" / "v1").mkdir(parents=True)
+        (normal_target / "current").symlink_to(normal_target / "releases" / "v1")
+        (normal_target / "own.txt").write_text("业务", encoding="utf-8")
+        removed_paths = deployer_mod.purge_target_release_history(
+            {"id": 7403, "name": "Normal_Target", "target_dir": str(normal_target)})
+        check("目标目录清理移除releases与current", len(removed_paths) == 2
+              and not (normal_target / "releases").exists()
+              and not (normal_target / "current").is_symlink())
+        check("目标目录清理保留目录本身与业务文件",
+              normal_target.exists() and (normal_target / "own.txt").exists())
 
         response = client.post("/api/tasks", json={"name": "Collision_Read", "repo_url": str(origin),
                                "schedule_type": "manual", "deploy_method": "release"})

@@ -30,7 +30,7 @@ TASK_INSERT_COLUMNS = (
 
 TASK_UPDATE_COLUMNS = (
     "name", "description",
-    "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username",
+    "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username", "git_token",
     "credential_id",
     "schedule_type", "schedule_expression", "enabled",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
@@ -598,6 +598,21 @@ class RunRepository:
                 default=0,
             )
         )
+
+    def log_paths_for_task(self, task_id: int) -> list[str]:
+        """该任务所有运行记录的日志路径。
+
+        删除任务前必须先取出来：runs 随任务级联删除，之后这些路径就无从
+        查找，日志文件会永久留在磁盘上成为孤儿。
+        """
+        return [
+            str(row["log_path"])
+            for row in self.db.query(
+                "SELECT log_path FROM runs WHERE task_id = ? AND log_path != ''",
+                (task_id,),
+            )
+            if row.get("log_path")
+        ]
 
     def mark_running(self, run_id: int, *, pid: int | None = None) -> None:
         self.db.execute_rowcount(
