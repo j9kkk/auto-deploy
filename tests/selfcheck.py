@@ -992,6 +992,19 @@ def run() -> int:
     check("代理不可达时明确指出代理问题", proxy_down is not None and "代理" in proxy_down, str(proxy_down))
 
     # ------------------------------------------------------------------
+    section("Docker Compose 项目名")
+    from app.deployer import _safe_task_slug
+
+    check("英文名直接使用", _safe_task_slug("tdcode-site", 1) == "tdcode-site-1")
+    check("中文名回退 task-<id>", _safe_task_slug("我的博客站点", 2) == "task-2")
+    check("混合字符被清洗", _safe_task_slug("a b  c--d!", 3) == "a-b-c-d-3")
+    check("空名回退 task-<id>", _safe_task_slug("", 4) == "task-4")
+    check("同 id 同名结果稳定", _safe_task_slug("x", 5) == _safe_task_slug("x", 5))
+    check("不同任务结果不同", _safe_task_slug("x", 5) != _safe_task_slug("x", 6))
+    check("项目名不含非法字符",
+          all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in _safe_task_slug("A_b!C", 7)))
+
+    # ------------------------------------------------------------------
     section("一键自我更新")
 
     import shutil as _shutil

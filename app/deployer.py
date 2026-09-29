@@ -578,6 +578,19 @@ def deploy_docker(ctx: DeployContext) -> None:
         ctx.log("未配置容器启动命令，仅完成镜像构建。")
 
 
+def _safe_task_slug(name: str, task_id: Any) -> str:
+    """任务名 → compose 项目名安全段：小写字母数字与短横线。"""
+    import re as _re
+    import unicodedata as _unicodedata
+
+    # 中文等非 ASCII 转拼音不可取（无依赖），转为 ASCII 音译太复杂；
+    # 直接把非 [a-z0-9-] 全替换为短横线并折叠，保证 compose 项目名合法。
+    text = _unicodedata.normalize("NFKD", str(name or ""))
+    slug = _re.sub(r"[^a-zA-Z0-9-]+", "-", text).strip("-").lower()
+    slug = _re.sub(r"-{2,}", "-", slug)[:40].strip("-") or "task"
+    return f"{slug}-{task_id}"
+
+
 def deploy_docker_compose(ctx: DeployContext) -> None:
     """Bring up the compose project from the release directory."""
     if not command_exists("docker"):
@@ -595,8 +608,17 @@ def deploy_docker_compose(ctx: DeployContext) -> None:
     ctx.log(f"--- 阶段: docker compose up ({compose_file}) ---")
     # `docker compose` (v2) is preferred; fall back to `docker-compose` (v1).
     base = ["docker", "compose"] if _supports_compose_v2() else ["docker-compose"]
+
+    # 固定 compose 项目名（按任务）。
+    # 默认项目名取自目录名，而发布目录每次运行都不同（<时间戳>-<commit>），
+    # 这会让每次部署都新建一个 compose 项目与一套网络——数百次运行后耗尽
+    # Docker 默认地址池，报 "all predefined address pools have been fully
+    # subnetted"。固定项目名让后续部署原地复用同一组网络并替换容器。
+    project_name = f"autodeploy-{_safe_task_slug(ctx.task.get('name') or '', ctx.task.get('id'))}"
+    ctx.log(f"compose 项目名: {project_name}")
+
     result = ctx.exec(
-        [*base, "-f", compose_file, "up", "-d", "--build", "--remove-orphans"],
+        [*base, "-f", compose_file, "-p", project_name, "up", "-d", "--build", "--remove-orphans"],
         cwd=cwd,
         env=env,
         timeout=_timeout_for(ctx),

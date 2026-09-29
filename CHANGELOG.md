@@ -4,6 +4,24 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.1] - 2026-09-29
+
+修复 Docker Compose 部署方式的一个严重资源泄漏。
+
+### 修复
+
+- **Compose 项目名按任务固定**（此前按发布目录命名）：发布目录每次运行都
+  不同，导致每次部署都新建一个 compose 项目与一套网络。数百次运行后耗尽
+  Docker 默认地址池，报
+  `all predefined address pools have been fully subnetted` 且部署全部失败。
+  现在项目名为 `autodeploy-<任务名>-<id>`，后续部署原地复用网络并替换容器，
+  `docker compose up -d` 语义恢复正常。
+
+**受影响服务器的处理**：升级本版本后，一次性清理历史泄漏的网络与项目：
+
+    docker network ls --format '{{.Name}}' | grep -E '^[0-9]{8}-[0-9]{6}-' | xargs -r docker network rm
+    docker compose ls -q | grep -E '^[0-9]{8}-[0-9]{6}-' | xargs -r docker compose -p rm
+
 ## [1.3.0] - 2026-09-29
 
 系统内置「一键更新」：不再需要手工配置自更新任务。
@@ -171,6 +189,7 @@
   数据库仓储层、完整 API 端到端流程（含真实部署、取消、日志增量协议）与调度器行为。
 
 
+[1.3.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.1
 [1.3.0]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.0
 [1.2.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.2.1
 [1.2.0]: https://github.com/j9kkk/git-deploy/releases/tag/v1.2.0
