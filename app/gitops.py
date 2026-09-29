@@ -308,6 +308,22 @@ def _looks_transient(output: str) -> bool:
     return any(marker in lowered for marker in _TRANSIENT_MARKERS)
 
 
+def _credential_hint(output: str) -> str:
+    """把「需要认证但没有可用凭据」的 git 输出翻译成可操作的中文提示。
+
+    私有仓库未配置凭据时，git 只会给出 ``could not read Username ...: terminal
+    prompts disabled``，最终上报的却只是「命令退出码 128」，看不出该去配凭据。
+    """
+    lowered = (output or "").lower()
+    if "could not read username" in lowered or "could not read password" in lowered:
+        return "私有仓库需要认证，但任务未配置可用凭据：请在任务中选择凭据，或配置任务内访问令牌"
+    if "authentication failed" in lowered or "invalid username or password" in lowered:
+        return "认证失败：凭据无效或已过期，请在「凭据」页面测试并更新"
+    if "permission denied" in lowered and "publickey" in lowered:
+        return "认证失败：SSH 密钥不被接受，请确认公钥已登记到仓库的 Deploy Keys"
+    return ""
+
+
 def _split_host_port(repo_url: str) -> tuple[str, int] | None:
     """Extract ``(host, port)`` from an http(s) URL for a reachability probe."""
     from urllib.parse import urlparse
@@ -510,6 +526,9 @@ def sync_checkout(
             # git's raw output.
             if "Remote branch" in result.output and "not found" in result.output:
                 raise GitError(f"远程分支 {branch!r} 不存在")
+            hint = _credential_hint(result.output)
+            if hint:
+                raise GitError(hint)
             raise GitError(result.error or "git clone 失败")
         if saved_owner is not None:
             # 恢复目录认领标记（重克隆把它随旧目录一起清掉了）。
@@ -535,6 +554,9 @@ def sync_checkout(
             retry_budget_seconds=timeout,
         )
         if not result.ok:
+            hint = _credential_hint(result.output)
+            if hint:
+                raise GitError(hint)
             raise GitError(result.error or "git fetch 失败")
         if reset_hard:
             reset = _run_git(

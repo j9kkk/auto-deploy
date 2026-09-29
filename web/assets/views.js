@@ -39,6 +39,7 @@ AD.views = {};
     refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v4h-4"/></svg>',
     download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>',
     rollback: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16"/><path d="M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7"/><path d="M6.5 7l.8 11.2A2 2 0 0 0 9.3 20h5.4a2 2 0 0 0 2-1.8L17.5 7"/><path d="M10.5 11v5M13.5 11v5"/></svg>',
   };
   AD.ICONS = ICONS;
 
@@ -264,6 +265,78 @@ AD.views = {};
     const search = container.querySelector('#task-search');
     search.addEventListener('input', AD.debounce(() => render(search.value), 180));
     container.querySelector('#task-new').addEventListener('click', () => AD.openTaskForm(null));
+
+    // 就地更新：运行状态落定时只改受影响的行与已展开的面板。
+    // 没有活跃运行时不发请求；正在观看的行内日志有自己的轮询，无需这里兜底。
+    AD.state.viewRefresh = async () => {
+      if (!AD.state.tasks.some((task) => task.active_run)) return;
+      await refreshTaskRowsInPlace();
+    };
+  };
+
+  // ======================================================================
+  // 删除任务
+  // ======================================================================
+  /** 删除后果的描述，用于两次确认；内容与后端实际动作一一对应。 */
+  function deleteConsequences(task) {
+    const items = ['停止并移除该任务部署的容器', '删除工作目录与发布产物', '删除全部运行记录与日志'];
+    const method = String(task.deploy_method || '');
+    if (method === 'docker_compose') items[0] = '执行 docker compose down，停止并移除该项目容器与网络';
+    else if (method === 'docker') items[0] = '执行回滚脚本停止容器（未配置回滚脚本时需手动确认）';
+    else if (method === 'systemd') items[0] = '不会停止 systemd 服务，如需停止请手动执行 systemctl stop';
+    else if (method === 'rsync') items[0] = '不会同步远端，远端文件保持原样';
+    else items[0] = '该部署方式没有需要停止的容器';
+    items.push('目标目录（target_dir）本身不会被删除');
+    return items;
+  }
+
+  /** 二次确认后删除任务：第一步确认意图，第二步要求输入任务名。 */
+  AD.deleteTask = async function (taskId, taskOverride) {
+    const task = taskOverride
+      || (AD.state.tasks || []).find((item) => item.id === taskId);
+    if (!task) { AD.toastError('任务不存在或已被删除'); return false; }
+    // 运行中的任务不能删除：容器可能正在被使用。这里挡住所有入口
+    // （列表行、编辑表单），不只依赖按钮的 disabled 状态。
+    if (task.active_run) {
+      AD.toastError(`任务正在运行（#${task.active_run.id}），请先取消后再删除`);
+      return false;
+    }
+
+    const first = await AD.confirm({
+      title: '删除任务',
+      message: `确定要删除「${task.name}」吗？`,
+      detail: '将删除该任务配置、运行记录与发布产物，并停止它部署的容器。此操作不可撤销。'
+        + '影响范围：' + deleteConsequences(task).join('；') + '。',
+      confirmText: '继续',
+      danger: true,
+    });
+    if (!first) return false;
+
+    // 第二步：输入任务名。这是唯一能防止「手滑点到删除」的关卡，
+    // 因为删除会连带清掉磁盘上的部署文件夹，无法从界面恢复。
+    const typed = await AD.prompt({
+      title: '最后确认',
+      label: `请输入任务名「${task.name}」以确认删除`,
+      placeholder: task.name,
+      value: '',
+      hint: '删除后无法恢复：工作目录、发布产物与运行日志都会被清理。',
+    });
+    if (typed === null) return false;
+    if (String(typed).trim() !== String(task.name)) {
+      AD.toastError('输入的任务名不匹配，已取消删除');
+      return false;
+    }
+    try {
+      const result = await AD.api.del(`/api/tasks/${taskId}`);
+      const removed = (result.purged || []).length;
+      const stopped = (result.containers || []).length;
+      AD.toastSuccess(`任务已删除（清理 ${removed} 项${stopped ? `，停止容器 ${stopped} 个` : ''}）`);
+      AD.render('tasks');
+      return true;
+    } catch (err) {
+      AD.toastError(err.message);
+      return false;
+    }
   };
 
   function renderTaskTable(tasks, keyword) {
@@ -344,6 +417,9 @@ AD.views = {};
                   aria-expanded="${expanded ? 'true' : 'false'}">${ICONS.scroll}</button>
           ${runButton}
           ${toggleButton}
+          <button class="icon-btn danger" data-task-delete="${task.id}"
+                  title="${active ? '任务运行中，需先取消才能删除' : '删除任务'}"
+                  aria-label="${active ? '任务运行中，需先取消才能删除' : '删除任务'}">${ICONS.trash}</button>
         </div>
       </td>
     </tr>`;
@@ -383,8 +459,9 @@ AD.views = {};
           return handle(run, async () => {
             const result = await AD.api.post(`/api/tasks/${taskId}/run`);
             AD.toastSuccess('已开始运行 #' + result.run_id);
+            // 只就地刷新这一行：整表重绘会丢掉滚动位置与其它行的展开状态。
+            await AD.refreshTaskRowsInPlace();
             // 运行后直接展开该行，让用户看到实时日志。
-            await AD.render('tasks');
             AD.toggleTaskExpand(taskId, { forceOpen: true, runId: result.run_id });
           });
         });
@@ -393,10 +470,11 @@ AD.views = {};
       const cancel = event.target.closest('[data-task-cancel]');
       if (cancel) {
         handle(cancel, async () => {
-          await AD.api.post(`/api/tasks/${cancel.dataset.taskCancel}/cancel`);
-          AD.toastSuccess('已请求取消当前运行');
-          AD.render('tasks');
+          const result = await AD.api.post(`/api/tasks/${cancel.dataset.taskCancel}/cancel`);
+          AD.toastSuccess(result.message || '已请求取消当前运行');
         });
+        // 取消是异步的（进程在安全点退出），状态由轮询就地收敛，不重绘表格。
+        AD.pollRunStates();
         return;
       }
       const logBtn = event.target.closest('[data-task-log]');
@@ -415,8 +493,15 @@ AD.views = {};
         handle(toggle, async () => {
           const result = await AD.api.post(`/api/tasks/${toggle.dataset.taskToggle}/toggle`);
           AD.toastSuccess(result.enabled ? '任务已启用' : '任务已禁用');
-          AD.render('tasks');
+          await AD.refreshTaskRowsInPlace();
         });
+        return;
+      }
+      const remove = event.target.closest('[data-task-delete]');
+      if (remove) {
+        if (remove.disabled) return;
+        // 删除连带停止容器与清理部署目录，走两步确认，不套用通用的单次确认。
+        handle(remove, () => AD.deleteTask(Number(remove.dataset.taskDelete)));
         return;
       }
       const emptyNew = event.target.closest('#task-new-empty');
@@ -448,6 +533,7 @@ AD.views = {};
     if (existing && !options_.forceOpen) {
       existing.remove();
       AD.stopInlineLog(taskId);
+      AD.clearInlinePanelSync();
       AD.state.expandedTaskId = null;
       delete AD.state.inlineRunSelection[taskId];
       syncScrollButton(scrollBtn, false);
@@ -458,6 +544,7 @@ AD.views = {};
     document.querySelectorAll('.expand-row').forEach((node) => node.remove());
     document.querySelectorAll('.scroll-btn.active').forEach((node) => syncScrollButton(node, false));
     AD.stopAllInlineLogs();
+    AD.clearInlinePanelSync();
     AD.state.expandedTaskId = taskId;
     syncScrollButton(scrollBtn, true);
 
@@ -484,20 +571,22 @@ AD.views = {};
     const t = data.task;
     const runs = data.runs || [];
     const checks = data.preflight || [];
-    const activeRun = runs.find((run) => run.status === 'queued' || run.status === 'running');
+    // 活跃运行可能随就地同步变化，因此每次从 runs 现算而不是缓存一次。
+    const activeRunOf = () => runs.find((run) => run.status === 'queued' || run.status === 'running');
+    const activeRun = activeRunOf();
     const lastRun = runs[0];
 
     placeholder.querySelector('td > .task-expand').innerHTML = `
       <div class="expand-toolbar">
-        <span class="badge ${t.enabled ? 'on' : 'off'}">${t.enabled ? '已启用' : '已禁用'}</span>
+        <span class="badge ${t.enabled ? 'on' : 'off'}" data-inline-state>${t.enabled ? '已启用' : '已禁用'}</span>
         <span class="badge neutral">${e(methodLabel(t.deploy_method))}</span>
-        ${dedupeIn([AD.scheduleText(t), nextRunInlineText(t)]).map((text) =>
-          `<span class="faint">${e(text)}</span>`).join('')}
+        <span class="faint" data-inline-schedule>${dedupeIn([AD.scheduleText(t), nextRunInlineText(t)]).map((text) =>
+          e(text)).join(' · ')}</span>
         <div class="spacer"></div>
         <button class="sm" data-inline-rollback="${t.id}">${ICONS.rollback}<span>回滚上一版本</span></button>
         <button class="sm" data-inline-rollback-selected disabled aria-describedby="inline-rollback-reason-${t.id}">${ICONS.rollback}<span>回滚到这个版本</span></button>
         <button class="sm" data-inline-artifacts="${t.id}">${ICONS.download}<span>产物</span></button>
-        ${activeRun ? `<button class="sm danger" data-inline-cancel="${activeRun.id}">取消 #${activeRun.id}</button>` : ''}
+        <span data-inline-cancel-slot>${activeRun ? `<button class="sm danger" data-inline-cancel="${activeRun.id}">取消 #${activeRun.id}</button>` : ''}</span>
       </div>
       <div class="hint inline-rollback-reason" id="inline-rollback-reason-${t.id}" data-inline-rollback-reason aria-live="polite"></div>
       ${t.workspace_error ? `<div class="alert warning">工作目录：${e(t.workspace_error)}</div>` : ''}
@@ -518,7 +607,7 @@ AD.views = {};
       <div class="log-view" data-inline-log><span class="log-empty">${lastRun ? '加载中…' : '该任务还没有运行记录'}</span></div>
 
       <div class="section-title">最近运行</div>
-      <div class="mini-runs">${renderInlineRuns(runs, taskId)}</div>
+      <div class="mini-runs" data-inline-runs>${renderInlineRuns(runs, taskId)}</div>
     `;
 
     // --- 工具条动作 -----------------------------------------------
@@ -532,10 +621,16 @@ AD.views = {};
       if (!button) return;
       button.addEventListener('click', () => busyGuard(button, fn));
     };
-    inline('[data-inline-cancel]', async () => {
-      await AD.api.post(`/api/runs/${root.querySelector('[data-inline-cancel]').dataset.inlineCancel}/cancel`);
-      AD.toastSuccess('已请求取消');
-      AD.toggleTaskExpand(taskId, { forceOpen: true });
+    // 取消走事件委托：就地同步会替换掉取消按钮本身，直接绑定会随节点失效。
+    root.addEventListener('click', async (event) => {
+      const cancelButton = event.target.closest('[data-inline-cancel]');
+      if (!cancelButton) return;
+      await busyGuard(cancelButton, async () => {
+        const result = await AD.api.post(`/api/runs/${cancelButton.dataset.inlineCancel}/cancel`);
+        AD.toastSuccess(result.message || '已请求取消');
+      });
+      // 取消是异步的，终态由日志轮询就地落定，不重绘面板。
+      AD.pollRunStates();
     });
     let selectedRun = null;
     let rollbackBusy = false;
@@ -622,11 +717,56 @@ AD.views = {};
     root.querySelectorAll('[data-inline-run-log]').forEach((button) => {
       button.addEventListener('click', () => selectRun(Number(button.dataset.inlineRunLog), true));
     });
+
+    // --- 就地同步：运行状态落定时更新本面板，不重绘整个视图 ---------
+    const cancelSlot = root.querySelector('[data-inline-cancel-slot]');
+    const renderCancelSlot = () => {
+      const active = activeRunOf();
+      cancelSlot.innerHTML = active
+        ? `<button class="sm danger" data-inline-cancel="${active.id}">取消 #${active.id}</button>` : '';
+    };
+    AD.setInlinePanelSync({
+      taskId,
+      /** 一条运行的最新状态：更新工具条取消按钮与「最近运行」对应行。 */
+      applyRun(run) {
+        if (!root.isConnected) return;
+        const known = runs.find((item) => item.id === run.id);
+        if (known) Object.assign(known, run);
+        else runs.unshift(run);
+        renderCancelSlot();
+        updateRollbackControls();
+        const row = root.querySelector(`[data-inline-run-row="${run.id}"]`);
+        if (row) {
+          const statusCell = row.querySelector('[data-inline-run-status]');
+          if (statusCell) statusCell.innerHTML = runBadgeHtml(run);
+          const durationCell = row.querySelector('[data-inline-run-duration]');
+          if (durationCell) durationCell.textContent = AD.formatDuration(run.duration_ms);
+        }
+      },
+      /** 任务级字段变化（启用状态、下次执行时间）。 */
+      applyTask(task) {
+        if (!root.isConnected) return;
+        const stateBadge = root.querySelector('[data-inline-state]');
+        if (stateBadge) {
+          stateBadge.className = 'badge ' + (task.enabled ? 'on' : 'off');
+          stateBadge.textContent = task.enabled ? '已启用' : '已禁用';
+        }
+        const schedule = root.querySelector('[data-inline-schedule]');
+        if (schedule) {
+          schedule.textContent = dedupeIn([
+            AD.scheduleText(task), nextRunInlineText(task),
+          ]).join(' · ');
+        }
+      },
+    });
+
     const requested = options_.runId || (options_.forceOpen ? AD.state.inlineRunSelection[taskId] : null);
     const targetRunId = runs.some((run) => run.id === requested) ? requested
       : (activeRun ? activeRun.id : (lastRun ? lastRun.id : null));
     selectRun(targetRunId);
   };
+
+  AD.clearInlinePanelSync = () => { inlinePanelSync = null; };
 
   /** 下次执行的纯文本描述（与调度描述一起做去重，避免重复展示）。 */
   function nextRunInlineText(task) {
@@ -654,12 +794,12 @@ AD.views = {};
     if (!runs.length) return '<p class="faint">还没有运行记录；点击右上角「运行」开始第一次部署。</p>';
     return `<table><thead><tr>
         <th>#</th><th>状态</th><th>提交</th><th>触发</th><th>耗时</th><th>时间</th><th></th>
-      </tr></thead><tbody>${runs.slice(0, 8).map((run) => `<tr>
+      </tr></thead><tbody>${runs.slice(0, 8).map((run) => `<tr data-inline-run-row="${run.id}">
         <td class="mono dim">${run.id}</td>
-        <td><span class="badge ${e(run.status)}">${run.status === 'running' || run.status === 'queued' ? `<span class="dot ${e(run.status)}"></span>` : ''}${e(AD.statusLabel(run.status))}</span></td>
+        <td data-inline-run-status>${runBadgeHtml(run)}</td>
         <td class="mono dim truncate" style="max-width:200px" title="${a(run.commit_message || '')}">${run.commit_after ? e(AD.shortCommit(run.commit_after)) + ' ' + e(run.commit_message || '') : '—'}</td>
         <td class="dim">${e(AD.triggerLabel(run.trigger))}</td>
-        <td class="dim nowrap">${e(AD.formatDuration(run.duration_ms))}</td>
+        <td class="dim nowrap" data-inline-run-duration>${e(AD.formatDuration(run.duration_ms))}</td>
         <td class="dim nowrap">${e(AD.formatRelative(run.queued_at))}</td>
         <td class="right"><button class="sm" data-inline-run-log="${run.id}" aria-pressed="false">详情</button></td>
       </tr>`).join('')}</tbody></table>
@@ -725,7 +865,8 @@ AD.views = {};
           if (!alive()) return;
           onRun(detail.run);
           AD.stopInlineLog(taskId);
-          refreshTaskRowInPlace(taskId);
+          // 就地收敛：更新任务行与本面板的取消按钮、状态徽标，不重绘视图。
+          AD.syncRunInPlace(detail.run, taskId);
         }
       } catch (err) { fail(err); }
     };
@@ -737,26 +878,29 @@ AD.views = {};
         paint(detail.run.log_tail || [], true);
         onRun(detail.run);
         if (detail.run.is_active) schedule();
-        else AD.stopInlineLog(taskId);
+        else {
+          AD.stopInlineLog(taskId);
+          AD.syncRunInPlace(detail.run, taskId);
+        }
       } catch (err) { fail(err); }
     })();
   }
 
-  /** 原地刷新任务行：轮询发现状态落定后更新图标与徽标，不重建整个表格。
-   *  重建表格会连带销毁用户正在查看的行内展开，所以这里只改这一行。 */
-  function refreshTaskRowInPlace(taskId) {
-    AD.api.get('/api/tasks').then((data) => {
-      const task = (data.tasks || []).find((item) => item.id === taskId);
+  /** 原地刷新任务行：状态落定后更新图标与徽标，不重建整个表格。
+   *  重建表格会连带销毁用户正在查看的行内展开，所以这里只改这一行。
+   *  传入 task 时直接使用该对象，避免轮询里对每个任务重复请求。 */
+  function refreshTaskRowInPlace(taskId, task) {
+    const applyTask = (found) => {
       const row = document.querySelector(`tr[data-task-row="${taskId}"]`);
-      if (!task || !row) return;
-      const active = task.active_run;
+      if (!found || !row) return;
+      const active = found.active_run;
 
       // 运行/停止图标
       const cell = row.querySelector('.table-actions');
       if (cell) {
         const runButton = active
-          ? `<button class="icon-btn stop" data-task-cancel="${task.id}" title="停止当前运行" aria-label="停止当前运行">${ICONS.stop}</button>`
-          : `<button class="icon-btn run" data-task-run="${task.id}" title="立即运行" aria-label="立即运行">${ICONS.play}</button>`;
+          ? `<button class="icon-btn stop" data-task-cancel="${found.id}" title="停止当前运行" aria-label="停止当前运行">${ICONS.stop}</button>`
+          : `<button class="icon-btn run" data-task-run="${found.id}" title="立即运行" aria-label="立即运行">${ICONS.play}</button>`;
         const control = cell.querySelector('[data-task-run], [data-task-cancel]');
         if (control) control.outerHTML = runButton;
       }
@@ -766,11 +910,11 @@ AD.views = {};
       if (statusCell) {
         const statusBadge = active
           ? `<span class="badge ${e(active.status)}"><span class="dot ${e(active.status)}"></span>${e(AD.statusLabel(active.status))}</span>`
-          : task.enabled
+          : found.enabled
             ? '<span class="badge on">已启用</span>'
             : '<span class="badge off">已暂停</span>';
-        const stats = task.run_count
-          ? `<span class="faint">${task.success_count} 成功 / ${task.failure_count} 失败</span>`
+        const stats = found.run_count
+          ? `<span class="faint">${found.success_count} 成功 / ${found.failure_count} 失败</span>`
           : '<span class="faint">尚未运行</span>';
         statusCell.innerHTML = `${statusBadge}<div class="faint" style="margin-top:3px">${stats}</div>`;
       }
@@ -778,16 +922,36 @@ AD.views = {};
       // 最近运行列
       const lastRunCell = row.querySelector('td:nth-child(5)');
       if (lastRunCell) {
-        lastRunCell.innerHTML = task.last_status
-          ? `<span class="badge ${e(task.last_status)}">${e(AD.statusLabel(task.last_status))}</span>
-             <div class="faint">${e(AD.formatRelative(task.last_run_at))}</div>`
+        lastRunCell.innerHTML = found.last_status
+          ? `<span class="badge ${e(found.last_status)}">${e(AD.statusLabel(found.last_status))}</span>
+             <div class="faint">${e(AD.formatRelative(found.last_run_at))}</div>`
           : '<span class="faint">—</span>';
       }
 
       // 禁用行样式
-      row.classList.toggle('row-disabled', !task.enabled);
-    }).catch(() => { /* 下次轮询或手动刷新兜底 */ });
+      row.classList.toggle('row-disabled', !found.enabled);
+    };
+
+    if (task) { applyTask(task); return; }
+    // 页面上没有这一行时无需发请求：运行记录页等视图也会走到这里。
+    if (!document.querySelector(`tr[data-task-row="${taskId}"]`)) return;
+    AD.api.get('/api/tasks')
+      .then((data) => applyTask((data.tasks || []).find((item) => item.id === taskId)))
+      .catch(() => { /* 下次轮询或手动刷新兜底 */ });
   }
+  AD.refreshTaskRowInPlace = refreshTaskRowInPlace;
+
+  /** 就地刷新全表：一次请求更新所有任务行，供运行/启停等自身触发的动作使用，
+   *  避免整表重绘丢滚动位置与展开状态。 */
+  async function refreshTaskRowsInPlace() {
+    const data = await AD.api.get('/api/tasks');
+    AD.state.tasks = data.tasks || [];
+    for (const task of AD.state.tasks) {
+      refreshTaskRowInPlace(task.id, task);
+      AD.syncInlinePanelTask(task);
+    }
+  }
+  AD.refreshTaskRowsInPlace = refreshTaskRowsInPlace;
 
   // ======================================================================
   // Task form (create / edit)
@@ -1073,20 +1237,11 @@ AD.views = {};
     const deleteButton = backdrop.querySelector('#form-delete');
     if (deleteButton) {
       deleteButton.addEventListener('click', async () => {
-        const confirmed = await AD.confirm({
-          title: '删除任务',
-          message: `确定要删除「${t.name}」吗？`,
-          detail: '工作目录与发布产物会一并删除；该操作不可撤销。',
-          confirmText: '删除',
-          danger: true,
-        });
-        if (!confirmed) { AD.openTaskForm(taskId); return; }
-        try {
-          await AD.api.del(`/api/tasks/${taskId}`);
-          AD.toastSuccess('任务已删除');
-          AD.Modal.close();
-          AD.render('tasks');
-        } catch (err) { AD.toastError(err.message); }
+        // 表单是在模态里的：先关闭，避免删除确认叠在编辑表单之上。
+        AD.Modal.close();
+        const deleted = await AD.deleteTask(taskId, t);
+        // 取消删除时回到编辑表单，不丢失正在编辑的内容。
+        if (!deleted) AD.openTaskForm(taskId);
       });
     }
   };
@@ -1212,12 +1367,12 @@ AD.views = {};
       <div class="section-title">最近运行</div>
       ${runs.length ? `<div class="table-wrap"><table>
         <thead><tr><th>#</th><th>状态</th><th>提交</th><th>触发</th><th>耗时</th><th>时间</th><th></th></tr></thead>
-        <tbody>${runs.map((run) => `<tr>
+        <tbody>${runs.map((run) => `<tr data-task-detail-run-row="${run.id}">
           <td class="mono">${run.id}</td>
-          <td><span class="badge ${e(run.status)}">${e(AD.statusLabel(run.status))}</span></td>
+          <td data-task-detail-run-status>${runBadgeHtml(run)}</td>
           <td class="mono dim truncate" style="max-width:220px" title="${a(run.commit_message)}">${e(AD.shortCommit(run.commit_after))} ${e(run.commit_message || '')}</td>
           <td class="dim">${e(AD.triggerLabel(run.trigger))}</td>
-          <td class="dim nowrap">${e(AD.formatDuration(run.duration_ms))}</td>
+          <td class="dim nowrap" data-task-detail-run-duration>${e(AD.formatDuration(run.duration_ms))}</td>
           <td class="dim nowrap">${e(AD.formatRelative(run.queued_at))}</td>
           <td class="right"><button class="sm" data-run-log="${run.id}">日志</button></td>
         </tr>`).join('')}</tbody></table></div>`
@@ -1293,6 +1448,98 @@ AD.views = {};
     backdrop.querySelectorAll('[data-run-log]').forEach((button) => {
       button.addEventListener('click', () => AD.openRunDetail(Number(button.dataset.runLog)));
     });
+
+    // 就地同步：弹窗打开期间运行结束，只更新对应行，不重建弹窗。
+    AD.syncTaskDetailRun = (run) => {
+      if (!backdrop.isConnected || Number(run.task_id) !== Number(taskId)) return;
+      const row = backdrop.querySelector(`[data-task-detail-run-row="${run.id}"]`);
+      if (!row) return;
+      const statusCell = row.querySelector('[data-task-detail-run-status]');
+      if (statusCell) statusCell.innerHTML = runBadgeHtml(run);
+      const durationCell = row.querySelector('[data-task-detail-run-duration]');
+      if (durationCell) durationCell.textContent = AD.formatDuration(run.duration_ms);
+    };
+    const observer = new MutationObserver(() => {
+      if (!document.getElementById('modal-root').firstChild) {
+        AD.syncTaskDetailRun = null;
+        observer.disconnect();
+      }
+    });
+    observer.observe(document.getElementById('modal-root'), { childList: true });
+  };
+
+  /**
+   * 运行结束后的就地收敛：读取该运行的最新记录并同步到引用它的行与面板
+   * （任务行、行内展开面板、任务详情弹窗、运行记录行），不重绘整个视图。
+   */
+  AD.refreshRunAfterFinish = async function (runId) {
+    let run;
+    try { run = (await AD.api.get(`/api/runs/${runId}`)).run; }
+    catch (err) { return; }
+    if (!run) return;
+    AD.syncRunInPlace(run);
+    // 任务详情弹窗若正打开着同一个任务，刷新它的「最近运行」表格。
+    AD.syncTaskDetailRun?.(run);
+  };
+
+  // ======================================================================
+  // 运行状态的就地同步
+  // ======================================================================
+  // 运行结束时只更新引用该运行的节点（任务行、行内面板、运行记录行），不再
+  // 重建整个视图：整页重绘会丢掉滚动位置、展开状态和用户正在查看的日志，
+  // 也会让「查看日志」这类只读操作看起来像页面刷新。
+
+  /** 运行状态徽标：初始渲染与就地同步共用，避免两处显示不一致。 */
+  function runBadgeHtml(run) {
+    const active = run.is_active !== undefined && run.is_active !== null
+      ? Boolean(run.is_active)
+      : (run.status === 'queued' || run.status === 'running');
+    return `<span class="badge ${e(run.status)}">`
+      + (active ? `<span class="dot ${e(run.status)}"></span>` : '')
+      + `${e(AD.statusLabel(run.status))}</span>`;
+  }
+
+  /** 运行行的操作按钮：取消按钮只存在于仍在排队或运行中的记录。 */
+  function runActionsHtml(run) {
+    return `<button class="sm" data-run-log="${run.id}">日志</button>`
+      + (run.is_active ? `<button class="sm danger" data-run-cancel="${run.id}">取消</button>` : '');
+  }
+
+  // 当前展开的行内面板（同一时刻至多一个）的就地更新入口。
+  let inlinePanelSync = null;
+  AD.setInlinePanelSync = (sync) => { inlinePanelSync = sync; };
+  AD.syncInlinePanelRun = (taskId, run) => {
+    if (inlinePanelSync && inlinePanelSync.taskId === Number(taskId)) inlinePanelSync.applyRun(run);
+  };
+  AD.syncInlinePanelTask = (task) => {
+    if (inlinePanelSync && inlinePanelSync.taskId === Number(task.id)) inlinePanelSync.applyTask(task);
+  };
+
+  /** 把一条运行的最新状态同步到页面上所有引用它的节点。
+   *  taskId 由调用方已知时显式传入，避免依赖运行记录里是否带 task_id。 */
+  AD.syncRunInPlace = function (run, taskId) {
+    if (!run || run.id === null || run.id === undefined) return;
+    const runId = Number(run.id);
+
+    // 运行记录表格：只改这一行的徽标、耗时与操作按钮。
+    const row = document.querySelector(`tr[data-run-row="${runId}"]`);
+    if (row) {
+      const statusCell = row.querySelector('[data-run-status]');
+      if (statusCell) statusCell.innerHTML = runBadgeHtml(run);
+      const durationCell = row.querySelector('[data-run-duration]');
+      if (durationCell && run.duration_ms !== undefined) {
+        durationCell.textContent = AD.formatDuration(run.duration_ms);
+      }
+      const actions = row.querySelector('[data-run-actions]');
+      if (actions) actions.innerHTML = runActionsHtml(run);
+    }
+
+    // 任务行与行内面板：按 task_id 精确定位，同样不触碰表格其余部分。
+    const owner = taskId === undefined || taskId === null ? run.task_id : taskId;
+    if (owner !== null && owner !== undefined) {
+      AD.refreshTaskRowInPlace(Number(owner));
+      AD.syncInlinePanelRun(owner, run);
+    }
   };
 
   // ======================================================================
@@ -1337,28 +1584,25 @@ AD.views = {};
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel" id="runs-table">
         ${data.runs.length ? `<div class="table-wrap"><table>
           <thead><tr>
             <th>#</th><th>任务</th><th>状态</th><th>触发</th><th>提交</th>
             <th>变更</th><th>耗时</th><th>时间</th><th class="right">操作</th>
           </tr></thead>
-          <tbody>${data.runs.map((run) => `<tr>
+          <tbody>${data.runs.map((run) => `<tr data-run-row="${run.id}">
             <td class="mono dim">${run.id}</td>
             <td class="truncate" style="max-width:170px" title="${a(run.task_name)}">${e(run.task_name)}</td>
-            <td><span class="badge ${e(run.status)}">${run.is_active ? `<span class="dot ${e(run.status)}"></span>` : ''}${e(AD.statusLabel(run.status))}</span></td>
+            <td data-run-status>${runBadgeHtml(run)}</td>
             <td class="dim nowrap">${e(AD.triggerLabel(run.trigger))}</td>
             <td class="mono dim truncate" style="max-width:230px" title="${a(run.commit_message || '')}">
               ${run.commit_after ? e(AD.shortCommit(run.commit_after)) + ' ' + e(run.commit_message || '') : '<span class="faint">—</span>'}
             </td>
             <td class="dim nowrap">${run.changed_files ? run.changed_files + ' 个文件' : (run.changes_detected ? '—' : '无变化')}</td>
-            <td class="dim nowrap">${e(AD.formatDuration(run.duration_ms))}</td>
+            <td class="dim nowrap" data-run-duration>${e(AD.formatDuration(run.duration_ms))}</td>
             <td class="dim nowrap" title="${a(AD.formatTime(run.queued_at, true))}">${e(AD.formatRelative(run.queued_at))}</td>
             <td>
-              <div class="table-actions">
-                <button class="sm" data-run-log="${run.id}">日志</button>
-                ${run.is_active ? `<button class="sm danger" data-run-cancel="${run.id}">取消</button>` : ''}
-              </div>
+              <div class="table-actions" data-run-actions>${runActionsHtml(run)}</div>
             </td>
           </tr>`).join('')}</tbody>
         </table></div>`
@@ -1387,20 +1631,37 @@ AD.views = {};
       });
     }
 
-    container.querySelectorAll('[data-run-log]').forEach((button) => {
-      button.addEventListener('click', () => AD.openRunDetail(Number(button.dataset.runLog)));
+    // 事件委托挂在本视图新建的节点上：表格就地更新后按钮依然有效，且每次
+    // 渲染重新绑定，不会在 #content 上累积监听器。
+    const tablePanel = container.querySelector('#runs-table');
+    tablePanel.addEventListener('click', async (event) => {
+      const logButton = event.target.closest('[data-run-log]');
+      if (logButton) { AD.openRunDetail(Number(logButton.dataset.runLog)); return; }
+      const cancelButton = event.target.closest('[data-run-cancel]');
+      if (!cancelButton) return;
+      AD.setBusy(cancelButton, true);
+      try {
+        const result = await AD.api.post(`/api/runs/${cancelButton.dataset.runCancel}/cancel`);
+        AD.toastSuccess(result.message || '已请求取消');
+      } catch (err) {
+        AD.toastError(err.message);
+        AD.setBusy(cancelButton, false);
+      }
+      // 取消是异步的（进程在安全点退出），状态由轮询就地收敛，这里不重绘。
+      AD.pollRunStates();
     });
 
-    container.querySelectorAll('[data-run-cancel]').forEach((button) => {
-      button.addEventListener('click', async () => {
-        AD.setBusy(button, true);
-        try {
-          await AD.api.post(`/api/runs/${button.dataset.runCancel}/cancel`);
-          AD.toastSuccess('已请求取消');
-          AD.render('runs');
-        } catch (err) { AD.toastError(err.message); AD.setBusy(button, false); }
-      });
-    });
+    // 就地更新：只同步状态变化了的行，不重建表格。没有活跃运行时不发请求。
+    AD.state.viewRefresh = async () => {
+      if (!container.querySelector('[data-run-cancel]')) return;
+      const params = new URLSearchParams({ limit: '60' });
+      if (runFilter.status) params.set('status', runFilter.status);
+      if (runFilter.task_id) params.set('task_id', runFilter.task_id);
+      if (runFilter.search) params.set('search', runFilter.search);
+      const fresh = await AD.api.get('/api/runs?' + params.toString());
+      const byId = new Map((fresh.runs || []).map((run) => [run.id, run]));
+      for (const run of byId.values()) AD.syncRunInPlace(run);
+    };
   };
 
   // ======================================================================
@@ -1515,8 +1776,11 @@ AD.views = {};
           const badge = backdrop.querySelector('#rd-status');
           if (badge) badge.style.color = result.status === 'success' ? 'var(--success)'
             : result.status === 'failed' ? 'var(--danger)' : '';
-          // Refresh the underlying list so the table reflects the final state.
-          if (AD.state.currentView === 'runs' || AD.state.currentView === 'tasks') AD.render(AD.state.currentView);
+          // 取消按钮只对活跃运行有意义；运行结束后就地移除，避免点击报错。
+          cancelButton?.remove();
+          // 底层列表就地收敛，不重绘整个视图（重绘会丢失滚动与展开状态，
+          // 也会让「查看日志」看起来像页面刷新）。
+          await AD.refreshRunAfterFinish(runId);
         }
       } catch (err) {
         AD.stopLiveLog();

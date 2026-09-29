@@ -20,8 +20,10 @@ from ..deployer import (
     disk_usage,
     list_releases,
     preflight,
+    purge_target_release_history,
     resolve_release_paths,
     rollback_task,
+    stop_task_containers,
 )
 from ..schedule import iso, next_run_time, utcnow
 from ..service import Service
@@ -195,49 +197,98 @@ def update_task(
 def delete_task(
     task_id: int,
     request: Request,
-    purge: bool = Query(True, description="同时删除工作目录与发布产物"),
+    purge: bool = Query(True, description="同时删除工作目录、发布产物与历史存档"),
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
-    row = service.store.tasks.get(task_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if service.store.runs.has_active_for_task(task_id):
-        raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+    """删除任务：停止容器、清空存档、再删除记录。
 
-    name = row.get("name", "")
-    # Collect log paths before the delete: the runs table cascades on task
-    # removal, so afterwards there is nothing left to find them from.
-    log_paths = [
-        Path(run["log_path"])
-        for run in service.store.runs.list_for_task(task_id, limit=10_000)
-        if run.get("log_path")
-    ]
-    service.store.tasks.delete(task_id)
-    purged: list[str] = []
-    if purge:
-        targets = [
-            *config.owned_workspace_dirs(row),
-            config.releases_dir(task_id),
-            config.artifacts_dir(task_id),
+    顺序是有意的：容器停止是唯一的**外部破坏性动作**，它需要任务记录里的
+    部署方式与项目名，并且 ``docker compose down`` 依赖发布目录中仍存在
+    compose 文件，所以必须在清理目录之前完成；而清理目录放在最后，即使中途
+    失败也不会留下一个「记录已删、容器还在跑」的孤儿。
+
+    调度锁只覆盖状态检查与记录删除这些数据库操作：一旦记录消失，调度器就
+    不会再派发该任务，``has_active_for_task`` 也就失去意义。Docker 命令最长
+    可能等待 ``CONTAINER_STOP_TIMEOUT_SECONDS``，若把它放在锁内，一个卡住的
+    docker 会让全站所有部署一起停摆。
+
+    ``purge=False`` 只保留文件，容器仍会被停止——任务记录消失后它已无人
+    管理，继续运行只会占用端口与资源。
+    """
+    with service.scheduler._lock:
+        row = service.store.tasks.get(task_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if service.store.runs.has_active_for_task(task_id):
+            raise HTTPException(status_code=409, detail="任务正在运行，请先取消后再删除")
+
+        name = str(row.get("name") or "")
+        # 日志路径要在删除记录前取好：runs 会随任务级联删除，之后就无从查找，
+        # 日志文件将永久留在磁盘上成为孤儿。
+        log_paths = [
+            path
+            for path in map(_safe_log_path, service.store.runs.log_paths_for_task(task_id))
+            if path is not None
         ]
-        target_dir = (row.get("target_dir") or "").strip()
+        run_total = service.store.runs.count(task_id=task_id)
+        service.store.tasks.delete(task_id)
+        service.scheduler.poke()
+
+    # 锁外执行：容器停止依赖的 compose 文件此时仍在发布目录里。
+    container_log: list[str] = []
+    containers = stop_task_containers(row, log=container_log.append)
+
+    purged: list[str] = []
+    kept: list[str] = []
+    if purge:
+        targets = [*config.owned_workspace_dirs(row), *config.owned_storage_dirs(row)]
         for path in targets:
-            if path.exists():
+            if path.exists() or path.is_symlink():
                 cleanup_path(path)
                 purged.append(str(path))
+        purged.extend(purge_target_release_history(row, log=container_log.append))
         for log_path in log_paths:
             try:
                 log_path.unlink(missing_ok=True)
+                purged.append(str(log_path))
             except OSError:
                 continue
+        target_dir = (row.get("target_dir") or "").strip()
         if target_dir:
-            purged.append(f"保留 {target_dir}（目标目录未删除）")
+            kept.append(target_dir)
+    else:
+        kept.append("工作目录、发布产物与运行日志已按 purge=false 保留")
+
     audit(
         service, "task_deleted", actor=user["username"], target=f"task:{task_id}",
-        detail=f"{name} purge={purge}", ip=client_ip(request),
+        detail=f"{name} purge={purge} 容器:{len(containers)} 运行记录:{run_total}",
+        ip=client_ip(request),
     )
-    return {"ok": True, "purged": purged}
+    return {
+        "ok": True,
+        "name": name,
+        "purged": purged,
+        "kept": kept,
+        "containers": containers,
+        "runs_deleted": run_total,
+        "log": container_log,
+    }
+
+
+def _safe_log_path(raw: str) -> Path | None:
+    """只接受位于日志目录内的路径，避免历史数据里的越界路径被当作删除目标。"""
+    if not raw:
+        return None
+    path = Path(str(raw))
+    try:
+        resolved = path.resolve()
+        logs_root = config.LOGS_DIR.resolve()
+    except OSError:
+        return None
+    if resolved.parent != logs_root:
+        return None
+    return resolved
 
 
 @router.post("/{task_id}/run")

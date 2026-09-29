@@ -391,6 +391,21 @@ def artifacts_dir(task_id: int) -> Path:
     return ARTIFACTS_DIR / f"task-{task_id}"
 
 
+def temp_dir(task_id: int) -> Path:
+    """按任务的临时目录（git 凭据助手文件等）。"""
+    return TMP_DIR / f"task-{task_id}"
+
+
+def owned_storage_dirs(task: dict[str, Any]) -> list[Path]:
+    """本任务在数据目录下拥有的持久化目录（不含工作目录）。
+
+    删除任务与「清理任务文件」共用这一份归属定义，避免两处规则漂移后
+    一方漏删、另一方误删。
+    """
+    task_id = int(task["id"])
+    return [releases_dir(task_id), artifacts_dir(task_id), temp_dir(task_id)]
+
+
 def run_log_path(run_id: int) -> Path:
     return LOGS_DIR / f"run-{run_id}.log"
 

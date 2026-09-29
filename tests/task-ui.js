@@ -20,6 +20,9 @@ class Element {
     this.disabled = Object.hasOwn(attrs, 'disabled');
     this.hidden = Object.hasOwn(attrs, 'hidden');
     this.checked = Object.hasOwn(attrs, 'checked');
+    // 有限样式对象：状态收敛会写入 style.color，缺失会让真实分支提前抛错。
+    this.style = {};
+    this.scrolled = false;
     this.dataset = new Proxy({}, { get: (_, key) => this.attrs['data-' + key.replace(/[A-Z]/g, c => '-' + c.toLowerCase())],
       set: (_, key, value) => { this.attrs['data-' + key.replace(/[A-Z]/g, c => '-' + c.toLowerCase())] = String(value); return true; } });
   }
@@ -56,6 +59,12 @@ class Element {
     if (selector.includes(' > ')) {
       const [parent, child] = selector.split(' > ');
       return this.matches(child) && Boolean(this.parent?.matches(parent));
+    }
+    // 后代选择器：末段匹配自身，前段由某个祖先匹配。
+    if (/\s/.test(selector.trim())) {
+      const parts = selector.trim().split(/\s+/);
+      return this.matches(parts[parts.length - 1])
+        && Boolean(this.parent?.closest(parts.slice(0, -1).join(' ')));
     }
     let rest = selector, ok = true;
     rest = rest.replace(/:nth-child\((\d+)\)/g, (_, n) => {
@@ -129,14 +138,16 @@ const deferred = () => {
 const run = (id, extra = {}) => ({ id, status: 'success', release_dir: `/releases/${id}`,
   commit_after: `abcdef${id}`, log_tail: [`日志 ${id}`], is_active: false, ...extra });
 
-async function scenario(runs = [run(30), run(20)], taskExtra = {}) {
+async function scenario(runs = [run(30), run(20)], taskExtra = {}, options = {}) {
   const task = { id: 1, name: 'Demo_task', repo_url: 'https://example.test/repo.git', repo_branch: 'main',
     enabled: true, schedule_type: 'manual', deploy_method: 'release', ...taskExtra };
   const document = new Element('document'), container = new Element(); document.append(container);
+  // 弹窗挂载点：运行详情弹窗的关闭检测依赖它是否为空。
+  const modalRoot = new Element('div', { id: 'modal-root' }); document.append(modalRoot);
   document.createElement = tag => new Element(tag);
   document.getElementById = id => document.querySelector('#' + id);
-  const timers = new Map(), queues = new Map(), requests = [], unexpected = [], errors = [], successes = [], confirms = [];
-  let timerId = 0, confirmResult = true, modal;
+  const timers = new Map(), queues = new Map(), requests = [], unexpected = [], errors = [], successes = [], confirms = [], prompts = [], renders = [];
+  let timerId = 0, confirmResult = true, promptResult = null, modal;
   const enqueue = (method, url, result) => {
     const key = method + ' ' + url; if (!queues.has(key)) queues.set(key, []); queues.get(key).push(result);
   };
@@ -148,7 +159,9 @@ async function scenario(runs = [run(30), run(20)], taskExtra = {}) {
     else if (method === 'GET' && url === '/api/tasks') result = { tasks: [task] };
     else if (method === 'GET' && url === '/api/tasks/1') result = { task, runs };
     else if (method === 'GET' && url === '/api/credentials') result = { credentials: [] };
-    else if (method === 'POST' && url === '/api/settings/schedule/preview') result = { ok: true, description: '固定间隔', next_runs: [] };
+    else if (method === 'GET' && url.startsWith('/api/runs?') && options.runsView) {
+      result = { runs, total: runs.length, statuses: [] };
+    } else if (method === 'POST' && url === '/api/settings/schedule/preview') result = { ok: true, description: '固定间隔', next_runs: [] };
     else if (method === 'GET' && /^\/api\/runs\/\d+$/.test(url) && runs.some(r => url.endsWith('/' + r.id))) {
       result = { run: runs.find(r => url.endsWith('/' + r.id)) };
     } else { unexpected.push(method + ' ' + url); throw new Error('未配置的模拟请求：' + url); }
@@ -158,24 +171,64 @@ async function scenario(runs = [run(30), run(20)], taskExtra = {}) {
   const AD = { state: { defaults: { schedule_defaults: { interval: '1h' } } }, escapeHtml, attr: escapeHtml,
     debounce: fn => fn, setBusy: (button, busy) => { button.disabled = busy; },
     toastError: message => errors.push(message), toastSuccess: message => successes.push(message),
-    confirm: async options => { confirms.push(options); return confirmResult; }, render: async () => {},
-    api: Object.fromEntries(['get', 'post', 'put'].map(method => [method, (url, body) => request(method.toUpperCase(), url, body)])),
-    Modal: { open: options => { modal?.remove(); modal = new Element(); document.append(modal);
-      modal.innerHTML = options.body + (options.footerLeft || '') + options.footer; return modal;
-    }, close: () => modal.remove() } };
+    confirm: async options_ => { confirms.push(options_); return confirmResult; },
+    render: async view => { renders.push(view); },
+    prompt: async options_ => { prompts.push(options_); return promptResult; },
+    api: Object.fromEntries(['get', 'post', 'put', 'del'].map(method => [method,
+      (url, body) => request(method === 'del' ? 'DELETE' : method.toUpperCase(), url, body)])),
+    Modal: { open: options_ => { modalRoot.innerHTML = ''; modal = new Element(); modalRoot.append(modal);
+      modal.innerHTML = options_.body + (options_.footerLeft || '') + options_.footer; return modal;
+    }, close: () => { modalRoot.innerHTML = ''; modal = null; } } };
   for (const key of ['statusLabel', 'formatTime', 'formatRelative', 'formatDuration', 'triggerLabel', 'shortCommit']) AD[key] = v => String(v ?? '');
+  // 运行详情弹窗使用 setInterval 轮询与 MutationObserver 感知关闭；这里提供
+  // 同契约的有限实现，让测试能驱动真实轮询与关闭清理逻辑。
+  const intervals = new Map();
+  const observers = [];
+  let intervalId = 0;
+  class TestMutationObserver {
+    constructor(callback) { this.callback = callback; this.disconnected = false; observers.push(this); }
+    observe() {}
+    disconnect() { this.disconnected = true; }
+    /** 模拟 modal-root 被清空：仅未断开的观察者收到通知。 */
+    fire() { if (!this.disconnected) this.callback([]); }
+  }
   vm.runInNewContext(source, { AD, window: { AD, addEventListener() {} }, document,
     setTimeout: (fn, delay) => { timers.set(++timerId, { fn, delay }); return timerId; },
-    clearTimeout: id => timers.delete(id), setInterval: () => assert.fail('行内日志不得使用 setInterval'),
+    clearTimeout: id => timers.delete(id),
+    setInterval: (fn, delay) => { intervals.set(++intervalId, { fn, delay }); return intervalId; },
+    clearInterval: id => intervals.delete(id),
+    MutationObserver: TestMutationObserver,
+    URLSearchParams,
   }, { filename: 'web/assets/views.js' });
   await AD.views.tasks(container);
   const q = selector => { const node = document.querySelector(selector); assert.ok(node, '找不到节点：' + selector); return node; };
-  return { AD, task, document, container, q, timers, requests, errors, successes, confirms, enqueue,
+  return { AD, task, document, container, q, timers, requests, errors, successes, confirms, prompts, renders, enqueue,
     confirmWith: value => { confirmResult = value; },
+    promptWith: value => { promptResult = value; },
     async click(selector, force = false) { await q(selector).fire('click', force); await flush(); },
     async open(options) { await AD.toggleTaskExpand(1, options); await flush(); },
     async tick() { const due = [...timers]; timers.clear(); due.forEach(([, t]) => { assert.equal(t.delay, 1200); t.fn(); }); await flush(); },
-    finish() { AD.stopAllInlineLogs(); assert.equal(timers.size, 0); assert.deepEqual(unexpected, []);
+    /** 触发一次运行详情弹窗的 1200ms 轮询。 */
+    async intervalTick() {
+      const due = [...intervals];
+      const pending = due.map(([, t]) => { assert.equal(t.delay, 1200); return t.fn(); });
+      await Promise.all(pending);
+      await flush();
+    },
+    /** 触发弹窗打开时 250ms 的首次探测。 */
+    async kickoffTick() {
+      const due = [...timers];
+      timers.clear();
+      const pending = due.map(([, t]) => { assert.equal(t.delay, 250); return t.fn(); });
+      await Promise.all(pending);
+      await flush();
+    },
+    intervals,
+    intervalCount() { return intervals.size; },
+    /** 模拟弹窗关闭：modal-root 变空，未断开的观察者收到通知。 */
+    closeModal() { AD.Modal.close(); observers.forEach(o => o.fire()); },
+    observeCount() { return observers.filter(o => !o.disconnected).length; },
+    finish() { AD.stopAllInlineLogs(); intervals.clear(); assert.equal(timers.size, 0); assert.deepEqual(unexpected, []);
       for (const [key, queue] of queues) assert.equal(queue.length, 0, '未消费预期请求：' + key); },
   };
 }
@@ -313,6 +366,92 @@ async function pollingChecks() {
   retry.AD.stopAllInlineLogs(); assert.equal(retry.timers.size, 0); retry.finish();
 }
 
+// 运行结束后状态必须就地收敛：取消按钮消失、徽标与「最近运行」同步更新。
+// 回归用户报告的问题：运行结束但界面仍显示「运行中」，取消按钮残留并报
+// 「该运行已结束，无法取消」。
+async function runFinishChecks() {
+  // 内联面板路径：正在观看的运行结束后，行与面板一起收敛。
+  const active = run(30, { status: 'running', is_active: true, release_dir: '' });
+  const test = await scenario([active, run(20)], { active_run: active }); await test.open();
+  assert.equal(test.q('[data-inline-cancel]').dataset.inlineCancel, '30');
+  assert.equal(test.q('[data-task-cancel]').dataset.taskCancel, '1');
+  test.enqueue('GET', '/api/runs/30/tail?after=1', { total: 2, lines: ['完成'], active: false });
+  test.enqueue('GET', '/api/runs/30', { run: run(30, { status: 'success', is_active: false, duration_ms: 900 }) });
+  // 终态收敛会就地刷新任务行；用最新任务状态回答这次请求。
+  test.enqueue('GET', '/api/tasks', { tasks: [{ ...test.task, active_run: null, last_status: 'success', run_count: 1, success_count: 1, failure_count: 0 }] });
+  await test.tick();
+  assert.equal(test.timers.size, 0);
+  assert.equal(test.document.querySelector('[data-inline-cancel]'), null, '运行结束后取消按钮必须消失');
+  assert.equal(test.document.querySelector('[data-task-cancel]'), null, '任务行必须回到「立即运行」');
+  assert.ok(test.q('[data-task-run]'));
+  assert.ok(test.q('[data-inline-run-status]').querySelector('.badge.success'), '面板状态应变为成功');
+  assert.equal(test.renders.length, 0, '终态收敛不得重绘整个视图');
+  test.finish();
+
+  // 任务页轮询路径：视图注册的 viewRefresh 只更新行与面板，不重绘。
+  const poll = await scenario([active, run(20)], { active_run: active });
+  await poll.open();
+  assert.equal(poll.timers.size, 1, '活跃运行时继续轮询');
+  poll.enqueue('GET', '/api/runs/30/tail?after=1', { total: 1, lines: [], active: false });
+  poll.enqueue('GET', '/api/runs/30', { run: run(30, { status: 'success', is_active: false }) });
+  poll.enqueue('GET', '/api/tasks', { tasks: [{ ...poll.task, active_run: null, last_status: 'success' }] });
+  await poll.tick();
+  assert.equal(poll.renders.length, 0, '状态收敛必须就地更新');
+  assert.equal(poll.document.querySelector('[data-inline-cancel]'), null);
+  assert.equal(poll.document.querySelector('[data-task-cancel]'), null);
+  poll.finish();
+}
+
+// 「查看日志」不得触发整体刷新：详情弹窗只就地更新，不重建底层视图。
+async function runDetailIsolationChecks() {
+  const test = await scenario([run(30), run(20)], {}, { runsView: true });
+  await test.AD.views.runs(test.container);
+  const row = test.q('[data-run-row="30"]');
+  assert.equal(row.querySelector('[data-run-actions]').querySelectorAll('button').length, 1,
+    '已结束的运行不应有取消按钮');
+  const rendersBefore = test.renders.length;
+  await test.click('[data-run-log="30"]');
+  assert.equal(test.renders.length, rendersBefore, '打开日志详情不得重绘视图');
+  assert.ok(test.q('#rd-status'), '弹窗已打开');
+  assert.equal(test.document.querySelector('#modal-root [data-cancel-run]'), null,
+    '已结束运行的弹窗不得显示取消按钮');
+  // 已结束的运行：首次探测即收敛，停止轮询。
+  test.enqueue('GET', '/api/runs/30/tail?after=1', { total: 1, lines: [], active: false });
+  await test.kickoffTick();
+  assert.equal(test.intervalCount(), 0, '已结束的运行不得继续轮询');
+  assert.equal(test.renders.length, rendersBefore, '终态收敛不得重绘视图');
+  test.closeModal();
+  test.finish();
+
+  // 活跃运行的弹窗在结束时移除取消按钮并就地同步列表行。
+  const live = run(31, { status: 'running', is_active: true });
+  const active = await scenario([live, run(20)], {}, { runsView: true });
+  await active.AD.views.runs(active.container);
+  const liveRow = active.q('[data-run-row="31"]');
+  assert.ok(liveRow.querySelector('[data-run-cancel]'), '活跃运行的列表行应有取消按钮');
+  const before = active.renders.length;
+  await active.click('[data-run-log="31"]');
+  assert.equal(active.renders.length, before, '打开活跃运行的日志不得重绘视图');
+  assert.ok(active.document.querySelector('#modal-root [data-cancel-run]'), '活跃运行的弹窗应有取消按钮');
+  // 运行结束：弹窗轮询读取终态后移除取消按钮并同步列表行。
+  active.enqueue('GET', '/api/runs/31/tail?after=1', { total: 1, lines: [], active: false });
+  active.enqueue('GET', '/api/runs/31', { run: run(31, { status: 'success', is_active: false, duration_ms: 42 }) });
+  await active.intervalTick();
+  assert.equal(active.renders.length, before, '终态收敛不得重绘视图');
+  assert.equal(active.document.querySelector('#modal-root [data-cancel-run]'), null,
+    '运行结束后弹窗取消按钮必须消失');
+  assert.equal(active.document.querySelector('[data-run-row="31"] [data-run-cancel]'), null,
+    '运行结束后列表行的取消按钮必须消失');
+  assert.ok(active.document.querySelector('[data-run-row="31"] [data-run-status] .badge.success'),
+    '列表行状态应就地更新为成功');
+  // 弹窗打开时排入的 250ms 首次探测随后会因终态而停止轮询。
+  active.enqueue('GET', '/api/runs/31/tail?after=1', { total: 1, lines: [], active: false });
+  await active.kickoffTick();
+  assert.equal(active.intervalCount(), 0, '运行结束后不得继续轮询');
+  active.closeModal();
+  active.finish();
+}
+
 async function rollbackChecks() {
   for (const extra of [{ status: 'failed' }, { release_dir: '' }]) {
     const test = await scenario([run(30, extra), run(20)]); await test.open();
@@ -355,6 +494,100 @@ async function rollbackChecks() {
   const test = await scenario(); await test.open(); const confirmation = deferred(); test.confirmWith(confirmation.promise);
   const clicking = test.q(selected).fire(); await flush(); await test.click('[data-task-log]');
   confirmation.resolve(true); await clicking; assert.equal(posts(test).length, 0, '确认期间离开已断开的面板不能提交'); test.finish();
+}
+
+async function deleteChecks() {
+  const del = test => test.requests.filter(r => r.method === 'DELETE');
+
+  // 行内删除走两步确认：先确认意图，再要求输入任务名。
+  const test = await scenario(); 
+  assert.ok(test.q('[data-task-delete]'), '任务行必须提供删除入口');
+  assert.equal(test.q('[data-task-delete]').dataset.taskDelete, '1');
+
+  // 第一步取消：不发请求。
+  test.confirmWith(false); test.promptWith('Demo_task');
+  await test.click('[data-task-delete]');
+  assert.equal(test.confirms.length, 1); assert.equal(test.prompts.length, 0, '首次确认取消后不得进入第二步');
+  assert.equal(del(test).length, 0);
+
+  // 第二步输入不匹配：仍然不发请求，并给出中文提示。
+  test.confirmWith(true); test.promptWith('demo_task_wrong');
+  await test.click('[data-task-delete]');
+  assert.equal(test.prompts.length, 1);
+  assert.equal(del(test).length, 0, '任务名不匹配不得提交删除');
+  assert.ok(test.errors.some(m => /任务名不匹配/.test(m)), '名称不匹配需明确提示：' + JSON.stringify(test.errors));
+
+  // 第二步取消（null）同样不发请求。
+  test.promptWith(null); await test.click('[data-task-delete]');
+  assert.equal(del(test).length, 0);
+
+  // 正常路径：名称匹配后提交 DELETE，并汇报清理与容器数量。
+  test.enqueue('DELETE', '/api/tasks/1', { ok: true, purged: ['a', 'b'], containers: ['c1'], runs_deleted: 3 });
+  test.promptWith('Demo_task');
+  await test.click('[data-task-delete]');
+  const deletes = del(test);
+  assert.equal(deletes.length, 1); assert.equal(deletes[0].url, '/api/tasks/1');
+  assert.ok(test.successes.some(m => /任务已删除/.test(m) && /2 项/.test(m) && /容器 1 个/.test(m)),
+    '需汇报清理数量：' + JSON.stringify(test.successes));
+  const confirmOptions = test.confirms.at(-1);
+  assert.equal(confirmOptions.danger, true);
+  assert.match(confirmOptions.message, /Demo_task/);
+  assert.match(confirmOptions.detail, /不可撤销/);
+  // 确认文案要说明该部署方式下的真实后果，避免误导。
+  assert.match(confirmOptions.detail, /影响范围/);
+  assert.equal(test.prompts.at(-1).label.includes('Demo_task'), true);
+
+  // 后端报错（例如运行中）要回显中文错误，不静默失败。
+  test.enqueue('DELETE', '/api/tasks/1', new Error('任务正在运行，请先取消后再删除'));
+  await test.click('[data-task-delete]');
+  assert.ok(test.errors.some(m => /正在运行/.test(m)), JSON.stringify(test.errors));
+  test.finish();
+
+  // 运行中的任务：不进入确认流程，直接给出中文提示。
+  // active_run 来自任务列表（列表接口据此标记），不是 runs 数组。
+  const busy = await scenario([run(30, { status: 'running', is_active: true })],
+    { active_run: run(30, { status: 'running', is_active: true }) });
+  const busyButton = busy.q('[data-task-delete]');
+  assert.match(busyButton.getAttribute('title'), /运行中/);
+  busy.confirmWith(true); busy.promptWith('Demo_task');
+  await busy.click('[data-task-delete]');
+  assert.equal(busy.confirms.length, 0, '运行中任务不得进入删除确认');
+  assert.equal(busy.prompts.length, 0);
+  assert.equal(del(busy).length, 0);
+  assert.ok(busy.errors.some(m => /正在运行.*请先取消/.test(m)), JSON.stringify(busy.errors));
+  busy.finish();
+
+  // 表单内的删除按钮复用同一套两步确认。
+  const fromForm = await scenario();
+  await fromForm.AD.openTaskForm(1); await flush();
+  assert.ok(fromForm.q('#form-delete'), '编辑表单需保留删除入口');
+  fromForm.confirmWith(true); fromForm.promptWith('Demo_task');
+  fromForm.enqueue('DELETE', '/api/tasks/1', { ok: true, purged: [], containers: [], runs_deleted: 0 });
+  await fromForm.click('#form-delete');
+  assert.equal(del(fromForm).length, 1, '表单删除同样要走两步确认并提交');
+  assert.equal(fromForm.prompts.length, 1);
+  fromForm.finish();
+
+  // 表单内取消删除时回到编辑表单，不丢失后续编辑入口。
+  const cancelled = await scenario();
+  await cancelled.AD.openTaskForm(1); await flush();
+  cancelled.confirmWith(false); cancelled.promptWith('Demo_task');
+  await cancelled.click('#form-delete');
+  assert.equal(del(cancelled).length, 0);
+  assert.equal(cancelled.confirms.length, 1);
+  cancelled.finish();
+
+  // 部署方式不同，后果说明必须随之变化（避免对 systemd/rsync 谎报会停容器）。
+  for (const [method, pattern] of [
+    ['docker_compose', /compose down/], ['docker', /回滚脚本/],
+    ['systemd', /systemctl stop/], ['rsync', /远端/], ['release', /没有需要停止的容器/],
+  ]) {
+    const each = await scenario([run(30)], { deploy_method: method });
+    each.confirmWith(false); each.promptWith('Demo_task');
+    await each.click('[data-task-delete]');
+    assert.match(each.confirms[0].detail, pattern, method + ' 的后果说明不正确：' + each.confirms[0].detail);
+    each.finish();
+  }
 }
 
 async function formChecks() {
@@ -408,6 +641,8 @@ function styleChecks() {
 }
 
 (async () => {
-  await selectionChecks(); await raceChecks(); await pollingChecks(); await rollbackChecks(); await formChecks(); styleChecks();
-  console.log('任务页 Node 回归通过：真实详情/表单 handler、日志选择与下载、异步会话隔离、增量轮询及清理、回滚确认与错误、名称原样校验及 CSS 契约（有限 DOM 模拟，未进行真实浏览器验收）');
+  await selectionChecks(); await raceChecks(); await pollingChecks(); await runFinishChecks();
+  await runDetailIsolationChecks(); await rollbackChecks(); await deleteChecks();
+  await formChecks(); styleChecks();
+  console.log('任务页 Node 回归通过：真实详情/表单 handler、日志选择与下载、异步会话隔离、增量轮询及清理、运行结束就地收敛（取消按钮消失且不重绘）、查看日志不触发整体刷新、回滚确认与错误、名称原样校验、删除两步确认与后果说明及 CSS 契约（有限 DOM 模拟，未进行真实浏览器验收）');
 })().catch(error => { console.error(error); process.exitCode = 1; });

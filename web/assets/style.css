@@ -282,6 +282,14 @@ tbody tr:last-child td { border-bottom: none; }
 .icon-btn.run:hover:not(:disabled) { background: rgba(62,207,142,0.24); }
 .icon-btn.stop { background: var(--danger-soft); border-color: rgba(255,95,109,0.4); color: var(--danger); }
 .icon-btn.stop:hover:not(:disabled) { background: rgba(255,95,109,0.24); }
+/* 删除：破坏性动作，仅悬停时显红，避免常驻红色视觉噪音分散注意。
+   运行中删除入口为 disabled，:not(:disabled) 已排除其悬停态。 */
+.icon-btn.danger { color: var(--text-dim); }
+.icon-btn.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: rgba(255,95,109,0.4);
+  color: var(--danger);
+}
 .icon-btn:hover:not(:disabled) { color: var(--text); }
 
 /* ------------------------------------------------- clickable task name --- */

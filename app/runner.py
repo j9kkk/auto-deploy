@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from . import config, gitops
 from .deployer import (
@@ -77,6 +77,21 @@ class ActiveRun:
         with self.lock:
             lines = list(self.tail)
         return lines[-limit:]
+
+
+def resolve_git_depth(task: Mapping[str, Any]) -> int:
+    """任务的拉取深度；0 表示完整历史，缺失时回退 1（浅克隆）。
+
+    不能用 ``task.get("git_depth") or 1``：那会把界面上的 0（完整历史）
+    当成缺省值吞掉，使完整历史永远退化为浅克隆。
+    """
+    raw = task.get("git_depth")
+    if raw is None or raw == "":
+        return 1
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 1
 
 
 class DeployRunner:
@@ -302,7 +317,7 @@ class DeployRunner:
             repo_url=task["repo_url"],
             branch=task["repo_branch"],
             workspace=workspace,
-            depth=int(task.get("git_depth") or 1),
+            depth=resolve_git_depth(task),
             token=credential.token,
             username=credential.username,
             credential=credential,
