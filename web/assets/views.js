@@ -2282,8 +2282,16 @@ AD.views = {};
       }
       if (!state.active) {
         if (state.restart === 'manual') {
-          body.innerHTML = '<div class="alert warning">更新文件已就位。当前环境没有 systemd，'
-            + '请手动重启服务加载新版本。</div>';
+          const cmd = state.manual_command || 'sudo systemctl restart autodeploy';
+          body.innerHTML = '<div class="alert warning">更新文件已就位，但自动重启未成功。'
+            + '请在服务器上执行以下命令加载新版本：</div>'
+            + '<div class="code-inline" style="display:block;padding:10px 12px;margin-top:8px">'
+            + e(cmd) + '</div>'
+            + '<div class="row" style="margin-top:10px">'
+            + '<button class="sm" id="upd-copy-cmd">复制命令</button>'
+            + '<button class="sm" id="upd-check">重新检查</button></div>';
+          body.querySelector('#upd-copy-cmd')?.addEventListener('click', () => AD.copyToClipboard(cmd));
+          body.querySelector('#upd-check').addEventListener('click', () => AD.renderUpdatePanel(panel));
           return;
         }
         body.innerHTML = '<div class="alert success">更新完成</div>';

@@ -426,11 +426,60 @@ class SelfUpdateManager:
         log(f"已备份当前版本到 {backup.name}")
         return backup
 
+    def _ensure_unit_env(self, service: str, log: Callable[[str], None]) -> None:
+        """确保 systemd 单元里带上了自我更新需要的环境变量。
+
+        install.sh 只在安装/升级时写 unit；老版本安装的 unit 缺少
+        AUTODEPLOY_SERVICE_NAME，导致服务名只能靠 cgroup 反查。这里做一次
+        幂等自愈：缺失则插入该行并 daemon-reload。失败不影响更新本身。
+        """
+        if not service:
+            return
+        from .executor import command_exists
+
+        if not (command_exists("systemctl") and command_exists("sudo")):
+            return
+        unit_path = Path(f"/etc/systemd/system/{service}")
+        try:
+            content = unit_path.read_text(encoding="utf-8")
+        except OSError:
+            return  # 读不到（权限或路径不同）就跳过
+        if "AUTODEPLOY_SERVICE_NAME" in content:
+            return
+
+        lines = content.splitlines()
+        out: list[str] = []
+        inserted = False
+        for line in lines:
+            out.append(line)
+            if not inserted and line.strip().startswith("Environment=AUTODEPLOY_PORT="):
+                out.append(f"Environment=AUTODEPLOY_SERVICE_NAME={service}")
+                inserted = True
+        if not inserted:
+            out.append(f"Environment=AUTODEPLOY_SERVICE_NAME={service}")
+        updated = "\n".join(out) + "\n"
+
+        import subprocess as _sp
+
+        try:
+            proc = _sp.run(
+                ["sudo", "-n", "bash", "-c",
+                 f"cat > {unit_path} && systemctl daemon-reload"],
+                input=updated, text=True, capture_output=True, timeout=30,
+            )
+        except (OSError, _sp.TimeoutExpired):
+            return
+        if proc.returncode == 0:
+            log(f"已为 systemd 单元补上服务名环境变量（{service}）")
+        else:
+            log("! 未能自动补全 systemd 单元环境变量，不影响本次更新")
+
     def _finish(self, state: dict[str, Any], root: Path, backup: Path, log: Callable[[str], None]) -> None:
         """重启策略与收尾。"""
         strategy, service = self._restart_plan()
-        # CI/容器里常有 systemd-run 但 sudo 无免密凭据；sudo -n 会立即失败，
-        # 不会挂起。真正要防的是策略可用却卡住：给重启命令较短的超时。
+        # 老版本安装的 unit 缺少 AUTODEPLOY_SERVICE_NAME，先幂等补齐，
+        # 否则下次更新又要靠 cgroup 反查。
+        self._ensure_unit_env(service, log)
         self._set_stage(state, "restarting")
         if strategy == "deferred":
             log(f"已调度延迟重启（{service}，5 秒后由 systemd 执行）")
@@ -444,26 +493,90 @@ class SelfUpdateManager:
                 log("服务即将自动重启；页面会自动重连")
                 self._save_state(state)
                 return
-            self._log(state, "! 延迟重启调度失败，尝试直接重启")
+            self._log(
+                state,
+                "! 延迟重启调度失败"
+                f"（{(result.output or result.error or '').strip()[:160]}），尝试直接重启",
+            )
         if strategy in ("deferred", "direct"):
             result = run_command(
                 ["sudo", "-n", "/usr/bin/systemctl", "restart", service],
                 timeout=30,
             )
-            if result.ok:
+            if result.ok or not self._sudo_refused(result):
+                # 非 sudo 拒绝的失败，通常是「重启已发出、本进程被 cgroup
+                # 一并杀掉」——重启其实成功了，按成功处理等前端重连。
                 state["restart"] = "direct"
-                self._log(state, "已请求重启；本次运行可能显示为中断，属预期现象")
+                if result.ok:
+                    self._log(state, "已请求重启；页面会自动重连")
+                else:
+                    self._log(state, "已发出重启请求（本进程随服务一同重启，属预期现象）")
                 self._save_state(state)
                 return
-            self._log(state, "! 直接重启失败，需要手动重启")
+            detail = (result.output or "").strip()[:200] or f"退出码 {result.exit_code}"
+            self._log(state, f"! 直接重启被 sudo 拒绝（{detail}）")
         state["restart"] = "manual"
-        self._log(state, "更新文件已就位：当前环境无 systemd，请手动重启服务以加载新版本")
+        state["manual_command"] = f"sudo systemctl restart {service}"
+        self._log(state, f"更新文件已就位，但自动重启未成功。请在服务器执行：{state['manual_command']}")
         state["stage"] = "done"
         state["version"] = __version__
         self._save_state(state)
 
+    def _detect_service_name(self) -> str:
+        """确定自身的 systemd 单元名。
+
+        优先环境变量（install.sh 会注入）；老版本安装的 unit 没有该变量，
+        此时从 systemd 自身反查：读本进程 cgroup 里出现的 ``*.service``。
+        两条路都拿不到才退回默认值——服务名猜错会导致重启到别的 unit。
+        """
+        from_env = os.environ.get("AUTODEPLOY_SERVICE_NAME", "").strip()
+        if from_env:
+            return from_env
+
+        import re as _re
+
+        # /proc/self/cgroup 形如 .../system.slice/autodeploy.service
+        try:
+            content = Path("/proc/self/cgroup").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            content = ""
+        candidates: list[str] = []
+        for line in content.splitlines():
+            for match in _re.finditer(r"([A-Za-z0-9@_.\-]+\.service)", line):
+                name = match.group(1)
+                if name not in candidates:
+                    candidates.append(name)
+        # 我们的 unit 是自己，不是 systemd 基础单元。
+        ignored = {"systemd-journald.service", "systemd-udevd.service", "dbus.service"}
+        for name in candidates:
+            if name not in ignored:
+                return name
+        return "autodeploy"
+
+    @staticmethod
+    def _sudo_refused(result: Any) -> bool:
+        """判断失败是否源于 sudo 拒绝（而非命令已发出、自身被杀）。
+
+        这一点很关键：``systemctl restart <自己>`` 会重启整个 cgroup，
+        发起请求的 systemctl 也随之被杀，退出码必然非 0——但重启其实已经
+        成功调度。若把它当成失败，就会错误地回落到「请手动重启」。
+        """
+        text = f"{result.output or ''} {result.error or ''}".lower()
+        return any(
+            marker in text
+            for marker in (
+                "a password is required",
+                "a terminal is required",
+                "not allowed",
+                "no tty present",
+                "is not in the sudoers",
+                "command not found",
+                "没有任何可用的",
+            )
+        )
+
     def _restart_plan(self) -> tuple[str, str]:
-        service = os.environ.get("AUTODEPLOY_SERVICE_NAME", "autodeploy")
+        service = self._detect_service_name()
         from .executor import command_exists
 
         if command_exists("systemd-run") and command_exists("systemctl") and command_exists("sudo"):
@@ -537,7 +650,8 @@ class SelfUpdateManager:
                     return {"ok": True, "message": f"已回滚到 {backup.name}，服务即将重启"}
             state["stage"] = "done"
             state["restart"] = "manual"
-            self._log(state, "已回滚文件；当前环境无 systemd，请手动重启服务")
+            state["manual_command"] = f"sudo systemctl restart {service}"
+            self._log(state, f"已回滚文件，但自动重启未成功。请执行：{state['manual_command']}")
             self._save_state(state)
             return {"ok": True, "message": "已回滚文件，请手动重启服务"}
 

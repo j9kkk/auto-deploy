@@ -4,6 +4,25 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.3] - 2026-09-29
+
+修复一键更新在 systemd 环境下误报「请手动重启」的问题。
+
+### 修复
+
+- **自我重启不再被误判为失败**：``systemctl restart <自身>`` 会重启整个
+  cgroup，发起请求的 systemctl 也随之被杀，退出码必然非 0——此前据此判定
+  失败并提示「请手动重启」，而重启其实已经成功。现在区分两类失败：
+  sudo 明确拒绝（真失败）与命令已发出但本进程被一并重启（视为成功，
+  等前端重连）。
+- **服务名不再靠猜**：新增从进程 cgroup 反查自身 unit 名，环境变量缺失时
+  （老版本安装的 unit 没有该变量）也能定位正确的 unit，避免重启到错误服务。
+- **systemd 单元幂等自愈**：更新时若发现 unit 缺少
+  ``AUTODEPLOY_SERVICE_NAME``，自动补上并 ``daemon-reload``。
+- **失败原因可见**：sudo 被拒时把真实输出写进更新日志，不再只显示退出码。
+- 手动重启提示改为给出可直接复制的命令（界面提供复制按钮），
+  不再笼统地说「当前环境没有 systemd」。
+
 ## [1.3.2] - 2026-09-29
 
 修复 1.3.1 项目名迁移后旧容器占用容器名的问题。
@@ -202,6 +221,7 @@
   数据库仓储层、完整 API 端到端流程（含真实部署、取消、日志增量协议）与调度器行为。
 
 
+[1.3.3]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.3
 [1.3.2]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.2
 [1.3.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.1
 [1.3.0]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.0

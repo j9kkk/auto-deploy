@@ -1001,6 +1001,24 @@ def run() -> int:
     check("空名回退 task-<id>", _safe_task_slug("", 4) == "task-4")
     check("同 id 同名结果稳定", _safe_task_slug("x", 5) == _safe_task_slug("x", 5))
     check("不同任务结果不同", _safe_task_slug("x", 5) != _safe_task_slug("x", 6))
+    # 重启策略：区分「sudo 被拒」（真失败）与「命令已发出、本进程随
+    # cgroup 被杀」（重启其实成功）。
+    from app.selfupdate import SelfUpdateManager as _SUM
+
+    class _Res:
+        def __init__(self, ok, output="", error="", exit_code=0):
+            self.ok, self.output, self.error, self.exit_code = ok, output, error, exit_code
+
+    check("sudo 拒绝判为真失败",
+          _SUM._sudo_refused(_Res(False, "sudo: a password is required")) is True)
+    check("sudoers 拒绝判为真失败",
+          _SUM._sudo_refused(_Res(False, "user is not in the sudoers file")) is True)
+    check("自身被 cgroup 杀掉不算 sudo 拒绝",
+          _SUM._sudo_refused(_Res(False, "", "", -15)) is False)
+    check("无输出的非零退出不算 sudo 拒绝",
+          _SUM._sudo_refused(_Res(False, "", "", 143)) is False)
+    check("成功结果不算 sudo 拒绝", _SUM._sudo_refused(_Res(True)) is False)
+
     check("项目名不含非法字符",
           all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in _safe_task_slug("A_b!C", 7)))
 
