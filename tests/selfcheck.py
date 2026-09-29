@@ -1112,8 +1112,10 @@ def run() -> int:
         restored = (install_root / "app" / "__init__.py").read_text()
         check("回滚后恢复到更新前内容", '1.0.0' in restored, restored[:80])
 
-        # 防护：源码目录有未提交改动时拒绝自更新
-        (install_root / ".git").mkdir()
+        # 防护：源码目录有未提交改动时拒绝自更新。
+        # 回滚（deferred 环境下）可能又把 stage 置为 restarting（已调度重启），
+        # 需先落定才能再次 start()。
+        mgr.mark_settled()
         (install_root / "uncommitted.txt").write_text("dev work\n")
         import subprocess as _sp
         _sp.run(["git", "init", "-q"], cwd=install_root, check=True)
