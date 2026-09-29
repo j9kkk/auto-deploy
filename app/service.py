@@ -50,7 +50,8 @@ class Service:
         self.store = Store(self.db)
         self.runner = DeployRunner(self.store)
         self.scheduler = Scheduler(self.store, self.runner)
-        self.selfupdate = SelfUpdateManager(self.store)
+        self.selfupdate = SelfUpdateManager(self.store, self.scheduler._lock)
+        self.scheduler.deployment_blocked = self.selfupdate.deployment_blocked
         self.throttle = LoginThrottle(
             self.settings.login_max_attempts, self.settings.login_lockout_seconds
         )

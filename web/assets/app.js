@@ -13,6 +13,7 @@
 
   // ---------------------------------------------------------------- session
   AD.showLogin = function (message) {
+    AD.stopUpdatePanel?.();
     document.getElementById('app-view').classList.add('hidden');
     document.getElementById('login-view').classList.remove('hidden');
     const errorBox = document.getElementById('login-error');
@@ -69,6 +70,7 @@
   };
 
   AD.render = async function (view) {
+    AD.stopUpdatePanel?.();
     const container = document.getElementById('content');
     const previousView = AD.state.currentView;
     AD.state.currentView = view;

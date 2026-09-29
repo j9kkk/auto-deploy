@@ -49,6 +49,7 @@ class Scheduler:
         self._wake_event = threading.Event()
         self._lock = threading.RLock()
         self._last_maintenance = 0.0
+        self.deployment_blocked: Callable[[], bool] = lambda: False
         # Populated by the API layer; called after a run is dispatched so the
         # UI can be pushed an update.
         self.on_dispatch: Callable[[int, int], None] | None = None
@@ -115,6 +116,12 @@ class Scheduler:
         return started
 
     def _dispatch(self, task: dict[str, Any], *, trigger: str) -> bool:
+        with self._lock:
+            if self.deployment_blocked():
+                return False
+            return self._dispatch_allowed(task, trigger=trigger)
+
+    def _dispatch_allowed(self, task: dict[str, Any], *, trigger: str) -> bool:
         task_id = int(task["id"])
         if self.store.runs.has_active_for_task(task_id):
             settings = config.load_settings()
@@ -192,6 +199,12 @@ class Scheduler:
 
     def run_now(self, task_id: int, *, trigger: str = "manual") -> int | None:
         """Queue an immediate run of a task, bypassing its schedule."""
+        with self._lock:
+            if self.deployment_blocked():
+                raise RuntimeError("系统正在更新或回滚，暂不能开始部署")
+            return self._run_now_allowed(task_id, trigger=trigger)
+
+    def _run_now_allowed(self, task_id: int, *, trigger: str) -> int | None:
         task = self.store.tasks.get(task_id)
         if task is None:
             return None
