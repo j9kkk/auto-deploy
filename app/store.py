@@ -320,6 +320,13 @@ class CredentialRepository:
 # Tasks
 # ---------------------------------------------------------------------------
 
+class TaskNameConflict(ValueError):
+    """任务名已被占用；API 可精准转换为字段校验错误。"""
+
+    def __init__(self) -> None:
+        super().__init__("任务名已被使用（不区分大小写），请换一个名称")
+
+
 class TaskRepository:
     def __init__(self, database: Database) -> None:
         self.db = database
@@ -343,7 +350,12 @@ class TaskRepository:
         values += [now, now]
         placeholders = ", ".join("?" for _ in columns)
         sql = f"INSERT INTO tasks ({', '.join(columns)}) VALUES ({placeholders})"
-        return self.db.execute(sql, values)
+        # 与所有仓储写入共享同一把 RLock，检查与写入不可被并发请求穿插。
+        # 不增加启动迁移，也不擅自改名已有的大小写冲突记录。
+        with self.db._lock:
+            if self.name_taken(payload.get("name", "")):
+                raise TaskNameConflict()
+            return self.db.execute(sql, values)
 
     def update(self, task_id: int, data: dict[str, Any]) -> bool:
         payload = self._payload(data)
@@ -354,7 +366,14 @@ class TaskRepository:
         values = [payload[c] for c in columns]
         values += [iso(utcnow()), task_id]
         sql = f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ?"
-        return self.db.execute_rowcount(sql, values) > 0
+        with self.db._lock:
+            if "name" in payload:
+                existing = self.get(task_id)
+                # 存量重名任务未改名时仍可保存其他配置。
+                if existing is not None and payload["name"] != existing["name"]:
+                    if self.name_taken(payload["name"], exclude_id=task_id):
+                        raise TaskNameConflict()
+            return self.db.execute_rowcount(sql, values) > 0
 
     def get(self, task_id: int) -> dict[str, Any] | None:
         return self.db.query_one("SELECT * FROM tasks WHERE id = ?", (task_id,))

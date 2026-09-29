@@ -25,7 +25,7 @@ from ..deployer import (
 )
 from ..schedule import iso, next_run_time, utcnow
 from ..service import Service
-from ..store import decode_task
+from ..store import TaskNameConflict, decode_task
 from ..validation import (
     ValidationError,
     describe_task_schedule,
@@ -50,13 +50,19 @@ def _decorate(task: dict[str, Any], service: Service) -> dict[str, Any]:
     if runs:
         enriched["last_run"] = runs[0]
     # Report whether the checkout exists so the UI can offer a first run hint.
-    workspace = config.workspace_dir_for_task(task)
-    if not (workspace / ".git").exists():
-        legacy = config.workspace_dir(int(task["id"]))
-        if (legacy / ".git").exists():
-            workspace = legacy
-    enriched["workspace_exists"] = (workspace / ".git").exists()
-    enriched["workspace"] = str(workspace)
+    try:
+        workspace = config.workspace_dir_for_task(task)
+    except ValueError as exc:
+        enriched["workspace_error"] = str(exc)
+        enriched["workspace_exists"] = False
+        enriched["workspace"] = ""
+    else:
+        if not (workspace / ".git").exists():
+            legacy = config.workspace_dir(int(task["id"]))
+            if legacy in config.owned_workspace_dirs(task) and (legacy / ".git").exists():
+                workspace = legacy
+        enriched["workspace_exists"] = (workspace / ".git").exists()
+        enriched["workspace"] = str(workspace)
     enriched["releases_root"], enriched["current_link"] = (
         str(part) for part in resolve_release_paths(task)
     )
@@ -91,14 +97,13 @@ def create_task(
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
 
-    # 任务名全局唯一：它同时用作工作目录名与各处展示标识。
-    if service.store.tasks.name_taken(body.get("name", "")):
+    try:
+        task_id = service.store.tasks.create(body)
+    except TaskNameConflict as exc:
         raise HTTPException(
             status_code=422,
-            detail={"message": "参数校验失败", "errors": {"name": "任务名已被使用，请换一个名称"}},
-        )
-
-    task_id = service.store.tasks.create(body)
+            detail={"message": "参数校验失败", "errors": {"name": str(exc)}},
+        ) from exc
     service.scheduler.reschedule(task_id)
     task = _decorate(decode_task(service.store.tasks.get(task_id)) or {}, service)
     audit(
@@ -156,27 +161,27 @@ def update_task(
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
-    existing = service.store.tasks.get_decoded(task_id)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    try:
-        # A partial update leaves unmentioned fields alone, which is what lets
-        # the edit form save without re-sending the git token.
-        body = validate_task_payload(payload, partial=True, existing=existing)
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
+    # 与手动/定时派发串行，锁内重新读取名称和运行状态，避免改名与派发竞态。
+    with service.scheduler._lock:
+        existing = service.store.tasks.get_decoded(task_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        try:
+            body = validate_task_payload(payload, partial=True, existing=existing)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
 
-    # 改名不得与其它任务重名（自己除外）。
-    if "name" in body and service.store.tasks.name_taken(body["name"], exclude_id=task_id):
-        raise HTTPException(
-            status_code=422,
-            detail={"message": "参数校验失败", "errors": {"name": "任务名已被其他任务使用"}},
-        )
-
-    if not service.store.tasks.update(task_id, body):
-        # Nothing changed, which is not an error.
-        pass
-    service.scheduler.reschedule(task_id)
+        if "name" in body and body["name"] != existing["name"]:
+            if service.store.runs.has_active_for_task(task_id):
+                raise HTTPException(status_code=409, detail="任务正在运行或排队，暂不能修改任务名")
+        try:
+            service.store.tasks.update(task_id, body)
+        except TaskNameConflict as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "参数校验失败", "errors": {"name": str(exc)}},
+            ) from exc
+        service.scheduler.reschedule(task_id)
     task = _decorate(decode_task(service.store.tasks.get(task_id)) or {}, service)
     changed = sorted(body.keys())
     audit(
@@ -212,10 +217,7 @@ def delete_task(
     purged: list[str] = []
     if purge:
         targets = [
-            config.workspace_dir(task_id),
-            # 名字目录可能带或不带 -id 后缀，两种形态都清理。
-            config.WORKSPACES_DIR / config._sanitize_dirname(str(row.get("name") or "")),
-            config.WORKSPACES_DIR / f"{config._sanitize_dirname(str(row.get('name') or ''))}-{task_id}",
+            *config.owned_workspace_dirs(row),
             config.releases_dir(task_id),
             config.artifacts_dir(task_id),
         ]
@@ -330,32 +332,41 @@ def cancel_task_run(
 def rollback(
     task_id: int,
     request: Request,
+    payload: dict[str, Any] | None = None,
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
-    row = service.store.tasks.get(task_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if service.store.runs.has_active_for_task(task_id):
-        raise HTTPException(status_code=409, detail="任务正在运行，无法回滚")
+    run_id = None
+    if payload is not None:
+        run_id = payload.get("run_id")
+        if set(payload) != {"run_id"} or type(run_id) is not int or not 0 < run_id <= 2**63 - 1:
+            raise HTTPException(status_code=422, detail="回滚参数必须仅包含正整数 run_id")
 
     lines: list[str] = []
     with service.scheduler._lock:
+        row = service.store.tasks.get(task_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        # Check admission inside the same lock used by run_now and self-update.
+        if service.store.runs.has_active_for_task(task_id):
+            raise HTTPException(status_code=409, detail="任务正在运行，无法回滚")
         if service.selfupdate.deployment_blocked():
             raise HTTPException(status_code=409, detail="系统正在更新或回滚，暂不能回滚部署")
+        selected_run = (service.store.runs.get(run_id) or {}) if run_id is not None else None
         ok, message = rollback_task(
             row,
             log=lines.append,
             timeout=min(600, int(row.get("timeout_seconds") or 300)),
             kill_grace_seconds=service.settings.kill_grace_seconds,
+            selected_run=selected_run,
         )
     audit(
         service, "rollback", actor=user["username"], target=f"task:{task_id}",
-        detail=message, ip=client_ip(request),
+        detail=(f"run:{run_id} " if run_id is not None else "") + message, ip=client_ip(request),
     )
     if not ok:
         raise HTTPException(status_code=400, detail={"message": message, "log": lines})
-    return {"ok": True, "message": message, "log": lines}
+    return {"ok": True, "message": message, "log": lines, "run_id": run_id}
 
 
 @router.get("/{task_id}/preflight")
@@ -368,6 +379,7 @@ def task_preflight(
     if row is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     releases_root, current_link = resolve_release_paths(row)
+    task = _decorate(decode_task(row) or {}, service)
     return {
         "checks": preflight(row),
         "required_binaries": sorted({*REQUIRED_BINARIES, *METHOD_BINARIES.values()}),
@@ -376,7 +388,8 @@ def task_preflight(
         "current_target": (
             str(current_release(releases_root, current_link) or "")
         ),
-        "workspace": str(config.workspace_dir_for_task(decode_task(row) or {})),
+        "workspace": task["workspace"],
+        "workspace_error": task.get("workspace_error", ""),
         "disk": disk_usage(config.DATA_DIR),
         "next_run_at": row.get("next_run_at"),
         "schedule_description": describe_task_schedule(decode_task(row) or {}),

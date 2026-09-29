@@ -18,7 +18,8 @@ from .schedule import describe_schedule, validate_schedule
 from .security import password_problem
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{3,64}$")
-TASK_NAME_MAX = 120
+TASK_NAME_MAX = 80
+TASK_NAME_RE = re.compile(r"[A-Za-z_]{1,80}")
 SCRIPT_MAX = 200_000
 
 DEPLOY_METHODS = set(deployer.DEPLOY_METHODS)
@@ -134,9 +135,14 @@ def validate_task_payload(
 
     # --- identity ------------------------------------------------------
     if has("name") or not partial:
-        name = _clean_str(payload.get("name") or existing.get("name"), limit=TASK_NAME_MAX)
-        if not name:
-            errors["name"] = "任务名称不能为空"
+        name = payload.get("name", existing.get("name"))
+        # 旧名称只允许原样保留；新增和实际改名不做类型转换、裁剪或截断。
+        if not isinstance(name, str):
+            errors["name"] = "任务名必须是字符串"
+        elif not name:
+            errors["name"] = "任务名不能为空"
+        elif not (partial and name == existing.get("name")) and not TASK_NAME_RE.fullmatch(name):
+            errors["name"] = f"任务名需为 1-{TASK_NAME_MAX} 位英文字母或下划线，不区分大小写；说明请填写备注"
         out["name"] = name
     if has("description") or not partial:
         out["description"] = _clean_str(

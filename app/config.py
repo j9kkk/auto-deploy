@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -252,9 +253,12 @@ CLAIM_FILE = ".autodeploy-owner"
 
 def _claimed_by(directory: Path, task_id: Any) -> bool:
     """目录内的认领标记是否指向该任务。"""
+    marker = directory / CLAIM_FILE
+    if directory.is_symlink() or marker.is_symlink():
+        return False
     try:
-        return (directory / CLAIM_FILE).read_text(encoding="utf-8").strip() == str(task_id)
-    except OSError:
+        return marker.read_text(encoding="utf-8").strip() == str(task_id)
+    except (OSError, UnicodeError):
         return False
 
 
@@ -267,6 +271,48 @@ def _claim(directory: Path, task_id: Any) -> None:
         pass
 
 
+def _workspace_basename(task: dict[str, Any]) -> str:
+    """新标识原样用作 POSIX 目录名，兼容已认领的旧清洗目录，不迁移数据。"""
+    name = str(task.get("name") or "")
+    legacy = _sanitize_dirname(name)
+    if re.fullmatch(r"[A-Za-z_]{1,80}", name):
+        # CON、纯下划线在本项目运行的 POSIX 平台上均是合法目录名。
+        # 旧版曾将它们映射到 _CON / task，已有认领目录必须继续可访问。
+        if legacy != name:
+            for base in (legacy, f"{legacy}-{task.get('id')}"):
+                candidate = WORKSPACES_DIR / base
+                if not candidate.is_symlink() and _claimed_by(candidate, task.get("id")):
+                    return base
+        return name
+    return legacy
+
+
+def owned_workspace_dirs(task: dict[str, Any]) -> list[Path]:
+    """列出可安全清理的任务目录，不认领、不迁移、不跟随软链。"""
+    task_id = int(task["id"])
+    name = str(task.get("name") or "")
+    bases = {_sanitize_dirname(name)}
+    if re.fullmatch(r"[A-Za-z_]{1,80}", name):
+        bases.add(name)
+    legacy = workspace_dir(task_id)
+    candidates = {legacy}
+    for base in bases:
+        candidates.update((WORKSPACES_DIR / base, WORKSPACES_DIR / f"{base}-{task_id}"))
+    owned: list[Path] = []
+    for directory in sorted(candidates):
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        marker = directory / CLAIM_FILE
+        if marker.is_symlink():
+            continue
+        if _claimed_by(directory, task_id):
+            owned.append(directory)
+        elif directory == legacy and not marker.exists() and (directory / ".git").is_dir():
+            # 认领标记引入前的 task-id Git checkout；有他人标记时绝不清理。
+            owned.append(directory)
+    return owned
+
+
 def workspace_dir_for_task(task: dict[str, Any]) -> Path:
     """以「任务名」命名的工作目录；同名冲突时追加任务 id 保证唯一。
 
@@ -274,16 +320,17 @@ def workspace_dir_for_task(task: dict[str, Any]) -> Path:
     把目录与任务 id 绑定，因此同一任务每次解析结果一致、不同任务目录互不
     相同，且不受其他任务目录存在与否的影响。
     """
-    base = _sanitize_dirname(str(task.get("name") or ""))
+    base = _workspace_basename(task)
     task_id = task.get("id")
-    candidate = WORKSPACES_DIR / base
-    if candidate.exists():
-        if _claimed_by(candidate, task_id):
-            return candidate  # 任务名目录本就属于该任务
-        return WORKSPACES_DIR / f"{base}-{task_id}"
-    # 任务名目录不存在：若旧目录已持有认领标记（从旧布局升级途中），
-    # 任务名可直接用于后续迁移。
-    return candidate
+    candidates = (WORKSPACES_DIR / base, WORKSPACES_DIR / f"{base}-{task_id}")
+    # 优先沿用本任务已认领的目录（即使后来基础名字空闲了），拒绝跟随软链。
+    for candidate in candidates:
+        if not candidate.is_symlink() and _claimed_by(candidate, task_id):
+            return candidate
+    for candidate in candidates:
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise ValueError("任务工作目录已被其他任务或文件占用，请检查目录归属")
 
 
 def migrate_workspace_to_name(task: dict[str, Any], *, log: Any = None) -> Path:
@@ -295,8 +342,12 @@ def migrate_workspace_to_name(task: dict[str, Any], *, log: Any = None) -> Path:
     """
     task_id = int(task.get("id") or 0)
     old = WORKSPACES_DIR / f"task-{task_id}"
-    base = _sanitize_dirname(str(task.get("name") or ""))
-    candidate = WORKSPACES_DIR / base
+    old_marker = old / CLAIM_FILE
+    if old.is_symlink() or (old.exists() and not old.is_dir()):
+        raise ValueError("旧任务工作目录不是安全的真实目录，无法迁移")
+    if (old_marker.exists() or old_marker.is_symlink()) and not _claimed_by(old, task_id):
+        raise ValueError("旧任务工作目录归属不明或属于其他任务，无法迁移")
+    candidate = workspace_dir_for_task(task)
     if old == candidate:
         return candidate
     if old.exists():
@@ -309,8 +360,8 @@ def migrate_workspace_to_name(task: dict[str, Any], *, log: Any = None) -> Path:
                 except OSError:
                     pass
                 return candidate
-            # 任务名目录被其他任务占用：改用带 id 后缀的目录名。
-            candidate = WORKSPACES_DIR / f"{base}-{task_id}"
+            # 解析后目录若被外部并发占用，也不覆盖或重新认领。
+            raise ValueError("任务工作目录已被占用，无法迁移")
         try:
             old.rename(candidate)
         except OSError:

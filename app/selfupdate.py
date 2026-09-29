@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import uuid
 import json
+import math
 import os
 import re
 import shutil
@@ -25,6 +26,7 @@ STATE_FILE_NAME = "self-update-state.json"
 BACKUP_DIR_NAME = "self-update-backups"
 CHECK_TTL_SECONDS = 600
 RESTART_TIMEOUT = 120
+STATE_SCHEMA_VERSION = 2
 PROCESS_BOOT_ID = uuid.uuid4().hex
 
 # 与部署脚本同一套产物：这些路径构成一次完整的程序更新。
@@ -116,9 +118,32 @@ class SelfUpdateManager:
             if isinstance(data, dict):
                 data.setdefault("stage", "idle")
                 data.setdefault("log", [])
-                if data.get("stage") == "restarting" and time.time() > data.get("restart_deadline", 0):
-                    data.update(stage="failed", error="重启确认超时；未确认目标版本运行，请检查服务")
-                    self._log(data, data["error"])
+                changed = False
+                if "schema_version" not in data:
+                    data["schema_version"] = STATE_SCHEMA_VERSION
+                    changed = True
+                    # v1.3.6 已有进程确认字段，但尚未写入格式版本。
+                    modern = any(key in data for key in ("operation_id", "before_boot_id", "expected_version"))
+                    if not modern and data["stage"] != "idle":
+                        data["legacy_stage"] = data["stage"]
+                        data["notice"] = "此记录来自旧版更新机制，缺少进程确认信息；当前运行版本不代表该次操作已确认成功。可继续检查更新，原日志已保留。"
+                        if data["stage"] in (*ACTIVE_STAGES, "done"):
+                            data["stage"] = "unverified"
+                if data.get("schema_version") != STATE_SCHEMA_VERSION:
+                    return {**data, "stage": "unverified", "notice": "无法识别更新记录格式，未确认操作成功；原记录保持不变。"}
+                if data.get("stage") == "restarting":
+                    deadline = data.get("restart_deadline")
+                    valid_deadline = (type(deadline) in (int, float) and math.isfinite(deadline) and deadline > 0)
+                    error = ""
+                    if not valid_deadline:
+                        error = "重启确认记录缺少有效期限，未确认操作成功；请检查服务"
+                    elif time.time() > deadline:
+                        error = "重启确认超时；未确认目标版本运行，请检查服务"
+                    if error:
+                        data.update(stage="failed", error=error)
+                        self._log(data, error)
+                        changed = True
+                if changed:
                     self._save_state(data)
                 return data
         except (OSError, json.JSONDecodeError):
@@ -143,15 +168,69 @@ class SelfUpdateManager:
     def backups_dir(self) -> Path:
         return config.DATA_DIR / BACKUP_DIR_NAME
 
-    def latest_backup(self) -> Path | None:
+    def _check_backup_root(self) -> None:
+        if self.backups_dir.is_symlink() or (self.backups_dir.exists() and not self.backups_dir.is_dir()):
+            raise RuntimeError("备份目录不安全或类型错误，尚未修改程序文件")
+
+    def _validate_backup(self, backup: Path) -> str:
+        self._check_backup_root()
+        if (backup.is_symlink() or not backup.is_dir()
+                or backup.resolve().parent != self.backups_dir.resolve()):
+            raise RuntimeError("备份路径不安全")
+        marker = backup / "complete.json"
+        if marker.is_symlink() or not marker.is_file():
+            raise RuntimeError("备份缺少有效完成标记，无法确认备份完整性")
+        try:
+            metadata = json.loads(marker.read_text(encoding="utf-8"))
+            version = metadata.get("version") if isinstance(metadata, dict) else None
+            if not isinstance(version, str) or not version.strip():
+                raise ValueError("version")
+            return self._validate_tree(backup, version)
+        except (OSError, ValueError, SyntaxError, UnicodeError) as exc:
+            raise RuntimeError("备份完成标记或程序内容无效") from exc
+
+    def _available_backup(self) -> tuple[Path | None, str]:
+        if self.backups_dir.is_symlink():
+            return None, "备份目录是软链，已禁用自动回滚；请人工核查备份。"
         if not self.backups_dir.exists():
-            return None
-        entries = sorted(
-            (p for p in self.backups_dir.iterdir() if p.is_dir() and not p.is_symlink() and (p / "complete.json").is_file()),
-            key=lambda p: p.name,
-            reverse=True,
-        )
-        return entries[0] if entries else None
+            return None, "尚无可用的代码备份。"
+        try:
+            entries = sorted(self.backups_dir.iterdir(), key=lambda p: p.lstat().st_mtime_ns, reverse=True)
+        except OSError:
+            return None, "无法读取备份目录，请检查访问权限。"
+        available = None
+        legacy = invalid = 0
+        for entry in entries:
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    invalid += 1
+                    continue
+                marker = entry / "complete.json"
+                if not marker.exists() and not marker.is_symlink():
+                    legacy += 1
+                    continue
+                self._validate_backup(entry)
+                if available is None:
+                    available = entry
+            except (RuntimeError, OSError):
+                invalid += 1
+        notices = []
+        if legacy:
+            notices.append(f"发现 {legacy} 份旧版或未完成备份，缺少完成标记，无法确认完整性；已保留但不用于自动回滚，请人工核查后恢复。")
+        if invalid:
+            notices.append(f"另有 {invalid} 份备份未通过校验，已跳过并保留。")
+        if available is not None:
+            notices.append("可回滚到最近通过结构及版本校验的代码备份；数据库和 Python 依赖不会回滚。")
+        elif not notices:
+            notices.append("尚无可用的代码备份。")
+        return available, " ".join(notices)
+
+    def latest_backup(self) -> Path | None:
+        return self._available_backup()[0]
+
+    def backup_status(self) -> dict[str, Any]:
+        backup, notice = self._available_backup()
+        return {"can_rollback": backup is not None, "backup_notice": notice}
 
     # ------------------------------------------------------------- 检查
     def check(self, *, force: bool = False) -> UpdateCheck:
@@ -265,11 +344,12 @@ class SelfUpdateManager:
             result = run_command(["git", "status", "--porcelain"], cwd=root, timeout=30)
             if not result.ok or result.output.strip():
                 raise RuntimeError("源码目录存在未提交改动或无法确认状态，已中止")
+        self._check_backup_root()
         self._validate_tree(root)
         return service
 
     def _new_state(self, operation: str, target: str, service: str) -> dict[str, Any]:
-        return dict(stage="queued", operation=operation, operation_id=uuid.uuid4().hex,
+        return dict(schema_version=STATE_SCHEMA_VERSION, stage="queued", operation=operation, operation_id=uuid.uuid4().hex,
                     target_version=target, expected_version=normalize_tag(target),
                     previous_version=__version__, before_boot_id=PROCESS_BOOT_ID,
                     before_pid=os.getpid(), service=service, started_at=time.time(),
@@ -348,6 +428,7 @@ class SelfUpdateManager:
                         path.unlink()
 
     def _backup(self, root, state, log):
+        self._check_backup_root()
         backup = self.backups_dir / (str(time.time_ns()) + "-" + state["operation_id"])
         backup.mkdir(parents=True)
         for item in UPDATE_ITEMS:
@@ -358,6 +439,7 @@ class SelfUpdateManager:
                 shutil.copy2(src, backup / item)
         version = self._validate_tree(backup)
         (backup / "complete.json").write_text(json.dumps({"version": version}))
+        self._validate_backup(backup)
         state["backup"] = str(backup)
         log("已备份程序代码；不包含数据库和 Python 依赖，不能保证降级兼容")
         return backup
@@ -366,9 +448,7 @@ class SelfUpdateManager:
         if not state.get("backup"):
             return
         backup = Path(state["backup"])
-        if backup.is_symlink() or backup.resolve().parent != self.backups_dir.resolve():
-            raise RuntimeError("备份路径不安全")
-        self._validate_tree(backup)
+        self._validate_backup(backup)
         self._replace(backup, root)
         self._log(state, "已恢复程序代码；数据库和依赖未回滚")
 
@@ -472,7 +552,7 @@ class SelfUpdateManager:
             backup = self.latest_backup()
             if backup is None:
                 raise RuntimeError("没有可用的代码备份")
-            version = self._validate_tree(backup)
+            version = self._validate_backup(backup)
             state = self._new_state("rollback", version, service)
             self._save_state(state)
             def run():
@@ -496,9 +576,11 @@ class SelfUpdateManager:
             if state.get("stage") not in ACTIVE_STAGES:
                 return
             valid = (state.get("stage") == "restarting" and state.get("operation") in ("update", "rollback")
-                     and bool(state.get("operation_id")) and bool(state.get("before_boot_id"))
+                     and isinstance(state.get("operation_id"), str) and bool(state["operation_id"])
+                     and isinstance(state.get("before_boot_id"), str) and bool(state["before_boot_id"])
                      and state["before_boot_id"] != PROCESS_BOOT_ID
-                     and state.get("before_pid") != os.getpid()
+                     and type(state.get("before_pid")) is int and state["before_pid"] > 0
+                     and state["before_pid"] != os.getpid()
                      and state.get("expected_version") == normalize_tag(__version__)
                      and normalize_tag(str(state.get("target_version", ""))) == normalize_tag(__version__))
             if valid:

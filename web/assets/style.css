@@ -286,16 +286,28 @@ tbody tr:last-child td { border-bottom: none; }
 
 /* ------------------------------------------------- clickable task name --- */
 .task-name-link {
-  font-weight: 500;
-  color: var(--text);
+  display: inline-block;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.5;
+  color: var(--accent-hover);
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
   cursor: pointer;
-  border-bottom: 1px dashed transparent;
-  transition: color .12s;
 }
-.task-name-link:hover { color: var(--accent); }
-.task-name-link.expanded { color: var(--accent); }
-.row-disabled .task-name-link { color: var(--text-dim); }
-.row-disabled .task-name-link:hover { color: var(--accent); }
+.task-name-link:hover:not(:disabled) {
+  color: var(--accent-hover);
+  background: transparent;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.task-name-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.row-disabled .task-name-link { color: var(--accent-hover); }
 
 /* ------------------------------------------------------ disabled row ----- */
 /* 禁用行压暗方式：不用整体透明度（会把辅助文字压到 4.5:1 以下），
@@ -351,7 +363,19 @@ tr.row-disabled .row-actions { opacity: 1; }
 .task-expand dl.kv { margin: 0; }
 .task-expand .mini-runs table { font-size: 12.5px; }
 .task-expand .mini-runs td, .task-expand .mini-runs th { padding: 7px 8px; }
-.task-expand .expand-toolbar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.task-expand .expand-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.task-expand .expand-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  min-height: 30px;
+  line-height: 1.4;
+}
+.task-expand .expand-toolbar button svg { width: 15px; height: 15px; flex: 0 0 15px; display: block; }
+.task-expand .inline-rollback-reason { color: var(--text-dim); font-size: 12px; margin: 8px 0 12px; }
+.task-expand [data-inline-run-log].active { color: var(--accent-hover); border-color: var(--accent); background: var(--accent-soft); }
+.task-expand .mini-runs { overflow-x: auto; }
 
 /* --------------------------------------------------------------- badges -- */
 .badge {
@@ -403,6 +427,31 @@ tr.row-disabled .row-actions { opacity: 1; }
 .log-line .l-stage { color: var(--warning); font-weight: 600; }
 .log-line .l-sep { color: var(--text-faint); }
 .log-empty { color: var(--text-faint); font-style: italic; }
+
+/* -------------------------------------------------------- self update --- */
+#upd-body { min-width: 0; }
+.upd-current { margin-bottom: 12px; }
+.upd-operation-error { margin-top: 6px; }
+.alert.neutral { background: var(--bg-panel); border-color: var(--border); color: var(--text-dim); }
+.upd-logs { margin-bottom: 16px; min-width: 0; }
+.upd-logs summary { cursor: pointer; color: var(--text-dim); padding: 6px 0; }
+.upd-logs .log-view {
+  min-height: 0; max-height: 240px; margin-top: 6px; overflow-anchor: none;
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--bg-input); color-scheme: dark;
+}
+.upd-source { width: 100%; }
+.upd-source-row { display: flex; flex-wrap: wrap; gap: 10px; width: 100%; align-items: center; }
+.upd-source-row input { flex: 1 1 280px; width: 100%; min-width: 0; }
+.upd-source-row button { flex: 0 0 auto; }
+.upd-check-section { margin-bottom: 14px; }
+.upd-check-section h3 { color: var(--text-dim); }
+.upd-recovery { display: flex; flex-wrap: wrap; gap: 10px; }
+.upd-rollback-reason { color: var(--text-dim); margin-top: 8px; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .upd-source-row { flex-direction: column; align-items: stretch; }
+  .upd-source-row input, .upd-source-row button { flex: 0 1 auto; width: 100%; }
+  .upd-source-row button { justify-content: center; white-space: normal; }
+}
 
 /* --------------------------------------------------------------- toast --- */
 #toasts {

@@ -750,24 +750,103 @@ def run_deploy(ctx: DeployContext) -> None:
     handler(ctx)
 
 
+def _rollback_target(
+    task: dict[str, Any],
+    selected_run: dict[str, Any] | None,
+) -> tuple[Path, Path, Path | None, Path]:
+    """Resolve only a stored run's direct release directory, never a client path."""
+    import re
+
+    if selected_run is not None:
+        if not selected_run:
+            raise DeployError("指定的运行记录不存在")
+        if selected_run.get("task_id") != task.get("id"):
+            raise DeployError("指定的运行记录不属于该任务")
+        if selected_run.get("status") != "success":
+            raise DeployError("只能回滚到部署成功的运行版本")
+        if not selected_run.get("release_dir"):
+            raise DeployError("该运行没有发布目录，无法回滚")
+        recorded_method = str(selected_run.get("deploy_method") or "").strip().lower()
+        current_method = str(task.get("deploy_method") or "script").strip().lower()
+        if recorded_method and recorded_method != current_method:
+            raise DeployError("任务部署方式已改变，不能使用当前配置回滚该运行版本")
+
+    releases_root, current_link = resolve_release_paths(task)
+    # Resolve trusted ancestors (e.g. macOS /tmp -> /private/tmp), not the
+    # release-root leaf: replacing that leaf must still be rejected.
+    if releases_root.is_symlink():
+        raise DeployError("发布目录根路径存在软链或越界，无法回滚")
+    if not releases_root.is_dir():
+        raise DeployError("发布目录不存在或已删除，无法回滚")
+    root = releases_root.resolve()
+    if not (task.get("target_dir") or "").strip():
+        expected_parent = config.RELEASES_DIR.resolve() / f"task-{int(task.get('id') or 0)}"
+        if root.parent != expected_parent:
+            raise DeployError("任务发布目录越界，无法回滚")
+    current_link = current_link.parent.resolve() / current_link.name
+    active = None
+    for link in (current_link, root / "current"):
+        if link.is_symlink():
+            resolved = link.resolve()
+            if resolved.parent != root or (resolved.exists() and not resolved.is_dir()):
+                raise DeployError("当前版本软链越界或未指向发布目录，无法回滚")
+            # A missing in-root current was ignored by current_release too.
+            if active is None and resolved.is_dir():
+                active = resolved
+        elif link.exists():
+            raise DeployError("current 不是软链，无法安全回滚")
+
+    if selected_run is None:
+        # Canonical root avoids comparing alias paths against a resolved current.
+        target = previous_release(root, current_link)
+        if target is None:
+            raise DeployError("没有可回滚的历史版本")
+    else:
+        raw_path = selected_run["release_dir"]
+        if not isinstance(raw_path, str) or "\\" in raw_path or "\x00" in raw_path:
+            raise DeployError("运行记录中的发布目录路径无效")
+        target = Path(raw_path)
+    if not target.is_absolute() or ".." in target.parts or target.parent.resolve() != root:
+        raise DeployError("运行记录中的发布目录越界或不属于该任务")
+    if selected_run is not None and not re.fullmatch(
+        r"\d{8}-\d{6}-(?:[0-9a-fA-F]{1,8}|nogit)(?:-[0-9]+)?", target.name,
+    ):
+        raise DeployError("运行记录未指向有效的版本发布目录")
+    if target.is_symlink():
+        raise DeployError("发布目录不能是软链或指向其他位置")
+    target = target.resolve()
+    if target.parent != root:
+        raise DeployError("发布目录不能是软链或指向其他位置")
+    if not target.is_dir():
+        raise DeployError("该版本的发布目录不存在或已删除")
+    if target == active:
+        raise DeployError("指定版本已经是当前版本，无需回滚")
+    return root, current_link, active, target
+
+
 def rollback_task(
     task: dict[str, Any],
     *,
     log: Callable[[str], None],
     timeout: int = 300,
     kill_grace_seconds: int = 10,
+    selected_run: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
-    """Point ``current`` at the previous release and restart the service.
+    """Switch to a validated stored run, or retain the legacy previous selection.
 
-    Returns ``(ok, message)``.  The optional ``rollback_script`` runs after the
-    swap so it can perform extra steps such as reverting a database migration.
+    The caller holds the deployment admission lock throughout this operation.
+    Scripts and systemd retain the original rollback semantics; other methods
+    do not automatically redeploy containers or synchronize remote machines.
     """
-    releases_root, current_link = resolve_release_paths(task)
-    active = current_release(releases_root, current_link)
-    target = previous_release(releases_root, current_link)
-    if target is None:
-        return False, "没有可回滚的历史版本"
+    try:
+        releases_root, current_link, active, target = _rollback_target(task, selected_run)
+    except DeployError as exc:
+        return False, str(exc)
+    except (OSError, RuntimeError, ValueError):
+        return False, "发布目录或当前版本路径无效、已删除或无法访问"
 
+    if selected_run is not None:
+        log("回滚使用任务当前配置的回滚脚本和服务名称；历史运行未保存这些配置的快照。")
     try:
         swap_symlink(current_link, target)
     except OSError as exc:
@@ -778,6 +857,8 @@ def rollback_task(
     ctx_env = {
         "AUTODEPLOY_TASK_ID": str(task.get("id", "")),
         "AUTODEPLOY_TASK_NAME": str(task.get("name", "")),
+        "AUTODEPLOY_RUN_ID": str(selected_run.get("id", "")) if selected_run else "",
+        "AUTODEPLOY_COMMIT": str(selected_run.get("commit_after") or "") if selected_run else "",
         "AUTODEPLOY_RELEASE_DIR": str(target),
         "AUTODEPLOY_CURRENT_LINK": str(current_link),
         "AUTODEPLOY_RELEASES_ROOT": str(releases_root),
@@ -813,7 +894,14 @@ def rollback_task(
         )
         if not result.ok:
             return False, f"重启服务失败: {result.error}"
-    return True, f"已回滚到 {target.name}"
+    message = f"已回滚到 {target.name}"
+    if task.get("deploy_method") in {"docker", "docker_compose", "rsync"}:
+        message += "；仅切换本地 current 并执行已配置的回滚脚本，不会自动重新部署容器或同步远端"
+        log(message)
+    elif task.get("deploy_method") == "artifact":
+        message += "；仅切换本地 current 并执行已配置的回滚脚本，不会自动重新打包、替换已有产物或执行部署"
+        log(message)
+    return True, message
 
 
 # ---------------------------------------------------------------------------

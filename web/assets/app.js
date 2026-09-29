@@ -24,6 +24,7 @@
       errorBox.classList.add('hidden');
     }
     AD.stopLiveLog();
+    AD.stopAllInlineLogs?.();
     AD.stopPolling();
     const input = document.getElementById('username');
     if (input) input.focus();

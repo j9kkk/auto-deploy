@@ -11,7 +11,6 @@ required; git-based tests use local repositories.
 from __future__ import annotations
 
 import json
-import sqlite3
 import os
 import subprocess
 import sys
@@ -204,7 +203,7 @@ def run() -> int:
 
     cleaned = validate_task_payload(
         {
-            "name": "  my task  ",
+            "name": "My_Task",
             "repo_url": "https://github.com/a/b.git",
             "deploy_method": "script",
             "deploy_script": "echo hi",
@@ -214,7 +213,27 @@ def run() -> int:
             "schedule_expression": "2h",
         }
     )
-    check("名称被裁剪", cleaned["name"] == "my task")
+    check("合法任务名原样保留", cleaned["name"] == "My_Task")
+    for valid_name in ("A", "_", "___", "CON", "Mixed_Case", "A" * 80):
+        result = validate_task_payload({**cleaned, "name": valid_name})
+        check(f"接受合法任务名 {valid_name[:15]}", result["name"] == valid_name)
+    for invalid_name in ("中文", "has space", " spaced ", "abc1", "a-b", "a.b", "../a", "/a",
+                         "a\\b", "é", "Ａ", "A\n", "A\x00", "A" * 81, "", " ", None, 123, True, [], {}):
+        for partial in (False, True):
+            try:
+                validate_task_payload({**cleaned, "name": invalid_name}, partial=partial, existing=cleaned)
+            except ValidationError as exc:
+                check(f"拒绝非法任务名 {invalid_name!r} partial={partial}", "name" in exc.errors)
+            else:
+                check(f"拒绝非法任务名 {invalid_name!r} partial={partial}", False)
+    for legacy_name in ("历史中文任务", "old-name", " Old Task ", "L" * 120):
+        legacy = {**cleaned, "name": legacy_name}
+        result = validate_task_payload({"name": legacy_name, "description": "备注"}, partial=True, existing=legacy)
+        check("旧不合规名原样保留可编辑 " + legacy_name[:15], result["name"] == legacy_name)
+        result = validate_task_payload({"description": "新备注"}, partial=True, existing=legacy)
+        check("旧名称省略不改写 " + legacy_name[:15], "name" not in result)
+        expect_raises("旧名称不能改成另一个非法名", lambda: validate_task_payload(
+            {"name": legacy_name + "!"}, partial=True, existing=legacy), ValidationError)
     check("打包路径去重", cleaned["artifact_paths"] == "dist\npackage.json")
     check("环境变量文本解析", cleaned["env_vars"] == {"A": "1", "B": "two"})
 
@@ -458,7 +477,7 @@ def run() -> int:
     # ------------------------------------------------------------------
     section("数据库与仓储层")
     from app.db import Database
-    from app.store import Store
+    from app.store import Store, TaskNameConflict
 
     store = Store(Database(tmp_root / "test.db"))
     check("schema 版本已写入", store.db.schema_version() >= 1)
@@ -532,6 +551,68 @@ def run() -> int:
     check("保留最新记录", len(store.runs.list_for_task(task_id2)) == 3)
     check("清理返回日志路径列表", isinstance(logs, list))
 
+    # 并发创建、改名及创建/改名互撞均在同一 NOCASE 临界区完成。
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch as name_patch
+
+    def race_names(operations):
+        barrier = threading.Barrier(len(operations))
+
+        def attempt(operation):
+            barrier.wait(timeout=10)
+            try:
+                operation()
+                return "ok"
+            except TaskNameConflict:
+                return "conflict"
+
+        original_name_taken = store.tasks.name_taken
+        lock_observations = []
+
+        def slow_name_taken(*args, **kwargs):
+            lock_observations.append(store.db._lock._is_owned())
+            result = original_name_taken(*args, **kwargs)
+            time.sleep(0.01)
+            return result
+
+        with name_patch.object(store.tasks, "name_taken", side_effect=slow_name_taken):
+            with ThreadPoolExecutor(max_workers=len(operations)) as pool:
+                results = list(pool.map(attempt, operations))
+        check("唯一性检查处于数据库锁内", all(lock_observations) and bool(lock_observations))
+        return results
+
+    results = race_names([
+        lambda n=n: store.tasks.create({"name": n, "repo_url": str(origin)})
+        for n in ("Concurrent_Create", "CONCURRENT_CREATE") * 4
+    ])
+    check("并发大小写创建仅一个成功", results.count("ok") == 1 and results.count("conflict") == 7)
+    rename_ids = [store.tasks.create({"name": n, "repo_url": str(origin)})
+                  for n in ("Rename_Source_A", "Rename_Source_B")]
+    results = race_names([
+        lambda i=i, n=n: store.tasks.update(i, {"name": n})
+        for i, n in zip(rename_ids, ("Concurrent_Rename", "CONCURRENT_RENAME"))
+    ])
+    check("并发大小写改名仅一个成功", sorted(results) == ["conflict", "ok"])
+    results = race_names([
+        lambda: store.tasks.update(rename_ids[0], {"name": "Mixed_Race"}),
+        lambda: store.tasks.create({"name": "MIXED_RACE", "repo_url": str(origin)}),
+    ])
+    check("创建与改名并发互撞仅一个成功", sorted(results) == ["conflict", "ok"])
+    expect_raises("仓储创建重名专用异常", lambda: store.tasks.create(
+        {"name": "CONCURRENT_CREATE", "repo_url": str(origin)}), TaskNameConflict)
+
+    # 模拟旧版本存量大小写冲突；不增索引、不自动重命名、不阻止启动。
+    with name_patch.object(store.tasks, "name_taken", return_value=False):
+        old_ids = [store.tasks.create({"name": n, "repo_url": str(origin)})
+                   for n in ("Legacy_Case", "LEGACY_CASE")]
+    store.db.init_schema()
+    check("存量大小写冲突启动后原样保留", [store.tasks.get(i)["name"] for i in old_ids]
+          == ["Legacy_Case", "LEGACY_CASE"])
+    check("存量大小写冲突未改名可编辑", store.tasks.update(old_ids[0],
+          {"name": "Legacy_Case", "description": "兼容旧任务"}))
+    expect_raises("存量大小写冲突禁止新增", lambda: store.tasks.create(
+        {"name": "legacy_case", "repo_url": str(origin)}), TaskNameConflict)
+
     store.audit.record("login_success", actor="admin", ip="127.0.0.1")
     check("审计日志写入", store.audit.list_recent()[0]["action"] == "login_success")
     store.close()
@@ -574,7 +655,7 @@ def run() -> int:
         response = client.post(
             "/api/tasks",
             json={
-                "name": "端到端任务",
+                "name": "End_To_End",
                 "repo_url": str(origin),
                 "repo_branch": "main",
                 "schedule_type": "interval",
@@ -599,7 +680,7 @@ def run() -> int:
         response = client.post(
             "/api/tasks",
             json={
-                "name": "端到端任务", "repo_url": str(origin),
+                "name": "End_To_End", "repo_url": str(origin),
                 "deploy_method": "script", "deploy_script": "true",
             },
         )
@@ -609,7 +690,7 @@ def run() -> int:
         response = client.post(
             "/api/tasks",
             json={
-                "name": "端到端任务".upper(), "repo_url": str(origin),
+                "name": "End_To_End".upper(), "repo_url": str(origin),
                 "deploy_method": "script", "deploy_script": "true",
             },
         )
@@ -617,16 +698,125 @@ def run() -> int:
         # 改名撞别的任务
         response = client.post(
             "/api/tasks",
-            json={"name": "取消测试甲", "repo_url": str(origin),
+            json={"name": "Cancel_Alpha", "repo_url": str(origin),
                   "deploy_method": "script", "deploy_script": "true"},
         )
         check("创建第二个任务成功", response.status_code == 201, response.text[:150])
         second_id = response.json()["task"]["id"]
-        response = client.put(f"/api/tasks/{second_id}", json={"name": "端到端任务"})
+        response = client.put(f"/api/tasks/{second_id}", json={"name": "End_To_End"})
         check("改名撞已有任务被拒绝", response.status_code == 422)
-        response = client.put(f"/api/tasks/{second_id}", json={"name": "取消测试甲"})
+        response = client.put(f"/api/tasks/{second_id}", json={"name": "Cancel_Alpha"})
         check("改回自己的名字不报错", response.status_code == 200)
+        response = client.patch(f"/api/tasks/{second_id}", json={"name": "END_TO_END"})
+        check("API 改名大小写撞名被拒绝", response.status_code == 422 and "name" in response.json()["detail"]["errors"])
+        for invalid_name in ("中文", "has space", "ABC1", "../bad", "A" * 81, "", None, False, 42, [], {}):
+            response = client.post("/api/tasks", json={"name": invalid_name, "repo_url": str(origin), "deploy_method": "release"})
+            check(f"API 新增非法名称 {invalid_name!r}", response.status_code == 422 and "name" in response.json()["detail"]["errors"])
+            response = client.patch(f"/api/tasks/{second_id}", json={"name": invalid_name})
+            check(f"API 编辑非法名称 {invalid_name!r}", response.status_code == 422 and "name" in response.json()["detail"]["errors"])
+        check("无效编辑未修改原名称", service.store.tasks.get(second_id)["name"] == "Cancel_Alpha")
+        active_id = service.store.runs.create(service.store.tasks.get(second_id))
+        original_active_check = service.store.runs.has_active_for_task
+        scheduler_lock_checks = []
+
+        def locked_active_check(task):
+            scheduler_lock_checks.append(service.scheduler._lock._is_owned())
+            return original_active_check(task)
+
+        with name_patch.object(service.store.runs, "has_active_for_task", side_effect=locked_active_check):
+            for run_status in ("queued", "running"):
+                if run_status == "running":
+                    service.store.runs.mark_running(active_id)
+                for next_name in ("Renamed_While_Active", "CANCEL_ALPHA"):
+                    response = client.patch(f"/api/tasks/{second_id}", json={"name": next_name})
+                    check(f"{run_status} 禁止改名 {next_name}", response.status_code == 409)
+                response = client.patch(f"/api/tasks/{second_id}", json={"name": "Cancel_Alpha", "description": "运行中备注"})
+                check(f"{run_status} 未改名可保存备注", response.status_code == 200)
+        check("活动任务检查在调度锁内", all(scheduler_lock_checks) and bool(scheduler_lock_checks))
+        service.store.runs.mark_finished(active_id, status="cancelled", exit_code=None)
+        response = client.patch(f"/api/tasks/{second_id}", json={"name": "CANCEL_ALPHA"})
+        check("非运行中允许仅大小写改名且主键不变", response.status_code == 200 and response.json()["task"]["id"] == second_id)
         client.delete(f"/api/tasks/{second_id}")
+
+        legacy_id = service.store.tasks.create({"name": "旧中文任务", "repo_url": str(origin), "schedule_type": "manual"})
+        for legacy_payload in ({"description": "只编辑备注"}, {"name": "旧中文任务", "description": "原样提交旧名"}):
+            response = client.patch(f"/api/tasks/{legacy_id}", json=legacy_payload)
+            check("API 旧中文名不改名兼容编辑", response.status_code == 200 and response.json()["task"]["name"] == "旧中文任务")
+        response = client.patch(f"/api/tasks/{legacy_id}", json={"name": "另一个中文名"})
+        check("API 旧名称实际改名必须合法", response.status_code == 422)
+        response = client.patch(f"/api/tasks/{legacy_id}", json={"name": "Legacy_Renamed"})
+        check("API 旧名称可改为新合法标识", response.status_code == 200 and response.json()["task"]["id"] == legacy_id)
+        client.delete(f"/api/tasks/{legacy_id}")
+
+        # 合法特殊名称的删除/清理使用同一所有权规则，保留外部或其他任务数据。
+        import shutil
+        for special_name in ("CON", "___"):
+            response = client.post("/api/tasks", json={"name": special_name, "repo_url": str(origin),
+                                   "schedule_type": "manual", "deploy_method": "release"})
+            special_task = response.json()["task"]
+            special_id = special_task["id"]
+            direct = config.WORKSPACES_DIR / special_name
+            cleaned_name = config._sanitize_dirname(special_name)
+            foreign = config.WORKSPACES_DIR / cleaned_name
+            own_suffix = config.WORKSPACES_DIR / f"{cleaned_name}-{special_id}"
+            foreign_suffix = config.WORKSPACES_DIR / f"{special_name}-{special_id}"
+            legacy_workspace = config.workspace_dir(special_id)
+            for own_path in (direct, own_suffix):
+                config._claim(own_path, special_id)
+            for foreign_path in (foreign, foreign_suffix):
+                config._claim(foreign_path, 99999)
+                (foreign_path / "keep.txt").write_text("其他任务数据", encoding="utf-8")
+            # 纯下划线的旧 sanitize 后缀恰好也是 task-id；模拟未认领旧布局。
+            (legacy_workspace / config.CLAIM_FILE).unlink(missing_ok=True)
+            (legacy_workspace / ".git").mkdir(parents=True)
+            response = client.post(f"/api/maintenance/cleanup-task/{special_id}")
+            check("清理特殊名称任务成功 " + special_name, response.status_code == 200)
+            check("清理自身新名字及历史后缀 " + special_name, not direct.exists() and not own_suffix.exists())
+            check("兼容清理真正无标记旧checkout " + special_name, not legacy_workspace.exists())
+            check("清理保留其他归属目录 " + special_name, all((p / "keep.txt").exists() for p in (foreign, foreign_suffix)))
+            for own_path in (direct, own_suffix):
+                config._claim(own_path, special_id)
+            config._claim(legacy_workspace, 99998)
+            (legacy_workspace / ".git").mkdir()
+            response = client.delete(f"/api/tasks/{special_id}")
+            check("删除特殊名称任务成功 " + special_name, response.status_code == 200)
+            check("删除清理自身新名字及历史后缀 " + special_name,
+                  not direct.exists() and (own_suffix == legacy_workspace or not own_suffix.exists()))
+            check("删除不误删其他归属目录含task-id " + special_name,
+                  all(p.exists() for p in (foreign, foreign_suffix, legacy_workspace))
+                  and config._claimed_by(legacy_workspace, 99998))
+            for fixture in (foreign, foreign_suffix, legacy_workspace):
+                shutil.rmtree(fixture)
+
+        response = client.post("/api/tasks", json={"name": "Collision_Read", "repo_url": str(origin),
+                               "schedule_type": "manual", "deploy_method": "release"})
+        collision_api_id = response.json()["task"]["id"]
+        collision_paths = [config.WORKSPACES_DIR / "Collision_Read",
+                           config.WORKSPACES_DIR / f"Collision_Read-{collision_api_id}"]
+        for path in collision_paths:
+            config._claim(path, 99997)
+        response = client.get(f"/api/tasks/{collision_api_id}")
+        check("候选双占用任务详情不500", response.status_code == 200
+              and bool(response.json()["task"].get("workspace_error"))
+              and response.json()["task"]["workspace"] == ""
+              and not response.json()["task"]["workspace_exists"])
+        response = client.get(f"/api/tasks/{collision_api_id}/preflight")
+        check("候选双占用预检不500", response.status_code == 200 and bool(response.json().get("workspace_error")))
+        response = client.get("/api/tasks")
+        check("候选双占用任务列表不500", response.status_code == 200 and any(
+            t["id"] == collision_api_id and t.get("workspace_error") for t in response.json()["tasks"]))
+        response = client.get("/api/storage")
+        check("双占用时存储统计跳过冲突任务不500", response.status_code == 200 and all(
+            row["task_id"] != collision_api_id for row in response.json()["tasks"]))
+        response = client.post("/api/maintenance/run")
+        check("双占用时维护继续执行不500", response.status_code == 200 and response.json().get("ok"))
+        check("维护不把冲突候选当孤儿删除", all(config._claimed_by(p, 99997) for p in collision_paths))
+        response = client.patch(f"/api/tasks/{collision_api_id}", json={"description": "碰撞时仍可保存备注"})
+        check("候选双占用保存备注不500", response.status_code == 200 and bool(response.json()["task"].get("workspace_error")))
+        response = client.delete(f"/api/tasks/{collision_api_id}")
+        check("候选双占用删除仅移除任务", response.status_code == 200 and all(p.exists() for p in collision_paths))
+        for path in collision_paths:
+            shutil.rmtree(path)
 
         response = client.get(f"/api/tasks/{task_id}")
         check("任务详情可读取", response.status_code == 200)
@@ -666,7 +856,7 @@ def run() -> int:
         check('API 更新期间拒绝部署回滚', response.status_code == 409)
         response = client.post('/api/system/self-update/rollback')
         check('API 更新期间拒绝自更新回滚', response.status_code == 409)
-        response = client.post('/api/tasks', json={'name': '更新中创建', 'repo_url': str(origin),
+        response = client.post('/api/tasks', json={'name': 'Created_During_Update', 'repo_url': str(origin),
             'deploy_method': 'script', 'deploy_script': 'true', 'run_on_create': True})
         check('创建后立即部署被阻止且返回警告', response.status_code == 201 and bool(response.json().get('warning')) and not response.json().get('run_id'))
         client.delete('/api/tasks/' + str(response.json()['task']['id']))
@@ -766,10 +956,10 @@ def run() -> int:
         check("导出不含令牌", "git_token" not in exported["task"])
 
         response = client.put(
-            f"/api/tasks/{task_id}", json={"name": "改名后的任务", "description": "desc"}
+            f"/api/tasks/{task_id}", json={"name": "Renamed_Task", "description": "desc"}
         )
         check("任务更新成功", response.status_code == 200)
-        check("任务名称已更新", response.json()["task"]["name"] == "改名后的任务")
+        check("任务名称已更新", response.json()["task"]["name"] == "Renamed_Task")
 
         response = client.post(f"/api/tasks/{task_id}/toggle")
         check("切换任务状态成功", response.status_code == 200)
@@ -858,7 +1048,7 @@ def run() -> int:
         cancel_task = client.post(
             "/api/tasks",
             json={
-                "name": "取消测试",
+                "name": "Cancel_Test",
                 "repo_url": str(origin),
                 "repo_branch": "main",
                 "schedule_type": "manual",
@@ -1159,6 +1349,113 @@ def run() -> int:
             mgr._save_state(dict(saved, stage='applying'))
             mgr.reconcile_on_startup()
             check('中断更新明确失败', mgr.state()['stage'] == 'failed')
+        section('旧版更新状态与备份兼容')
+        with patch.object(config, 'DATA_DIR', tmp_root / 'legacy-update-data'):
+            legacy_mgr = su.SelfUpdateManager(fake_store)
+            for stage in ('restarting', 'done', 'applying'):
+                legacy_mgr._save_state({'stage': stage, 'target_version': su.__version__, 'log': ['旧版原始日志']})
+                legacy_mgr.reconcile_on_startup()
+                migrated = legacy_mgr.state()
+                check('旧版 ' + stage + ' 不伪报成功或超时', migrated['stage'] == 'unverified'
+                      and migrated['legacy_stage'] == stage and not migrated.get('error')
+                      and not migrated.get('confirmed_operation_id'))
+                check('旧版 ' + stage + ' 保留日志且释放部署入口', migrated['log'] == ['旧版原始日志']
+                      and bool(migrated.get('notice')) and not legacy_mgr.deployment_blocked())
+                before_read = legacy_mgr.state_path.read_bytes()
+                check('兼容读取幂等 ' + stage, legacy_mgr.state() == migrated
+                      and legacy_mgr.state_path.read_bytes() == before_read)
+            legacy_mgr._save_state({'stage': 'failed', 'target_version': su.__version__,
+                                    'error': '旧机制的重启确认超时', 'log': ['sudo 被拒绝']})
+            legacy_failed = legacy_mgr.state()
+            check('旧失败保留原因并标明历史记录', legacy_failed['stage'] == 'failed'
+                  and legacy_failed['error'] == '旧机制的重启确认超时' and bool(legacy_failed.get('notice')))
+
+            modern = dict(saved)
+            modern.pop('schema_version')
+            modern['restart_deadline'] = time.time() + 60
+            legacy_mgr._save_state(modern)
+            with patch.object(su, 'PROCESS_BOOT_ID', 'compatible-boot'), \
+                    patch.object(su.os, 'getpid', return_value=os.getpid() + 102), patch.object(su, '__version__', '2.0.0'):
+                legacy_mgr.reconcile_on_startup()
+            check('无格式号的完整新协议仍严格确认', legacy_mgr.state()['stage'] == 'done'
+                  and legacy_mgr.state()['schema_version'] == su.STATE_SCHEMA_VERSION)
+            for deadline in (None, 'invalid', {}, True, float('inf')):
+                legacy_mgr._save_state(dict(saved, restart_deadline=deadline))
+                invalid_state = legacy_mgr.state()
+                check('无效重启期限明确失败 ' + str(deadline), invalid_state['stage'] == 'failed'
+                      and '有效期限' in invalid_state['error'])
+            no_deadline = dict(saved)
+            no_deadline.pop('restart_deadline')
+            legacy_mgr._save_state(no_deadline)
+            check('现代协议缺期限不得降级为旧记录', legacy_mgr.state()['stage'] == 'failed'
+                  and 'legacy_stage' not in legacy_mgr.state())
+            missing_pid = dict(saved, restart_deadline=time.time() + 60)
+            missing_pid.pop('before_pid')
+            legacy_mgr._save_state(missing_pid)
+            with patch.object(su, 'PROCESS_BOOT_ID', 'missing-pid-boot'), patch.object(su, '__version__', '2.0.0'):
+                legacy_mgr.reconcile_on_startup()
+            check('缺重启前进程身份不得确认成功', legacy_mgr.state()['stage'] == 'failed')
+            legacy_mgr._save_state({'schema_version': 999, 'stage': 'done', 'log': []})
+            unknown_bytes = legacy_mgr.state_path.read_bytes()
+            check('未知协议不确认也不改写原文件', legacy_mgr.state()['stage'] == 'unverified'
+                  and legacy_mgr.state_path.read_bytes() == unknown_bytes)
+
+            old_backup = legacy_mgr.backups_dir / '20260929011842'
+            tree(old_backup, '1.0.0')
+            old_status = legacy_mgr.backup_status()
+            check('旧备份不可证明完整性时说明原因', not old_status['can_rollback']
+                  and '缺少完成标记' in old_status['backup_notice'] and old_backup.exists())
+            expect_raises('无标记旧备份禁止自动恢复',
+                          lambda: legacy_mgr._restore_backup(install, {'backup': str(old_backup)}), RuntimeError)
+            incomplete = legacy_mgr.backups_dir / 'incomplete'
+            incomplete.mkdir()
+            check('旧备份与中断备份均不自动采用', legacy_mgr.latest_backup() is None)
+            valid_backup = legacy_mgr.backups_dir / '1770000000000000000-valid'
+            tree(valid_backup, '1.0.0')
+            (valid_backup / 'complete.json').write_text(json.dumps({'version': '1.0.0'}))
+            bad_backup = legacy_mgr.backups_dir / '9999999999999999999-bad'
+            tree(bad_backup, '3.0.0')
+            (bad_backup / 'complete.json').write_text('{broken')
+            check('损坏的新备份不遮蔽有效备份', legacy_mgr.latest_backup() == valid_backup)
+            (bad_backup / 'complete.json').write_text(json.dumps({'version': '9.0.0'}))
+            expect_raises('备份标记版本不符拒绝', lambda: legacy_mgr._validate_backup(bad_backup), RuntimeError)
+            (bad_backup / 'complete.json').write_text(json.dumps({'version': '3.0.0'}))
+            (bad_backup / 'app/main.py').unlink()
+            expect_raises('完成标记不能掩盖关键文件缺失', lambda: legacy_mgr._validate_backup(bad_backup), RuntimeError)
+            (bad_backup / 'app/main.py').write_text('')
+            (bad_backup / 'web/escape').symlink_to(tmp_root)
+            expect_raises('备份内部软链拒绝', lambda: legacy_mgr._validate_backup(bad_backup), RuntimeError)
+            (bad_backup / 'web/escape').unlink()
+            (bad_backup / 'complete.json').unlink()
+            (bad_backup / 'complete.json').symlink_to(valid_backup / 'complete.json')
+            expect_raises('备份完成标记软链拒绝', lambda: legacy_mgr._validate_backup(bad_backup), RuntimeError)
+            linked_backup = legacy_mgr.backups_dir / 'linked'
+            linked_backup.symlink_to(valid_backup, target_is_directory=True)
+            expect_raises('备份目录软链拒绝', lambda: legacy_mgr._validate_backup(linked_backup), RuntimeError)
+            expect_raises('备份根外路径拒绝', lambda: legacy_mgr._validate_backup(install), RuntimeError)
+            status = legacy_mgr.backup_status()
+            check('可用备份与被忽略旧备份同时说明', status['can_rollback']
+                  and '缺少完成标记' in status['backup_notice'] and '未通过校验' in status['backup_notice'])
+            from app.api.stats import self_update_status
+            api_status = self_update_status(service=SimpleNamespace(selfupdate=legacy_mgr), user={})
+            check('状态接口包含运行版本与备份说明', api_status['current_version'] == su.__version__
+                  and not api_status['active'] and api_status['can_rollback'] and bool(api_status['backup_notice']))
+        with patch.object(config, 'DATA_DIR', tmp_root / 'linked-backup-data'):
+            linked_mgr = su.SelfUpdateManager(fake_store)
+            linked_mgr.backups_dir.parent.mkdir(parents=True)
+            outside_backups = tmp_root / 'outside-backups'
+            outside_backups.mkdir()
+            linked_mgr.backups_dir.symlink_to(outside_backups, target_is_directory=True)
+            before_code = (install / 'app/__init__.py').read_bytes()
+            with patch.object(linked_mgr, '_restart_plan', return_value=('self-exit', 'autodeploy.service')), \
+                    patch.object(linked_mgr, '_replace') as replace_spy, \
+                    patch.object(linked_mgr, '_exit_for_restart') as exit_spy:
+                expect_raises('备份根目录软链在更新前拒绝', lambda: linked_mgr.start('v2.0.0'), RuntimeError)
+                expect_raises('备份生成也拒绝根目录软链',
+                              lambda: linked_mgr._backup(install, {'operation_id': 'test'}, lambda message: None), RuntimeError)
+                check('不安全备份位置不替换不退出不落状态', not replace_spy.called and not exit_spy.called
+                      and not linked_mgr.state_path.exists() and not list(outside_backups.iterdir())
+                      and (install / 'app/__init__.py').read_bytes() == before_code)
         check('测试绝未实际退出宿主', not hard_exit.called)
         check('重启仅调用只读 systemctl show', all(c[1] == 'show' for c in calls if c[0] == 'systemctl' and len(c) > 1))
 
@@ -1184,6 +1481,10 @@ def run() -> int:
     # Node vm 执行真实前端逻辑，不复制状态判定实现。
     frontend = safe_command(['node', str(ROOT / 'tests/selfupdate-ui.js')], timeout=30)
     check('前端更新状态回归', frontend.ok, frontend.output)
+    task_frontend = safe_command(['node', str(ROOT / 'tests/task-ui.js')], timeout=30)
+    check('前端任务名与回滚交互回归', task_frontend.ok, task_frontend.output)
+    from task_rollback_checks import run_checks as run_task_rollback_checks
+    run_task_rollback_checks(check, tmp_root)
 
     # ------------------------------------------------------------------
     section("调度器行为")
@@ -1245,25 +1546,25 @@ def run() -> int:
     check("cron 预览返回 3 项", len(preview) == 3)
     check("非法表达式预览为空", scheduler.preview("cron", "bad", 3) == [])
 
-    # 工作目录以任务名命名：同名任务通过 -<id> 后缀保证唯一。
+    # 工作目录以任务名命名；旧目录及外部占用通过认领标记隔离。
     from app import config as app_config
 
     ws_a = store2.tasks.create(
-        {"name": "命名目录任务", "repo_url": str(origin), "deploy_method": "script",
+        {"name": "Named_Workspace", "repo_url": str(origin), "deploy_method": "script",
          "deploy_script": "echo named-dir", "skip_if_no_changes": False}
     )
     # 数据库层唯一约束兜底：绕过 API 也无法创建重名任务。
     raised = False
     try:
         store2.tasks.create(
-            {"name": "命名目录任务", "repo_url": str(origin), "deploy_method": "script",
+            {"name": "Named_Workspace", "repo_url": str(origin), "deploy_method": "script",
              "deploy_script": "echo dup", "skip_if_no_changes": False}
         )
-    except sqlite3.IntegrityError:
+    except TaskNameConflict:
         raised = True
     check("数据库层拒绝重名任务", raised)
     ws_b = store2.tasks.create(
-        {"name": "命名目录任务乙", "repo_url": str(origin), "deploy_method": "script",
+        {"name": "Another_Workspace", "repo_url": str(origin), "deploy_method": "script",
          "deploy_script": "echo dup", "skip_if_no_changes": False}
     )
     dir_a = app_config.workspace_dir_for_task(store2.tasks.get(ws_a))
@@ -1280,11 +1581,108 @@ def run() -> int:
           f"{check_resolved.name}/{check_resolved2.name} vs {dir_a.name}")
     resolved_b = app_config.migrate_workspace_to_name(store2.tasks.get(ws_b))
     resolved_b2 = app_config.workspace_dir_for_task(store2.tasks.get(ws_b))
-    check("后建同名任务目录带后缀", resolved_b.name != dir_a.name and resolved_b2.name == resolved_b.name,
+    check("不同任务工作目录保持独立", resolved_b.name != dir_a.name and resolved_b2.name == resolved_b.name,
           f"{resolved_b.name}/{resolved_b2.name} vs {dir_a.name}")
     check("目录名使用任务名", "task-" not in dir_a.name.split("/")[-1] or dir_a.name.startswith("task-") is False)
     store2.tasks.delete(ws_a)
     store2.tasks.delete(ws_b)
+
+    for directory_id, valid_name in enumerate(("_", "___", "CON", "PRN", "Z" * 80), start=9000):
+        directory_task = {"id": directory_id, "name": valid_name}
+        path = app_config.workspace_dir_for_task(directory_task)
+        check("合法标识直接作为目录名 " + valid_name[:15], path.name == valid_name)
+        resolved = app_config.migrate_workspace_to_name(directory_task)
+        check("合法标识目录可创建并认领 " + valid_name[:15], resolved == path and app_config._claimed_by(path, directory_id))
+        check("合法目录位于工作区内", resolved.parent == app_config.WORKSPACES_DIR)
+        shutil.rmtree(path)
+    for directory_id, old_name in enumerate(("旧中文目录", "old-name", "CON", "___", "X" * 120), start=9100):
+        legacy_path = app_config.WORKSPACES_DIR / app_config._sanitize_dirname(old_name)
+        app_config._claim(legacy_path, directory_id)
+        marker = legacy_path / "keep.txt"
+        marker.write_text("保留旧目录", encoding="utf-8")
+        old_task = {"id": directory_id, "name": old_name}
+        check("旧目录解析兼容 " + old_name[:15], app_config.workspace_dir_for_task(old_task) == legacy_path)
+        check("旧目录不自动迁移 " + old_name[:15], app_config.migrate_workspace_to_name(old_task) == legacy_path and marker.exists())
+        shutil.rmtree(legacy_path)
+    collision_task = {"id": 9200, "name": "Owned_Workspace"}
+    foreign_dir = app_config.WORKSPACES_DIR / collision_task["name"]
+    app_config._claim(foreign_dir, 9999)
+    foreign_marker = foreign_dir / "keep.txt"
+    foreign_marker.write_text("其他任务", encoding="utf-8")
+    owned_fallback = app_config.migrate_workspace_to_name(collision_task)
+    check("名字目录被占用使用带主键后缀目录", owned_fallback.name == "Owned_Workspace-9200")
+    check("带后缀目录建立自身认领", app_config._claimed_by(owned_fallback, 9200))
+    check("不覆盖其他任务目录", foreign_marker.exists() and app_config._claimed_by(foreign_dir, 9999))
+    shutil.rmtree(foreign_dir)
+    check("原目录释放后仍使用已认领后缀目录", app_config.workspace_dir_for_task(collision_task) == owned_fallback)
+    app_config._claim(foreign_dir, 9999)
+    app_config._claim(owned_fallback, 9998)
+    expect_raises("基础和后缀目录均被占用时拒绝解析", lambda: app_config.workspace_dir_for_task(collision_task), ValueError)
+    expect_raises("迁移不覆盖被他人占用的后缀目录", lambda: app_config.migrate_workspace_to_name(collision_task), ValueError)
+    check("拒绝后保留他人认领", app_config._claimed_by(owned_fallback, 9998))
+    shutil.rmtree(foreign_dir)
+    shutil.rmtree(owned_fallback)
+    foreign_dir.symlink_to(tmp_root, target_is_directory=True)
+    check("工作区基础目录软链不被跟随", app_config.workspace_dir_for_task(collision_task) == owned_fallback)
+    foreign_dir.unlink()
+
+    unclaimed_task = {"id": 9300, "name": "Unclaimed_Workspace"}
+    unclaimed = app_config.WORKSPACES_DIR / unclaimed_task["name"]
+    unclaimed_legacy = app_config.workspace_dir(unclaimed_task["id"])
+    (unclaimed / ".git").mkdir(parents=True)
+    unclaimed_legacy.mkdir()
+    check("普通无主目录及无主名字checkout不参与清理", app_config.owned_workspace_dirs(unclaimed_task) == [])
+    (unclaimed_legacy / ".git").mkdir()
+    check("仅真正旧task-id checkout允许无标记清理", app_config.owned_workspace_dirs(unclaimed_task) == [unclaimed_legacy])
+    app_config._claim(unclaimed_legacy, 9996)
+    check("旧task-id目录有他人认领不清理", app_config.owned_workspace_dirs(unclaimed_task) == [])
+    app_config._claim(unclaimed, unclaimed_task["id"])
+    check("只收集自身认领名字目录", app_config.owned_workspace_dirs(unclaimed_task) == [unclaimed])
+    shutil.rmtree(unclaimed)
+    external_owner = tmp_root / "external-owner"
+    app_config._claim(external_owner, unclaimed_task["id"])
+    unclaimed.symlink_to(external_owner, target_is_directory=True)
+    check("清理不跟随带自身owner的外部软链", app_config.owned_workspace_dirs(unclaimed_task) == [])
+    unclaimed.unlink()
+    shutil.rmtree(unclaimed_legacy)
+
+    marker_task = {"id": 9400, "name": "Marker_Symlink"}
+    marker_base = app_config.WORKSPACES_DIR / marker_task["name"]
+    marker_base.mkdir()
+    external_marker = tmp_root / "external-marker.txt"
+    external_marker.write_text(str(marker_task["id"]), encoding="utf-8")
+    (marker_base / app_config.CLAIM_FILE).symlink_to(external_marker)
+    check("认领读取统一拒绝marker软链", not app_config._claimed_by(marker_base, marker_task["id"]))
+    marker_fallback = app_config.workspace_dir_for_task(marker_task)
+    check("marker软链不被解析为自身目录", marker_fallback.name == "Marker_Symlink-9400")
+    check("marker软链目录不参与清理", app_config.owned_workspace_dirs(marker_task) == [])
+    check("迁移选择安全后缀而不认领软链目录", app_config.migrate_workspace_to_name(marker_task) == marker_fallback)
+    check("迁移未改写外部marker", external_marker.read_text(encoding="utf-8") == "9400"
+          and (marker_base / app_config.CLAIM_FILE).is_symlink())
+    shutil.rmtree(marker_base)
+    shutil.rmtree(marker_fallback)
+
+    migration_task = {"id": 9500, "name": "Safe_Legacy_Migration"}
+    migration_old = app_config.workspace_dir(migration_task["id"])
+    migration_target = app_config.WORKSPACES_DIR / migration_task["name"]
+    migration_external = tmp_root / "legacy-external"
+    app_config._claim(migration_external, migration_task["id"])
+    migration_old.symlink_to(migration_external, target_is_directory=True)
+    expect_raises("旧task-id软链禁止迁移", lambda: app_config.migrate_workspace_to_name(migration_task), ValueError)
+    check("拒绝旧目录软链后外部数据不变", migration_old.is_symlink() and migration_external.exists() and not migration_target.exists())
+    migration_old.unlink()
+    app_config._claim(migration_old, 9995)
+    expect_raises("旧task-id他人owner禁止迁移", lambda: app_config.migrate_workspace_to_name(migration_task), ValueError)
+    check("拒绝旧目录他人owner后原目录不变", app_config._claimed_by(migration_old, 9995) and not migration_target.exists())
+    (migration_old / app_config.CLAIM_FILE).unlink()
+    (migration_old / app_config.CLAIM_FILE).symlink_to(external_marker)
+    expect_raises("旧task-id的marker软链禁止迁移", lambda: app_config.migrate_workspace_to_name(migration_task), ValueError)
+    check("拒绝marker软链后未移动旧目录", migration_old.exists() and not migration_target.exists())
+    (migration_old / app_config.CLAIM_FILE).unlink()
+    (migration_old / ".git").mkdir()
+    check("真正无标记旧checkout仍可迁移", app_config.migrate_workspace_to_name(migration_task) == migration_target
+          and not migration_old.exists() and app_config._claimed_by(migration_target, migration_task["id"]))
+    shutil.rmtree(migration_target)
 
     status = scheduler.status()
     check("调度器状态包含并发信息", "max_global_workers" in status)

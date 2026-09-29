@@ -319,7 +319,13 @@ class Scheduler:
         """
         tasks = self.store.tasks.list_all()
         known_ids = {int(task["id"]) for task in tasks}
-        known_dirs = {config.workspace_dir_for_task(task).name for task in tasks}
+        try:
+            known_dirs = {config.workspace_dir_for_task(task).name for task in tasks}
+        except ValueError:
+            # 存在归属冲突时无法完整建立保留集合；本轮不做孤儿清理，
+            # 防止把未解析出的候选目录当成孤儿删除。其他维护项正常执行。
+            logger.warning("工作目录存在归属冲突，本轮跳过孤立工作目录清理")
+            return
         known_dirs |= {f"task-{task_id}" for task_id in known_ids}
         root = config.WORKSPACES_DIR
         if not root.exists():
@@ -400,11 +406,16 @@ def workspace_summary(store: Store) -> list[dict[str, Any]]:
         except OSError:
             releases = []
         active = current_release(root, link)
-        workspace_path = config.workspace_dir_for_task(task)
+        try:
+            workspace_path = config.workspace_dir_for_task(task)
+        except ValueError:
+            # 不统计无法安全定位的目录，也不让单个任务阻断整个存储页面。
+            continue
         if not workspace_path.exists():
-            # 名字目录还不存在（尚未运行）时回退显示旧目录，避免统计为 0。
+            # 只回退到可确认归属的旧 checkout，不读取其他任务目录。
             legacy = config.workspace_dir(task_id)
-            workspace_path = legacy if legacy.exists() else workspace_path
+            if legacy in config.owned_workspace_dirs(task):
+                workspace_path = legacy
         rows.append(
             {
                 "task_id": task_id,
