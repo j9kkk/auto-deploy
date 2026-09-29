@@ -4,7 +4,11 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [1.3.6] - 2026-09-29
+
+完善网页一键更新：新进程确认目标版本后自动刷新，失败保留明确原因和日志。
+
+[发布页面](https://github.com/j9kkk/git-deploy/releases/tag/v1.3.6)
 
 ### 修复
 
