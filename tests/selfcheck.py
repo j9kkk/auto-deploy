@@ -1098,11 +1098,14 @@ def run() -> int:
         check("安装目录已更新为目标版本", '1.3.0' in installed_version)
         check("更新前备份已保留", bool(mgr.latest_backup()))
 
-        # 回滚（先把「手动重启」状态落定为本环境的终态；rollback 拒绝在
-        # 活动阶段执行，本环境无 systemd，done 即终态）
-        if mgr.state().get("stage") in _su.ACTIVE_STAGES:
-            mgr.state()["stage"] = "done"
-            mgr._save_state(mgr.state())
+        # 回滚前落定终态：CI 上 sudo 免密可用，systemd-run 会成功调度重启，
+        # stage 停在 restarting（restart=deferred）——本进程视角这已是终态。
+        # 注意 mgr.state() 每次从磁盘新读，必须改快照后再保存。
+        snap = mgr.state()
+        if snap.get("stage") in _su.ACTIVE_STAGES:
+            snap["stage"] = "done"
+            snap.setdefault("restart", snap.get("restart") or "deferred")
+            mgr._save_state(snap)
         result_rb = mgr.rollback()
         check("回滚执行成功", result_rb.get("ok") is True, str(result_rb))
         restored = (install_root / "app" / "__init__.py").read_text()
