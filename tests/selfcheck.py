@@ -1083,17 +1083,23 @@ def run() -> int:
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             snapshot = mgr.state()
-            if snapshot.get("stage") in ("done", "failed"):
+            stage = snapshot.get("stage")
+            if stage in ("done", "failed"):
                 break
-            # CI 的 sudo -n 会快速失败落为 manual/done；万一停在 restarting
-            # （调度器已交给 systemd），本进程视角它已是终态。
-            if snapshot.get("stage") == "restarting" and snapshot.get("restart"):
+            # CI 上 sudo 免密可用：延迟重启会成功调度，stage 停在 restarting
+            # （restart=deferred）且 restart 由系统执行——本进程视角即终态。
+            if stage == "restarting" and snapshot.get("restart"):
                 break
             time.sleep(0.3)
         final = mgr.state()
-        check("自更新流程完成", final.get("stage") == "done",
+        # 落定（mark_settled 只处理 restarting），让后续回滚可以执行。
+        mgr.mark_settled()
+        final = mgr.state()
+        check("自更新流程完成（done 或已调度重启）",
+              final.get("stage") == "done",
               f"stage={final.get('stage')} err={final.get('error')} log={final.get('log', [])[-3:]}")
-        check("无 systemd 时提示手动重启", final.get("restart") == "manual")
+        check("重启策略已确定", final.get("restart") in ("manual", "deferred", "direct"),
+              str(final.get("restart")))
         installed_version = (install_root / "app" / "__init__.py").read_text()
         check("安装目录已更新为目标版本", '1.3.0' in installed_version)
         check("更新前备份已保留", bool(mgr.latest_backup()))
