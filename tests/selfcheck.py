@@ -1004,6 +1004,34 @@ def run() -> int:
     check("项目名不含非法字符",
           all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in _safe_task_slug("A_b!C", 7)))
 
+    # 旧遗留容器识别：只清旧命名项目的冲突容器，不碰用户手工容器。
+    import app.deployer as _deployer_mod
+
+    conflict_out = ('Error response from daemon: Conflict. The container name "/web" '
+                    'is already in use by container "abc123"')
+    class _FakeRun:
+        def __init__(self, listing):
+            self.listing = listing
+        def __call__(self, args, **kwargs):
+            class _R:
+                ok = True
+                output = self.listing
+            return _R()
+    original_run = _deployer_mod.run_command
+    _deployer_mod.run_command = _FakeRun(
+        "web\tcom.docker.compose.project=20260929-090855-6bf1c2f2_default\n"
+        "mine\tcom.docker.compose.project=myproj\n"
+        "manual\tno-labels\n"
+        "other\tcom.docker.compose.project=autodeploy-other-9\n")
+    try:
+        picked = _deployer_mod._conflicting_stale_containers(
+            conflict_out, "autodeploy-tdcode-site-1")
+    finally:
+        _deployer_mod.run_command = original_run
+    check("识别旧命名项目的遗留容器", picked == ["web"], str(picked))
+    check("不碰其他项目的容器", "mine" not in picked)
+    check("不碰无标签的手工容器", "manual" not in picked)
+
     # ------------------------------------------------------------------
     section("一键自我更新")
 

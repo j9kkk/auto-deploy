@@ -4,6 +4,19 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.2] - 2026-09-29
+
+修复 1.3.1 项目名迁移后旧容器占用容器名的问题。
+
+### 修复
+
+- **自动清理旧部署的遗留容器**：项目名改为按任务固定后，旧命名项目
+  （项目名=发布目录）的容器仍占用服务的容器名，导致新部署报
+  `The container name "/xxx" is already in use`。现在部署遇到容器名冲突时，
+  自动识别冲突容器是否属于旧发布目录命名的 compose 项目（或有 autodeploy
+  前缀的项目），确认后移除并重试一次部署。
+  安全边界：无 compose 标签的手工容器、其他项目的容器一律不碰。
+
 ## [1.3.1] - 2026-09-29
 
 修复 Docker Compose 部署方式的一个严重资源泄漏。
@@ -189,6 +202,7 @@
   数据库仓储层、完整 API 端到端流程（含真实部署、取消、日志增量协议）与调度器行为。
 
 
+[1.3.2]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.2
 [1.3.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.1
 [1.3.0]: https://github.com/j9kkk/git-deploy/releases/tag/v1.3.0
 [1.2.1]: https://github.com/j9kkk/git-deploy/releases/tag/v1.2.1

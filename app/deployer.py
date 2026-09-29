@@ -578,6 +578,54 @@ def deploy_docker(ctx: DeployContext) -> None:
         ctx.log("未配置容器启动命令，仅完成镜像构建。")
 
 
+def _conflicting_stale_containers(output: str, project_name: str) -> list[str]:
+    """从 compose 报错中解析容器名冲突，且只认旧 autodeploy 项目的容器。
+
+    安全边界：绝不碰任何不带 autodeploy 项目标签的容器——那可能是用户
+    手工跑的业务容器。
+    """
+    import re as _re
+
+    conflicts = _re.findall(r'The container name "/([^"]+)" is already in use', output or "")
+    if not conflicts:
+        return []
+    listing = run_command(
+        ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Labels}}"],
+        timeout=30,
+    )
+    if not listing.ok:
+        return []
+    stale: list[str] = []
+    # 旧命名：项目名 = 发布目录名 = <日期>-<时间>-<短commit>[_default]。
+    # 新命名：autodeploy-<任务slug>-<id>。识别旧项目即识别这两种形态。
+    legacy_re = _re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6,8}(_\w+)?$")
+    new_re = _re.compile(r"^autodeploy-[a-z0-9-]+-[0-9]+$")
+    for line in listing.output.splitlines():
+        name, _, label = line.partition("\t")
+        labels = label or ""
+        # compose 给每个容器打 com.docker.compose.project 标签；没有标签的
+        # 容器（手工 docker run）一律不碰。
+        if "com.docker.compose.project" not in labels:
+            continue
+        project = labels.split("com.docker.compose.project=")[-1].split(",")[0].strip()
+        if project == project_name:
+            continue  # 属于本项目（compose 自己会处理）
+        if legacy_re.match(project) or new_re.match(project):
+            stale.append(name.strip())
+    # 只移除确实冲突的那几个名字。
+    return [name for name in stale if name in conflicts]
+
+
+def _remove_stale_containers(ctx: DeployContext, names: list[str]) -> bool:
+    ok_all = True
+    for name in names:
+        result = ctx.exec(["docker", "rm", "-f", name], label="compose-cleanup")
+        if not result.ok:
+            ctx.log(f"! 无法移除遗留容器 {name}: {result.error}")
+            ok_all = False
+    return ok_all
+
+
 def _safe_task_slug(name: str, task_id: Any) -> str:
     """任务名 → compose 项目名安全段：小写字母数字与短横线。"""
     import re as _re
@@ -624,6 +672,22 @@ def deploy_docker_compose(ctx: DeployContext) -> None:
         timeout=_timeout_for(ctx),
         label="compose",
     )
+    if not result.ok and not result.cancelled:
+        # 从旧命名时代（项目名=发布目录）迁移过来时，旧项目的容器还占着
+        # 服务的容器名；自动识别并清理同项目遗留容器后重试一次。
+        stale = _conflicting_stale_containers(result.output, project_name)
+        if stale:
+            ctx.log(f"! 检测到旧部署遗留容器占用容器名: {', '.join(stale)}")
+            if _remove_stale_containers(ctx, stale):
+                ctx.log("已清理遗留容器，重试部署…")
+                result = ctx.exec(
+                    [*base, "-f", compose_file, "-p", project_name,
+                     "up", "-d", "--build", "--remove-orphans"],
+                    cwd=cwd,
+                    env=env,
+                    timeout=_timeout_for(ctx),
+                    label="compose",
+                )
     if not result.ok:
         reason = "已取消" if result.cancelled else (result.error or f"退出码 {result.exit_code}")
         raise DeployError(f"docker compose 启动失败: {reason}")
