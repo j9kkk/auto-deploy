@@ -7,8 +7,8 @@
 需要 Python 3.10+ 与 git。
 
 ```bash
-git clone https://github.com/j9kkk/git-deploy.git
-cd git-deploy
+git clone https://github.com/j9kkk/auto-deploy.git
+cd auto-deploy
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -47,7 +47,7 @@ API 端到端流程（含真实部署与取消）、调度器派发行为。
 ```bash
 .venv/bin/python -m pyflakes app/ tests/     # Python
 node --check web/assets/*.js                 # JavaScript
-bash -n run.sh scripts/install.sh            # Shell
+bash -n run.sh scripts/bootstrap.sh          # Shell
 ```
 
 ## 提交规范
@@ -90,7 +90,7 @@ chore: 更新依赖版本
 | `app/runner.py` | 单次运行的流水线编排 |
 | `app/scheduler.py` | 调度循环、并发控制、数据保留 |
 | `app/service.py` | 组件装配与服务生命周期 |
-| `app/api/` | 路由：auth / tasks / runs / stats / settings |
+| `app/api/` | 路由：auth / tasks / runs / credentials / webhooks / stats / settings |
 | `web/` | 控制台前端 |
 
 新增功能时请遵循既有分层：路由只做参数校验与编排，业务逻辑落在对应模块，

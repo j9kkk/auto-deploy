@@ -206,7 +206,7 @@ async function scenario(responses) {
 }
 
 const idle = { stage: 'idle', active: false, can_rollback: false, current_version: 'v1.4.0', log: [] };
-const settings = { settings: { update_repo: 'https://github.com/j9kkk/git-deploy.git' }, proxy_description: '未启用' };
+const settings = { settings: { update_repo: 'https://github.com/j9kkk/auto-deploy.git' }, proxy_description: '未启用' };
 const noUpdate = { current: 'v1.4.0', latest: 'v1.4.0', update_available: false, error: '' };
 const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true, error: '' };
 
@@ -244,7 +244,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   await test.click('#upd-upgrade');
   assert.equal(test.confirms.length, 1, '点击升级图标必须弹二次确认');
   assert.match(test.confirms[0].title, /更新到 v1\.5\.0/);
-  assert.match(test.confirms[0].detail, /更新源：https:\/\/github\.com\/j9kkk\/git-deploy\.git/);
+  assert.match(test.confirms[0].detail, /更新源：https:\/\/github\.com\/j9kkk\/auto-deploy\.git/);
   assert.match(test.confirms[0].detail, /网络代理：未启用/);
   const start = test.requests.find(r => r.url === '/api/system/self-update');
   assert.ok(start, '确认后才发起升级');

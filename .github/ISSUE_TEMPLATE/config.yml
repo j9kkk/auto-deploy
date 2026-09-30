@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: 安全漏洞
-    url: https://github.com/j9kkk/git-deploy/security/advisories/new
+    url: https://github.com/j9kkk/auto-deploy/security/advisories/new
     about: 请勿在公开 Issue 中披露安全问题，改用私密渠道报告

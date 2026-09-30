@@ -38,7 +38,7 @@ assignees: ""
 - AutoDeploy 版本：
 - 操作系统与版本：
 - Python 版本：
-- 部署方式：直接运行 `run.sh` / systemd
+- 部署方式：Docker Compose / `run.sh`（本地开发）
 
 ## 日志
 

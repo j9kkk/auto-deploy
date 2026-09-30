@@ -10,6 +10,22 @@
 
 ## [未发布]
 
+### 变更
+
+- 部署方式收敛为 **Docker Compose**：新增 `Dockerfile`（内置 git / ssh / rsync /
+  docker CLI，非 root 运行，自带健康检查）与 `docker-compose.yml`（命名数据卷持久化，
+  固定项目名）；重写一键脚本 `scripts/bootstrap.sh`——自动安装 Docker、克隆/更新源码、
+  构建启动、健康检查并从日志提取一次性初始密码，重复执行即升级
+- 移除 systemd 安装脚本 `scripts/install.sh` 与 `scripts/uninstall.sh`；
+  应用内自更新保留给非容器环境，容器部署统一用脚本或 compose 升级
+- 仓库迁移至 `github.com/j9kkk/auto-deploy`：git remote、默认更新源、
+  CI 徽章与各文档/模板链接同步切换
+
+### 文档
+
+- README 按最新功能重写：快速开始改为 Docker Compose 一键部署，
+  新增 Webhook 触发说明，精简凭据/代理/自我更新与故障排查章节
+
 ### 新增
 
 - 任务支持 Webhook 触发方式：每个任务创建时自动生成含随机令牌的触发地址

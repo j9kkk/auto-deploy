@@ -23,7 +23,7 @@ from . import __version__
 from . import config
 from .executor import run_command
 
-UPDATE_REPO_DEFAULT = "https://github.com/j9kkk/git-deploy.git"
+UPDATE_REPO_DEFAULT = "https://github.com/j9kkk/auto-deploy.git"
 STATE_FILE_NAME = "self-update-state.json"
 HISTORY_FILE_NAME = "self-update-history.json"
 BACKUP_DIR_NAME = "self-update-backups"
@@ -416,7 +416,7 @@ class SelfUpdateManager:
             owner, name = path.split("/", 1)
             return owner, name
         except (ValueError, AttributeError):
-            return "j9kkk", "git-deploy"
+            return "j9kkk", "auto-deploy"
 
     def _fetch_latest(self) -> UpdateCheck:
         from .schedule import iso, utcnow

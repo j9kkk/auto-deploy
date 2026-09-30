@@ -19,7 +19,7 @@ from typing import Any
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 # 自我更新默认代码来源。
-UPDATE_REPO_DEFAULT = "https://github.com/j9kkk/git-deploy.git"
+UPDATE_REPO_DEFAULT = "https://github.com/j9kkk/auto-deploy.git"
 
 
 def _env_str(name: str) -> str | None:

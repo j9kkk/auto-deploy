@@ -1,0 +1,15 @@
+# 镜像只需要 app/、web/ 与 requirements.txt
+.git
+.gitignore
+.gitattributes
+.github
+.venv
+venv
+data
+tests
+deploy
+scripts
+*.md
+.env
+__pycache__/
+*.py[cod]

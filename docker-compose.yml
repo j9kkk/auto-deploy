@@ -1,0 +1,22 @@
+# AutoDeploy —— Docker Compose 部署。
+# 端口通过同目录 .env 的 AUTODEPLOY_PORT 调整（scripts/bootstrap.sh 会自动写入）。
+# 固定项目名，保证数据卷名与部署目录名无关。
+name: auto-deploy
+
+services:
+  autodeploy:
+    build: .
+    image: auto-deploy:latest
+    container_name: auto-deploy
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${AUTODEPLOY_PORT:-8770}:8770"
+    volumes:
+      - autodeploy-data:/app/data
+      # 任务需要使用「Docker / Docker Compose」部署方式时，放开下行挂载宿主机
+      # Docker socket，并按 README 为服务追加宿主机 docker 组的 group_add：
+      # - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  autodeploy-data:

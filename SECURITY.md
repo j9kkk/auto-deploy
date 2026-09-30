@@ -3,7 +3,7 @@
 ## 报告漏洞
 
 请**不要**通过公开 Issue 报告安全问题，改用 GitHub 的
-[私密漏洞报告](https://github.com/j9kkk/git-deploy/security/advisories/new)。
+[私密漏洞报告](https://github.com/j9kkk/auto-deploy/security/advisories/new)。
 
 请尽量包含：
 
@@ -25,8 +25,9 @@
 
 1. **不要将控制台直接暴露到公网。** 如确需外网访问，请置于 Nginx 之后并启用 HTTPS，
    同时叠加访问控制（如 `auth_basic`、IP 白名单或 VPN）。参考 `deploy/nginx.conf.example`。
-2. **使用独立低权限账号运行。** `scripts/install.sh` 会创建专用的 `autodeploy`
-   系统用户，并只授予重启指定 systemd 单元的 sudo 权限，请勿改为 root 运行。
+2. **使用非 root 运行。** 官方镜像内置独立的 `autodeploy` 用户运行服务；
+   挂载 Docker socket 等价于授予 root 权限，仅在确需「Docker / Docker Compose」
+   部署方式时开启，并避免将控制台暴露到公网。
 3. **启用 HTTPS 后再开启「仅通过 HTTPS 发送会话 Cookie」。** 在 HTTP 下开启该选项会导致无法登录。
 4. **为私有仓库使用最小权限令牌。** 建议使用只读（`repo:read`）的细粒度令牌，
    泄漏时影响面更小。

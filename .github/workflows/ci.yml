@@ -45,9 +45,10 @@ jobs:
       - name: Shell 语法检查
         run: |
           bash -n run.sh
-          bash -n scripts/install.sh
-          bash -n scripts/uninstall.sh
           bash -n scripts/bootstrap.sh
+
+      - name: Docker Compose 配置检查
+        run: docker compose config -q
 
       - name: 运行自检
         run: python tests/selfcheck.py

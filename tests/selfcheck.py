@@ -1526,49 +1526,52 @@ def run() -> int:
         check("退出后无法访问", response.status_code == 401)
 
     # ------------------------------------------------------------------
-    section("自我更新支持")
-    install_sh = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
-    check("install.sh 含延迟重启授权（老安装升级后可用）",
-          "systemd-run --collect --on-active=5s /usr/bin/systemctl restart" in install_sh)
-    check("install.sh 每次重写 sudoers（升级能拿到新授权）",
-          'cat > "/etc/sudoers.d/$SERVICE_NAME"' in install_sh
-          and 'if [ ! -f "/etc/sudoers.d/$SERVICE_NAME" ]' not in install_sh)
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    check("README 含自我更新章节", "## 自我更新" in readme)
+    section("部署脚本（Docker Compose 一键部署）")
+    from app.config import UPDATE_REPO_DEFAULT as config_repo_default
+    from app.selfupdate import UPDATE_REPO_DEFAULT as selfupdate_repo_default
+    check("默认更新源指向 auto-deploy 仓库",
+          config_repo_default == selfupdate_repo_default
+          == "https://github.com/j9kkk/auto-deploy.git",
+          f"{config_repo_default!r} / {selfupdate_repo_default!r}")
 
-    # ------------------------------------------------------------------
-    section("一键安装脚本")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    check("README 快速开始提供 Docker Compose 一键部署",
+          "scripts/bootstrap.sh" in readme and "docker compose up" in readme)
+
     bootstrap_sh = (ROOT / "scripts" / "bootstrap.sh").read_text(encoding="utf-8")
-    check("一键脚本把系统改动全部委托给 install.sh（升级自动继承新授权/单元）",
-          "scripts/install.sh" in bootstrap_sh)
-    check("一键脚本默认安装最新发布版本（与应用内自更新一致）",
-          "releases/latest" in bootstrap_sh and "archive/refs/tags" in bootstrap_sh)
-    check("一键脚本识别并沿用既有安装的自定义配置",
-          "WorkingDirectory=" in bootstrap_sh
-          and "AUTODEPLOY_SERVICE_NAME" in bootstrap_sh
-          and "AUTODEPLOY_PORT" in bootstrap_sh
-          and "AUTODEPLOY_INSTALL_DIR" in bootstrap_sh)
-    check("一键脚本校验压缩包完整性（损坏的下载不会半途安装）",
-          "tar -tzf" in bootstrap_sh)
-    check("一键脚本保存为文件后非 root 执行可自动提权（文件可重读）",
-          "AUTODEPLOY_ESCALATED" in bootstrap_sh and "exec sudo env" in bootstrap_sh)
-    check("一键脚本管道模式不落盘自提权（bash 增量读 stdin，落盘副本会截断）",
-          "AUTODEPLOY_SAVED_SCRIPT" not in bootstrap_sh
-          and "cat >" not in bootstrap_sh)
-    check("install.sh 随程序复制 scripts 与 README（一键安装后可就地卸载/修复）",
-          "for item in app web requirements.txt run.sh scripts README.md" in install_sh)
-    check("install.sh 校验 Python 版本（老系统一键安装时给出明确提示）",
-          "version_info >= (3, 10)" in install_sh)
-    check("install.sh 重建失效虚拟环境（系统 Python 升级后仍可一键升级）",
-          "重建虚拟环境" in install_sh
-          and 'rm -rf "${INSTALL_DIR:?}/.venv"' in install_sh)
-    for script_name in ("install.sh", "uninstall.sh", "bootstrap.sh"):
-        syntax = subprocess.run(
-            ["bash", "-n", str(ROOT / "scripts" / script_name)],
-            capture_output=True, text=True,
-        )
-        check(f"{script_name} 语法有效（bash -n）", syntax.returncode == 0,
-              syntax.stderr.strip())
+    check("一键脚本基于 Docker Compose 构建启动",
+          "docker compose" in bootstrap_sh and "up -d --build" in bootstrap_sh)
+    check("一键脚本默认使用 auto-deploy 仓库地址",
+          "https://github.com/j9kkk/auto-deploy.git" in bootstrap_sh)
+    check("一键脚本自动安装缺失的 Docker 并校验 compose 插件",
+          "get.docker.com" in bootstrap_sh and "docker compose version" in bootstrap_sh)
+    check("一键脚本重复执行即升级（已有安装原地拉取更新）",
+          "git -C" in bootstrap_sh and "reset --hard FETCH_HEAD" in bootstrap_sh)
+    check("一键脚本等待 /api/health 就绪（无人值守安装也能确认服务可用）",
+          "/api/health" in bootstrap_sh)
+    check("一键脚本从日志提取一次性初始密码", "初始密码" in bootstrap_sh)
+    check("一键脚本拉取源码自动重试（GitHub 偶发抖动）",
+          "for attempt in 1 2 3" in bootstrap_sh)
+    check("一键脚本管道模式不读取自身文件（bash 增量读 stdin，落盘副本会截断）",
+          "BASH_SOURCE" not in bootstrap_sh and "$0" not in bootstrap_sh)
+    check("已移除 systemd 安装脚本（仅保留 Docker Compose 部署方式）",
+          not (ROOT / "scripts" / "install.sh").exists()
+          and not (ROOT / "scripts" / "uninstall.sh").exists())
+
+    compose_text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    check("Compose 定义 autodeploy 服务并持久化 /app/data",
+          "autodeploy:" in compose_text and "autodeploy-data:/app/data" in compose_text)
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    check("镜像内置 git、ssh 与 docker CLI（各任务部署方式开箱可用）",
+          "git openssh-client" in dockerfile and "docker-compose-plugin" in dockerfile)
+    check("镜像以非 root 用户运行", "USER autodeploy" in dockerfile)
+    check("镜像自带健康检查", "HEALTHCHECK" in dockerfile and "/api/health" in dockerfile)
+    syntax = subprocess.run(
+        ["bash", "-n", str(ROOT / "scripts" / "bootstrap.sh")],
+        capture_output=True, text=True,
+    )
+    check("bootstrap.sh 语法有效（bash -n）", syntax.returncode == 0,
+          syntax.stderr.strip())
 
     # ------------------------------------------------------------------
     section("凭据与代理")
@@ -2098,7 +2101,7 @@ def run() -> int:
         return SimpleNamespace(ok=False, output='', error='不应被调用')
 
     proxy_settings = SimpleNamespace(
-        update_repo='https://github.com/j9kkk/git-deploy.git', proxy_enabled=True,
+        update_repo='https://github.com/j9kkk/auto-deploy.git', proxy_enabled=True,
         proxy_url='http://127.0.0.1:7897', proxy_username='', proxy_password='',
         proxy_no_proxy='localhost,127.0.0.1', proxy_for_scripts=False,
         git_timeout_seconds=30,
@@ -2130,7 +2133,7 @@ def run() -> int:
 
     with patch.object(gitops, 'check_reachable', return_value=None), \
             patch.object(gitops, 'run_command', side_effect=capture_git):
-        gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/git-deploy.git',
+        gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/auto-deploy.git',
                               tmp_dir=tmp_root / 'ls-remote-creds', timeout=30)
     check('ls-remote 使用 HTTP/1.1 抗抖配置',
           'http.version=HTTP/1.1' in captured_args.get('args', []),
@@ -2147,7 +2150,7 @@ def run() -> int:
             patch.object(gitops, 'run_command',
                          side_effect=lambda *a, **k: ran_git.append(a) or SimpleNamespace(
                              ok=True, output='', error='', exit_code=0, duration_ms=0)):
-        unreachable = gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/git-deploy.git',
+        unreachable = gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/auto-deploy.git',
                                             tmp_dir=tmp_root / 'ls-remote-unreachable', timeout=30)
     check('不可达时预检即返回原因且不启动 git',
           not unreachable.ok and '无法连接' in (unreachable.error or '') and not ran_git,
@@ -2166,7 +2169,7 @@ def run() -> int:
 
     with patch.object(gitops, 'check_reachable', return_value=None), \
             patch.object(gitops, 'run_command', side_effect=inconclusive_git):
-        after_blip = gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/git-deploy.git',
+        after_blip = gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/auto-deploy.git',
                                            tmp_dir=tmp_root / 'ls-remote-blip', timeout=30)
     check('预检无法判定时仍执行 git（不误杀）', len(inconclusive_ran) >= 1,
           f'ran={len(inconclusive_ran)}')

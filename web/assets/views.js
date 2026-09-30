@@ -3002,7 +3002,7 @@ AD.views = {};
     ctx.submitting = true;
     try {
       const settings = (ctx.settings && ctx.settings.settings) || {};
-      const repo = settings.update_repo || '默认更新源（github.com/j9kkk/git-deploy）';
+      const repo = settings.update_repo || '默认更新源（github.com/j9kkk/auto-deploy）';
       const proxy = (ctx.settings && ctx.settings.proxy_description) || '未启用';
       const confirmed = await AD.confirm({
         title: operation === 'update' ? '更新到 ' + versionText(target) : '回滚到 ' + versionText(target),
