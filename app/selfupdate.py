@@ -128,16 +128,7 @@ def _proxy_bypassed(host: str, no_proxy: str) -> bool:
     ``urllib`` 的 ``proxy_bypass`` 只读进程环境变量，而这里的代理来自应用设置，
     因此必须自己按 ``no_proxy`` 判断，否则内网更新源会被强行推过外网代理。
     """
-    host = (host or "").strip().lower()
-    if not host or not no_proxy:
-        return False
-    for entry in str(no_proxy).split(","):
-        entry = entry.strip().lower().lstrip(".")
-        if not entry:
-            continue
-        if entry == "*" or host == entry or host.endswith("." + entry):
-            return True
-    return False
+    return config.no_proxy_bypassed(host, no_proxy)
 
 
 def urlopen_with_proxy(
