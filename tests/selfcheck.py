@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -796,7 +797,6 @@ def run() -> int:
         client.delete(f"/api/tasks/{legacy_id}")
 
         # 合法特殊名称的删除/清理使用同一所有权规则，保留外部或其他任务数据。
-        import shutil
         for special_name in ("CON", "___"):
             response = client.post("/api/tasks", json={"name": special_name, "repo_url": str(origin),
                                    "schedule_type": "manual", "deploy_method": "release"})
@@ -1377,10 +1377,107 @@ def run() -> int:
                                  "username": "u", "secret": "s3cr3t", "description": ""})
     check("解码后不含 secret 明文", "secret" not in decoded and decoded["has_secret"])
     check("解码后给出密钥长度", decoded["secret_length"] == 6)
-    check("SSH 指纹可计算",
-          ssh_key_fingerprint("-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END-----").startswith("SHA256:")
-          or ssh_key_fingerprint("AAAA") == "")
     check("空私钥指纹为空", ssh_key_fingerprint("") == "")
+    check("非法私钥不产生指纹", ssh_key_fingerprint("not a key") == "")
+
+    # --- SSH 公钥推导与指纹 ---
+    # 指纹必须与 `ssh-keygen -lf` 一致，否则用户拿界面上的值和 GitHub 核对
+    # 会永远对不上（曾直接用私钥文件内容做哈希，得到的值完全不同）。
+    from app import sshkey
+
+    generated_available = bool(shutil.which("ssh-keygen"))
+    if generated_available:
+        priv_text, pub_text, fp = sshkey.generate_keypair(comment="selfcheck")
+        check("生成的私钥为 OpenSSH 格式",
+              priv_text.startswith("-----BEGIN OPENSSH PRIVATE KEY-----"))
+        check("生成的公钥为单行 ssh-ed25519", pub_text.startswith("ssh-ed25519 ") and "\n" not in pub_text)
+        check("生成时给出指纹", fp.startswith("SHA256:"))
+
+        # 从私钥推导的公钥必须与 ssh-keygen 输出逐字一致。
+        derived = sshkey.public_key_line(priv_text, "selfcheck")
+        check("公钥可由私钥复现", derived == pub_text, f"{derived!r} != {pub_text!r}")
+
+        # 指纹必须等于 ssh-keygen 对同一把钥匙算出的值。
+        import tempfile as _tempfile
+
+        with _tempfile.TemporaryDirectory() as _dir:
+            pub_path = Path(_dir) / "k.pub"
+            pub_path.write_text(pub_text + "\n", encoding="utf-8")
+            real = subprocess.run(
+                ["ssh-keygen", "-lf", str(pub_path)], capture_output=True, text=True
+            )
+        real_fp = real.stdout.split()[1] if real.returncode == 0 and real.stdout.split() else ""
+        check("指纹与 ssh-keygen 一致", real_fp == fp, f"{real_fp!r} != {fp!r}")
+
+        # 界面显示的是 store 层的 ssh_key_fingerprint，必须单独断言：
+        # 只测 sshkey.fingerprint 会漏掉 store 里另写一份实现的情形。
+        check("store 指纹与 ssh-keygen 一致",
+              ssh_key_fingerprint(priv_text) == real_fp,
+              f"{ssh_key_fingerprint(priv_text)!r} != {real_fp!r}")
+        check("解码出的指纹即 ssh-keygen 指纹",
+              decode_credential({"id": 4, "name": "n", "kind": "ssh_key",
+                                 "username": "git", "secret": priv_text,
+                                 "description": ""}).get("fingerprint") == real_fp)
+
+        # 解码时也带出公钥，但注释用的是凭据名，故只比较密钥本体。
+        decoded_key = decode_credential(
+            {"id": 2, "name": "n", "kind": "ssh_key", "username": "git",
+             "secret": priv_text, "description": ""}
+        ).get("public_key", "")
+        check("SSH 凭据解码带出公钥",
+              decoded_key.split()[:2] == pub_text.split()[:2], decoded_key)
+        check("解码结果不含私钥明文",
+              "PRIVATE KEY" not in json.dumps(
+                  decode_credential({"id": 3, "name": "n", "kind": "ssh_key",
+                                     "username": "git", "secret": priv_text, "description": ""})))
+
+        # 带口令的私钥也能推导公钥：OpenSSH 私钥里的公钥段是明文，
+        # 无需解密即可读出，因此口令不会影响公钥与指纹的展示。
+        enc_priv, enc_pub, enc_fp = None, None, None
+        with _tempfile.TemporaryDirectory() as _dir:
+            enc_path = Path(_dir) / "enc"
+            made = subprocess.run(
+                ["ssh-keygen", "-t", "ed25519", "-f", str(enc_path), "-N", "pw123", "-C", "e", "-q"],
+                capture_output=True, text=True,
+            )
+            if made.returncode == 0:
+                enc_priv = enc_path.read_text(encoding="utf-8")
+                enc_pub = (Path(_dir) / "enc.pub").read_text(encoding="utf-8").strip()
+                enc_fp = subprocess.run(
+                    ["ssh-keygen", "-lf", str(enc_path) + ".pub"], capture_output=True, text=True
+                ).stdout.split()[1]
+        if enc_priv:
+            check("带口令私钥仍可推导公钥",
+                  sshkey.public_key_line(enc_priv).split()[:2] == enc_pub.split()[:2])
+            check("带口令私钥指纹正确", sshkey.fingerprint(enc_priv) == enc_fp)
+        else:
+            check("跳过带口令私钥检查", True)
+    else:
+        check("跳过 SSH 生成检查（无 ssh-keygen）", True)
+
+    check("拒绝非私钥内容", sshkey.validate_private_key("hello") is not None)
+    check("拒绝空私钥", sshkey.validate_private_key("") is not None)
+
+    # --- 凭据获取指引（界面帮助面板的数据源）---
+    from app.api.credentials import credential_guide
+
+    guide = credential_guide(user={"username": "admin"})
+    kinds = {item["kind"] for item in guide["kinds"]}
+    check("指引覆盖两种凭据类型", kinds == {"https_token", "ssh_key"}, str(kinds))
+    check("指引说明各有适用场景",
+          all(item.get("best_for") for item in guide["kinds"]))
+    token_kind = next(i for i in guide["kinds"] if i["kind"] == "https_token")
+    ssh_kind = next(i for i in guide["kinds"] if i["kind"] == "ssh_key")
+    check("令牌指引指向细粒度令牌页",
+          "personal-access-tokens/new" in token_kind["create_url"])
+    check("令牌指引写明 Contents 只读权限",
+          any("Contents" in s for s in token_kind["steps"]))
+    check("SSH 指引指向仓库 Deploy Keys 页", "settings/keys" in ssh_kind["create_url"])
+    check("SSH 指引提示不要开启写权限",
+          any("write access" in text.lower()
+              for text in ssh_kind["notes"] + ssh_kind["steps"]))
+    check("指引每步都有内容",
+          all(item["steps"] for item in guide["kinds"]))
 
     # --- 代理 URL 与脱敏 ---
     st = Settings()
@@ -1715,6 +1812,245 @@ def run() -> int:
     with patch.object(config, 'load_settings', return_value=download_settings), patch.object(config, 'proxy_env', return_value={}):
         latest = mgr.check(force=True)
         check('真实查询识别最新标签', latest.latest == 'v2.0.0')
+
+    # ------------------------------------------------------------------
+    section('更新检查的网络路径')
+
+    import urllib.error
+    import urllib.request
+
+    from app import gitops
+
+    # 依据设置页配置的代理必须真正作用到 Releases API 这条主路径上：
+    # 之前它只传给了 git 回退，在「必须走代理才能访问 GitHub」的服务器上，
+    # 主路径永远失败，用户看到的就是「检测不到新版本」。
+    used = []
+
+    def recording_opener(*handlers):
+        # build_opener 收到的是 ProxyHandler；真正的代理 URL 在它的 proxies 里。
+        proxy_url = ''
+        for handler in handlers:
+            proxies = getattr(handler, 'proxies', None) or {}
+            proxy_url = proxies.get('https') or proxies.get('http') or ''
+        class Opener:
+            def open(self, request, timeout=None):
+                used.append(('proxy', proxy_url))
+                raise urllib.error.URLError('测试替身不应真连')
+        return Opener()
+
+    def recording_urlopen(request, timeout=None):
+        used.append(('direct', request.full_url))
+        raise urllib.error.URLError('测试替身不应真连')
+
+    def invoke(proxy):
+        used.clear()
+        with patch.object(su.urllib.request, 'build_opener', recording_opener), \
+                patch.object(su.urllib.request, 'urlopen', recording_urlopen):
+            try:
+                su.urlopen_with_proxy(
+                    su.urllib.request.Request('https://api.github.com/repos/x/y/releases/latest'),
+                    proxy, timeout=5)
+            except urllib.error.URLError:
+                pass
+        return used[0] if used else ('none', '')
+
+    check('API 主路径使用设置页配置的代理（而不是进程环境）',
+          invoke({'https_proxy': 'http://127.0.0.1:7897'}) == ('proxy', 'http://127.0.0.1:7897'))
+    check('未配置代理时直连', invoke(None) == ('direct', 'https://api.github.com/repos/x/y/releases/latest')
+          and invoke({}) == ('direct', 'https://api.github.com/repos/x/y/releases/latest'))
+    check('no_proxy 命中的主机即使配了代理也直连',
+          invoke({'https_proxy': 'http://127.0.0.1:9', 'no_proxy': 'api.github.com'})[0] == 'direct')
+    check('no_proxy 按域后缀匹配且不误伤相似域名',
+          su._proxy_bypassed('api.github.com', 'github.com') is True
+          and su._proxy_bypassed('127.0.0.1', 'localhost,127.0.0.1') is True
+          and su._proxy_bypassed('api.github.com', 'localhost,127.0.0.1') is False
+          and su._proxy_bypassed('evil-github.com', 'github.com') is False)
+
+    # git 回退必须走 gitops：才有 HTTP/1.1 抗抖配置与 GIT_TERMINAL_PROMPT=0，
+    # 否则在缺凭据时会挂在交互提示上直到超时。
+    fallback_calls = []
+    leftover_commands = []
+
+    def fake_ls_remote_tags(**kwargs):
+        fallback_calls.append(kwargs)
+        return SimpleNamespace(ok=True, output='abc\trefs/tags/v2.0.0\n', error='')
+
+    def recording_run_command(args, **kwargs):
+        leftover_commands.append(list(args))
+        return SimpleNamespace(ok=False, output='', error='不应被调用')
+
+    proxy_settings = SimpleNamespace(
+        update_repo='https://github.com/j9kkk/git-deploy.git', proxy_enabled=True,
+        proxy_url='http://127.0.0.1:7897', proxy_username='', proxy_password='',
+        proxy_no_proxy='localhost,127.0.0.1', proxy_for_scripts=False,
+        git_timeout_seconds=30,
+    )
+    with patch.object(config, 'load_settings', return_value=proxy_settings), \
+            patch.object(config, 'TMP_DIR', tmp_root / 'check-tmp'), \
+            patch.object(gitops, 'ls_remote_tags', side_effect=fake_ls_remote_tags), \
+            patch.object(su.SelfUpdateManager, '_urlopen',
+                         side_effect=urllib.error.URLError('模拟 API 不可用')), \
+            patch.object(su, 'run_command', side_effect=recording_run_command):
+        fallback = su.SelfUpdateManager(fake_store)._fetch_latest()
+    check('API 失败后回退到 gitops 标签查询',
+          fallback.latest == 'v2.0.0' and fallback.update_available and len(fallback_calls) == 1,
+          f'{fallback.latest!r} calls={len(fallback_calls)}')
+    check('回退不再自行拼 git ls-remote（避免绕过抗抖配置）',
+          not leftover_commands, str(leftover_commands))
+    check('git 回退带上设置页配置的代理',
+          fallback_calls and fallback_calls[0].get('proxy', {}).get('https_proxy') == 'http://127.0.0.1:7897',
+          str(fallback_calls))
+
+    # git 回退本身必须真的用上 _GIT_RESILIENCE_CONFIG 与 GIT_TERMINAL_PROMPT=0。
+    # 连通性预检会真开 socket，自检要求离线可跑，因此这里把它替换掉。
+    captured_args = {}
+
+    def capture_git(args, **kwargs):
+        captured_args['args'] = list(args)
+        captured_args['env'] = dict(kwargs.get('env') or {})
+        return SimpleNamespace(ok=True, output='', error='', exit_code=0, duration_ms=0)
+
+    with patch.object(gitops, 'check_reachable', return_value=None), \
+            patch.object(gitops, 'run_command', side_effect=capture_git):
+        gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/git-deploy.git',
+                              tmp_dir=tmp_root / 'ls-remote-creds', timeout=30)
+    check('ls-remote 使用 HTTP/1.1 抗抖配置',
+          'http.version=HTTP/1.1' in captured_args.get('args', []),
+          str(captured_args.get('args')))
+    check('ls-remote 禁止交互式凭据提示',
+          captured_args.get('env', {}).get('GIT_TERMINAL_PROMPT') == '0',
+          str(captured_args.get('env')))
+    check('ls-remote 仍是只读查询',
+          'ls-remote' in captured_args.get('args', [])
+          and '--tags' in captured_args.get('args', []))
+    # 不可达时应在预检阶段就返回可读原因，而不是干等完整的 ls-remote 超时。
+    ran_git = []
+    with patch.object(gitops, 'check_reachable', return_value='无法连接 github.com:443（超时）'), \
+            patch.object(gitops, 'run_command',
+                         side_effect=lambda *a, **k: ran_git.append(a) or SimpleNamespace(
+                             ok=True, output='', error='', exit_code=0, duration_ms=0)):
+        unreachable = gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/git-deploy.git',
+                                            tmp_dir=tmp_root / 'ls-remote-unreachable', timeout=30)
+    check('不可达时预检即返回原因且不启动 git',
+          not unreachable.ok and '无法连接' in (unreachable.error or '') and not ran_git,
+          f'{unreachable.error!r} ran_git={bool(ran_git)}')
+
+    # 失败结果不得进入 10 分钟缓存：否则界面会持续显示「检查失败」，
+    # 用户点多少次都只是拿到同一个缓存的错误。
+    flaky = {'count': 0}
+
+    def flaky_fetch(self):
+        flaky['count'] += 1
+        if flaky['count'] == 1:
+            return su.UpdateCheck('1.0.0', '', False, '', error='网络暂时不可用')
+        return su.UpdateCheck('1.0.0', 'v2.0.0', True, '')
+
+    cache_mgr = su.SelfUpdateManager(fake_store)
+    with patch.object(su.SelfUpdateManager, '_fetch_latest', flaky_fetch):
+        first = cache_mgr.check()
+        second = cache_mgr.check()
+    check('失败结果不缓存，重试可立即恢复',
+          first.error and not second.error and flaky['count'] == 2, str(flaky))
+    with patch.object(su.SelfUpdateManager, '_fetch_latest', flaky_fetch):
+        third = cache_mgr.check()
+        fourth = cache_mgr.check()
+    check('成功结果仍按 TTL 缓存（不再重复请求）',
+          flaky['count'] == 2 and third.latest == fourth.latest == 'v2.0.0', str(flaky))
+
+    # ------------------------------------------------------------------
+    section('更新历史与按版本回滚')
+
+    with patch.object(config, 'DATA_DIR', tmp_root / 'history-data'):
+        history_mgr = su.SelfUpdateManager(fake_store)
+        check('无记录时历史为空且备份清单为空',
+              history_mgr.history() == [] and history_mgr.backups() == []
+              and history_mgr.backup_for_version('1.0.0') is None)
+        history_mgr._save_state(dict(saved, operation='update', operation_id='op-a', stage='restarting',
+                                     target_version='2.0.0', previous_version='1.0.0', backup_version='1.0.0',
+                                     log=['[10:00:00] 下载中'], error=''))
+        history_mgr.reconcile_on_startup()   # 进程/版本对不上 → 落定为失败并写入历史
+        entries = history_mgr.history()
+        check('终态历史记录包含日志与最终结果',
+              len(entries) == 1 and entries[0]['operation_id'] == 'op-a'
+              and entries[0]['stage'] == 'failed' and entries[0]['error']
+              and entries[0]['log'][0] == '[10:00:00] 下载中'
+              and entries[0]['backup_version'] == '1.0.0'
+              and entries[0]['previous_version'] == '1.0.0',
+              str(entries))
+        history_mgr.reconcile_on_startup()
+        check('同一 operation_id 不重复写入历史', len(history_mgr.history()) == 1)
+        check('历史不含服务器路径与代币字段',
+              'backup' not in entries[0] and 'path' not in entries[0])
+        # 不同操作各留一条（新的在前）：只保留最新一条会让「升级日志」变成单条。
+        history_mgr._save_state(dict(saved, operation='update', operation_id='op-c', stage='restarting',
+                                     target_version='3.0.0', previous_version='2.0.0', backup_version='2.0.0',
+                                     log=['[12:00:00] 第二次更新'], error=''))
+        history_mgr.reconcile_on_startup()
+        kept = [item['operation_id'] for item in history_mgr.history()]
+        check('多次操作全部保留且新的在前', kept == ['op-c', 'op-a'], str(kept))
+        check('历史记录保留各自日志',
+              history_mgr.history()[0]['log'][0] == '[12:00:00] 第二次更新', str(history_mgr.history()))
+
+        # 按版本回滚只在通过校验的备份里查找，界面传进来的值不能越界。
+        for name, version in (('2026010100000000000-a', '1.0.0'), ('2026010200000000000-b', '1.1.0')):
+            backup = history_mgr.backups_dir / name
+            tree(backup, version)
+            (backup / 'complete.json').write_text(json.dumps({'version': version}))
+        legacy = history_mgr.backups_dir / 'legacy-no-marker'
+        tree(legacy, '0.9.0')
+        listed = {item['version'] for item in history_mgr.backups()}
+        check('备份清单只含通过校验的版本', listed == {'1.0.0', '1.1.0'}, str(listed))
+        check('按版本找到对应备份',
+              history_mgr.backup_for_version('v1.0.0').name == '2026010100000000000-a'
+              and history_mgr.backup_for_version('1.9.9') is None)
+        check('备份清单不含路径', all('path' not in item for item in history_mgr.backups()))
+        # 版本号校验发生在 _preflight 之后，因此必须让预检通过才能真正走到它；
+        # 否则这些「拒绝」会全部由预检报错顶掉，校验逻辑本身没被测到。
+        with patch.object(history_mgr, '_preflight', return_value='autodeploy.service'):
+            expect_raises('按版本回滚拒绝非法版本号',
+                          lambda: history_mgr.rollback('../../etc'), RuntimeError)
+            expect_raises('按版本回滚拒绝不存在的版本',
+                          lambda: history_mgr.rollback('9.9.9'), RuntimeError)
+            expect_raises('按版本回滚不能指向未校验的备份',
+                          lambda: history_mgr.rollback('0.9.0'), RuntimeError)
+            # 非法版本号必须在查备份目录之前就被挡下：否则形如 1.0.0/../x 的输入
+            # 会先进入目录查找逻辑，安全就只剩「恰好查不到」这一层运气。
+            try:
+                history_mgr.rollback('1.0.0/../../etc')
+                version_guard = ''
+            except RuntimeError as exc:
+                version_guard = str(exc)
+            check('非法版本号在版本校验层被拒绝（而非查不到备份）',
+                  '无效' in version_guard, repr(version_guard))
+
+    api_history_seen = {}
+    with patch.object(config, 'DATA_DIR', tmp_root / 'history-api-data'):
+        api_mgr = su.SelfUpdateManager(fake_store)
+        # 走真实确认路径：重启后进程身份与版本都对齐 → 落定为成功并写入历史。
+        # target/expected 必须与被 patch 的 __version__ 一致，才是「确认成功」。
+        api_mgr._save_state(dict(saved, operation='rollback', operation_id='op-b', stage='restarting',
+                                 target_version='2.0.0', expected_version='2.0.0',
+                                 version='2.0.0', previous_version='1.0.0', backup_version='1.0.0',
+                                 log=['[11:00:00] 回滚完成'], error=''))
+        with patch.object(su, 'PROCESS_BOOT_ID', 'api-boot'), \
+                patch.object(su.os, 'getpid', return_value=os.getpid() + 500), \
+                patch.object(su, '__version__', '2.0.0'):
+            api_mgr.reconcile_on_startup()
+            confirmed_state = api_mgr.state()
+            from app.api.stats import self_update_history
+            api_history_seen = self_update_history(service=SimpleNamespace(selfupdate=api_mgr), user={})
+        entry = (api_history_seen['entries'] or [{}])[0]
+        check('确认成功后历史记录标为完成且无错误',
+              confirmed_state['stage'] == 'done' and entry.get('operation_id') == 'op-b'
+              and entry.get('stage') == 'done' and entry.get('operation') == 'rollback'
+              and not entry.get('error') and entry.get('log'),
+              str(api_history_seen)[:300])
+        check('历史接口同时返回运行版本与备份清单（均无路径）',
+              api_history_seen['backups'] == []
+              and api_history_seen['current_version'] == su.normalize_tag(su.__version__)
+              and 'path' not in json.dumps(api_history_seen, ensure_ascii=False)
+              and 'backup"' not in json.dumps(api_history_seen, ensure_ascii=False),
+              str(api_history_seen)[:300])
 
     # Node vm 执行真实前端逻辑，不复制状态判定实现。
     frontend = safe_command(['node', str(ROOT / 'tests/selfupdate-ui.js')], timeout=30)

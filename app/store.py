@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from . import sshkey
 from .db import Database, decode_run, decode_task, encode_env_vars
 from .schedule import iso, utcnow
 
@@ -195,30 +196,21 @@ def decode_credential(row: dict[str, Any] | None) -> dict[str, Any] | None:
     secret = item.pop("secret", "") or ""
     item["has_secret"] = bool(secret)
     item["secret_length"] = len(secret)
-    # SSH 私钥的公开指纹（用于在界面上辨认是哪把钥匙）。
+    # SSH 私钥的公开信息：指纹用于辨认是哪把钥匙，公钥供用户重新配置
+    # GitHub Deploy Key 时复制。两者都不属于机密，可以安全返回前端。
     if item.get("kind") == "ssh_key" and secret:
         item["fingerprint"] = ssh_key_fingerprint(secret)
+        item["public_key"] = sshkey.public_key_line(secret)
     return item
 
 
 def ssh_key_fingerprint(private_key: str) -> str:
-    """计算 SSH 公钥指纹，避免把私钥内容泄露给前端。"""
-    import base64
-    import hashlib
+    """计算 SSH 公钥指纹，避免把私钥内容泄露给前端。
 
-    lines = [
-        line.strip()
-        for line in (private_key or "").splitlines()
-        if line.strip() and not line.startswith("-----")
-    ]
-    if not lines:
-        return ""
-    try:
-        blob = base64.b64decode("".join(lines), validate=False)
-    except (ValueError, TypeError):
-        return ""
-    digest = hashlib.sha256(blob).digest()
-    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+    实现见 :mod:`app.sshkey`：必须对公钥块取摘要，直接用私钥文件内容哈希
+    会得到与 ``ssh-keygen -lf`` / GitHub 完全不同的值。
+    """
+    return sshkey.fingerprint(private_key)
 
 
 class CredentialRepository:

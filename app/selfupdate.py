@@ -9,9 +9,11 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,10 +25,12 @@ from .executor import run_command
 
 UPDATE_REPO_DEFAULT = "https://github.com/j9kkk/git-deploy.git"
 STATE_FILE_NAME = "self-update-state.json"
+HISTORY_FILE_NAME = "self-update-history.json"
 BACKUP_DIR_NAME = "self-update-backups"
 CHECK_TTL_SECONDS = 600
 RESTART_TIMEOUT = 120
 STATE_SCHEMA_VERSION = 2
+HISTORY_LIMIT = 20
 PROCESS_BOOT_ID = uuid.uuid4().hex
 
 # 与部署脚本同一套产物：这些路径构成一次完整的程序更新。
@@ -94,6 +98,75 @@ class UpdateCheck:
         }
 
 
+def _tmp_root() -> Path:
+    """A writable directory for throwaway files, even before the first deploy."""
+    try:
+        config.TMP_DIR.mkdir(parents=True, exist_ok=True)
+        return config.TMP_DIR
+    except OSError:
+        return Path(tempfile.gettempdir())
+
+
+def _dir_size(path: Path) -> int:
+    """Total bytes of a directory tree, ignoring anything unreadable."""
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            try:
+                if child.is_file() and not child.is_symlink():
+                    total += child.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return total
+    return total
+
+
+def _proxy_bypassed(host: str, no_proxy: str) -> bool:
+    """``no_proxy`` 是否覆盖该主机。
+
+    ``urllib`` 的 ``proxy_bypass`` 只读进程环境变量，而这里的代理来自应用设置，
+    因此必须自己按 ``no_proxy`` 判断，否则内网更新源会被强行推过外网代理。
+    """
+    host = (host or "").strip().lower()
+    if not host or not no_proxy:
+        return False
+    for entry in str(no_proxy).split(","):
+        entry = entry.strip().lower().lstrip(".")
+        if not entry:
+            continue
+        if entry == "*" or host == entry or host.endswith("." + entry):
+            return True
+    return False
+
+
+def urlopen_with_proxy(
+    request: urllib.request.Request,
+    proxy: dict[str, str] | None,
+    *,
+    timeout: float,
+) -> Any:
+    """按应用设置打开 URL：显式使用配置的代理，并尊重 no_proxy。
+
+    默认的 ``urllib.request.urlopen`` 只看进程环境变量，因此「设置页里配好的
+    代理」对更新检查完全不起作用——在必须走代理才能访问 GitHub 的服务器上，
+    Releases API 这条主路径会直接失败。这里把代理显式装进 opener。
+    """
+    if not proxy:
+        return urllib.request.urlopen(request, timeout=timeout)
+    url = proxy.get("https_proxy") or proxy.get("http_proxy") or ""
+    no_proxy = proxy.get("no_proxy") or proxy.get("NO_PROXY") or ""
+    host = urllib.parse.urlsplit(request.full_url).hostname or ""
+    if not url or _proxy_bypassed(host, no_proxy):
+        return urllib.request.urlopen(request, timeout=timeout)
+    # socks5 代理 urllib 原生不支持，会直接报错并回退到 git 协议查询；
+    # 这里不做特殊处理，避免引入标准库之外的依赖。
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": url, "https": url})
+    )
+    return opener.open(request, timeout=timeout)
+
+
 class SelfUpdateManager:
     """内置自我更新的状态机与执行器。"""
 
@@ -102,6 +175,9 @@ class SelfUpdateManager:
         self._lock = gate or threading.RLock()
         self._thread: threading.Thread | None = None
         self._check_cache: tuple[float, UpdateCheck] | None = None
+
+    def _urlopen(self, request: urllib.request.Request, proxy: dict[str, str] | None, *, timeout: float) -> Any:
+        return urlopen_with_proxy(request, proxy, timeout=timeout)
 
     # ------------------------------------------------------------- 状态
     @property
@@ -163,6 +239,52 @@ class SelfUpdateManager:
     def _log(self, state: dict[str, Any], message: str) -> None:
         state.setdefault("log", []).append(f"[{time.strftime('%H:%M:%S')}] {message}")
         state["log"] = state["log"][-200:]
+
+    # ------------------------------------------------------------- 历史
+    @property
+    def history_path(self) -> Path:
+        return config.DATA_DIR / HISTORY_FILE_NAME
+
+    def history(self) -> list[dict[str, Any]]:
+        """历次更新/回滚记录（新→旧）。
+
+        每次操作结束（成功、失败或确认）时落一条，供界面展示「每次升级的日志」
+        并按版本回滚。记录只保留可展示字段与日志，不含路径或代币。
+        """
+        try:
+            data = json.loads(self.history_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return []
+        return [item for item in entries if isinstance(item, dict)]
+
+    def _append_history(self, state: dict[str, Any]) -> None:
+        """把一次操作的结果追加到历史；同一 operation_id 只保留最新一条。"""
+        operation_id = str(state.get("operation_id") or "")
+        if not operation_id:
+            return
+        entry = {
+            "operation_id": operation_id,
+            "operation": str(state.get("operation") or "update"),
+            "stage": str(state.get("stage") or ""),
+            "target_version": normalize_tag(str(state.get("target_version") or "")),
+            "previous_version": normalize_tag(str(state.get("previous_version") or "")),
+            "current_version": normalize_tag(str(state.get("version") or __version__)),
+            "backup_version": normalize_tag(str(state.get("backup_version") or state.get("previous_version") or "")),
+            "started_at": state.get("started_at") or 0,
+            "finished_at": time.time(),
+            "error": str(state.get("error") or ""),
+            "log": list(state.get("log") or [])[-200:],
+        }
+        entries = [item for item in self.history() if item.get("operation_id") != operation_id]
+        entries.insert(0, entry)
+        payload = {"entries": entries[:HISTORY_LIMIT]}
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = self.history_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.history_path)
 
     @property
     def backups_dir(self) -> Path:
@@ -232,9 +354,56 @@ class SelfUpdateManager:
         backup, notice = self._available_backup()
         return {"can_rollback": backup is not None, "backup_notice": notice}
 
+    def _valid_backups(self) -> list[tuple[Path, str, float]]:
+        """所有通过校验的备份，按时间从新到旧：``(路径, 版本, mtime)``。
+
+        与 ``_available_backup`` 用同一套校验（完成标记 + 结构 + 版本），
+        因此历史列表里的回滚目标和「回滚上一版本」可信度一致。
+        """
+        if self.backups_dir.is_symlink() or not self.backups_dir.is_dir():
+            return []
+        try:
+            entries = sorted(
+                self.backups_dir.iterdir(), key=lambda p: p.lstat().st_mtime_ns, reverse=True
+            )
+        except OSError:
+            return []
+        found: list[tuple[Path, str, float]] = []
+        for entry in entries:
+            try:
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                marker = entry / "complete.json"
+                if not marker.exists() or marker.is_symlink():
+                    continue
+                version = self._validate_backup(entry)
+                found.append((entry, version, entry.lstat().st_mtime))
+            except (RuntimeError, OSError):
+                continue
+        return found
+
+    def backup_for_version(self, version: str) -> Path | None:
+        """按版本号查一个可回滚的备份；查不到返回 None。"""
+        wanted = normalize_tag(version)
+        for path, backed_up, _ in self._valid_backups():
+            if normalize_tag(backed_up) == wanted:
+                return path
+        return None
+
+    def backups(self) -> list[dict[str, Any]]:
+        """界面用的备份清单（不含路径，避免把服务器目录结构暴露成接口契约）。"""
+        return [
+            {"version": normalize_tag(version), "created_at": created, "size": _dir_size(path)}
+            for path, version, created in self._valid_backups()
+        ]
+
     # ------------------------------------------------------------- 检查
     def check(self, *, force: bool = False) -> UpdateCheck:
-        """查询最新版本。结果缓存 10 分钟，避免频繁请求 GitHub API。"""
+        """查询最新版本。成功结果缓存 10 分钟，避免频繁请求 GitHub API。
+
+        **失败结果不缓存**：把一次网络抖动缓存十分钟，会让界面持续显示
+        「检查失败」，用户点多少次都没用，只能等缓存过期。失败必须即时可见。
+        """
         with self._lock:
             if not force and self._check_cache is not None:
                 cached_at, cached = self._check_cache
@@ -242,7 +411,7 @@ class SelfUpdateManager:
                     return cached
 
         result = self._fetch_latest()
-        self._check_cache = (time.monotonic(), result)
+        self._check_cache = None if result.error else (time.monotonic(), result)
         return result
 
     def _repo_slug(self) -> tuple[str, str]:
@@ -265,6 +434,7 @@ class SelfUpdateManager:
         current = __version__
         settings = config.load_settings()
         repo = (settings.update_repo or UPDATE_REPO_DEFAULT).strip()
+        proxy = config.proxy_env(settings)
 
         # GitHub 仓库优先用 Releases API；失败（限流/内网镜像）则回退到
         # git ls-remote --tags，两者都不通才报错。
@@ -275,7 +445,7 @@ class SelfUpdateManager:
                 api, headers={"Accept": "application/vnd.github+json", "User-Agent": "AutoDeploy"}
             )
             try:
-                with urllib.request.urlopen(request, timeout=15) as response:
+                with self._urlopen(request, proxy, timeout=15) as response:
                     payload = json.load(response)
                 latest = str(payload.get("tag_name") or "").strip()
                 if latest:
@@ -290,12 +460,13 @@ class SelfUpdateManager:
                 pass  # 回退到 git 协议查询
 
         # git ls-remote --tags：不依赖 API，且对镜像/私有副本同样有效。
-        proxy = config.proxy_env(settings)
-        env = {**os.environ, **proxy}
-        result = run_command(
-            ["git", "ls-remote", "--tags", "--", repo],
-            env=env, timeout=30,
-        )
+        # 必须复用 gitops 的环境构造，才能带上 HTTP/1.1 等抗抖配置与代理。
+        from . import gitops
+
+        with tempfile.TemporaryDirectory(prefix="update-check-", dir=_tmp_root()) as tmp:
+            result = gitops.ls_remote_tags(
+                repo_url=repo, tmp_dir=Path(tmp), timeout=30, proxy=proxy
+            )
         if not result.ok:
             return UpdateCheck(
                 current=current, latest="", update_available=False,
@@ -441,6 +612,7 @@ class SelfUpdateManager:
         (backup / "complete.json").write_text(json.dumps({"version": version}))
         self._validate_backup(backup)
         state["backup"] = str(backup)
+        state["backup_version"] = version
         log("已备份程序代码；不包含数据库和 Python 依赖，不能保证降级兼容")
         return backup
 
@@ -491,6 +663,7 @@ class SelfUpdateManager:
         state.update(stage="failed", error=error)
         self._log(state, error)
         self._save_state(state)
+        self._append_history(state)
 
     def _download(self, target, tmp_root, settings, log, state):
         from . import gitops
@@ -544,14 +717,28 @@ class SelfUpdateManager:
             os._exit(0)
         threading.Thread(target=exit_later, daemon=True).start()
 
-    def rollback(self):
+    def rollback(self, target_version: str | None = None):
+        """回滚到指定版本的备份；不指定则回滚最近一份可用备份。
+
+        指定版本时只在**通过校验的备份**里按版本号查找（清单来自
+        ``_valid_backups``，不接受任何路径），因此界面传入的值无法越界或
+        指向备份目录之外的代码。
+        """
         with self._lock:
             if self.deployment_blocked():
                 raise RuntimeError("更新或回滚正在进行，无法重复操作")
             service = self._preflight()
-            backup = self.latest_backup()
-            if backup is None:
-                raise RuntimeError("没有可用的代码备份")
+            if target_version:
+                wanted = str(target_version).strip()
+                if not re.fullmatch(r"[vV]?\d+(?:\.\d+){1,3}(?:-[A-Za-z0-9.-]+)?", wanted):
+                    raise RuntimeError("回滚目标版本号无效")
+                backup = self.backup_for_version(wanted)
+                if backup is None:
+                    raise RuntimeError(f"没有版本 {normalize_tag(wanted)} 的可用代码备份")
+            else:
+                backup = self.latest_backup()
+                if backup is None:
+                    raise RuntimeError("没有可用的代码备份")
             version = self._validate_backup(backup)
             state = self._new_state("rollback", version, service)
             self._save_state(state)
@@ -591,6 +778,9 @@ class SelfUpdateManager:
                 state.update(stage="failed", error="更新或回滚中断，或启动版本/进程与预期不符；未确认成功")
                 self._log(state, state["error"])
             self._save_state(state)
+            # 只有这里（重启后确认/落定为失败）才是操作的终态，历史在此写入，
+            # 使「升级日志」里的每条记录都带最终结果而不是中途状态。
+            self._append_history(state)
 
 
 def sys_executable() -> str:
