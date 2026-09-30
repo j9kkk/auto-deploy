@@ -11,8 +11,10 @@ fast instead of hanging on an interactive prompt until the task times out.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
+import socket
 import stat
 import tempfile
 import time
@@ -20,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from . import config
 from .executor import CommandResult, run_command
 
 # Schemes a repository URL may use.  Plain paths and file:// are permitted: an
@@ -324,6 +327,18 @@ def _credential_hint(output: str) -> str:
     return ""
 
 
+def _network_hint(output: str) -> str:
+    """把 git 的域名解析失败翻译成可操作提示。
+
+    解析失败可能只是瞬时抖动（重试即可通），因此不给「不可达」的结论，
+    只说明这次没解析成功以及该检查什么，避免运维按错误方向排查。
+    """
+    lowered = (output or "").lower()
+    if "could not resolve host" in lowered or "name resolution" in lowered:
+        return "域名解析失败：可能是 DNS 临时抖动（可重试）或服务器 DNS 配置有误"
+    return ""
+
+
 def _split_host_port(repo_url: str) -> tuple[str, int] | None:
     """Extract ``(host, port)`` from an http(s) URL for a reachability probe."""
     from urllib.parse import urlparse
@@ -340,56 +355,101 @@ def _split_host_port(repo_url: str) -> tuple[str, int] | None:
     return host, (parsed.port or (443 if parsed.scheme == "https" else 80))
 
 
+# 域名解析类错误：有些是「临时」失败（DNS 抖动、上游解析器过载），git 自己
+# 会重试就能通；把它们当成确定不可达，会让一次解析抖动直接终止整个检查。
+# 这些常量并非所有平台都有（Windows 缺 EAI_NODATA），故用 getattr 取值，
+# 避免模块导入期就 AttributeError。
+_TRANSIENT_DNS_ERRNOS = tuple(
+    value
+    for value in (
+        getattr(socket, "EAI_AGAIN", None),
+        getattr(socket, "EAI_FAIL", None),
+        getattr(socket, "EAI_NODATA", None),
+    )
+    if value is not None
+)
+
+
+def _probe_is_conclusive(exc: OSError) -> bool:
+    """该探测异常是否足以判定「不可达」。
+
+    ``EAI_AGAIN`` 之类的临时解析失败按语义就是「稍后重试即可」，git 自己会重试；
+    把这类失败当作确定不可达，一次 DNS 抖动就会终止整个更新检查或部署，
+    而运维在服务器上手动访问却一切正常——这正是需要避免的误杀。
+    """
+    if isinstance(exc, socket.gaierror):
+        return getattr(exc, "errno", None) not in _TRANSIENT_DNS_ERRNOS
+    if isinstance(exc, socket.timeout):
+        return True
+    return getattr(exc, "errno", None) in (
+        errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH,
+    )
+
+
+def _probe_failure_message(host: str, port: int, exc: OSError, *, via_proxy: bool = False) -> str | None:
+    """把探测异常翻译成可读原因；``None`` 表示不应据此判定不可达。
+
+    ``via_proxy`` 表示被探测的是代理而非目标主机，用于给出准确的措辞。
+    """
+    if not _probe_is_conclusive(exc):
+        return None
+    who = "代理" if via_proxy else "主机"
+    if isinstance(exc, socket.gaierror):
+        return f"无法解析{who}名 {host}（{exc.strerror or exc}）"
+    if isinstance(exc, socket.timeout):
+        return f"连接{who} {host}:{port} 超时，请检查网络或代理设置"
+    tail = "，请检查代理设置" if via_proxy else ""
+    return f"无法连接{who} {host}:{port}（{exc.strerror or exc}）{tail}"
+
+
 def check_reachable(
     repo_url: str,
     *,
     timeout: float = 8.0,
     proxy_url: str = "",
+    no_proxy: str = "",
 ) -> str | None:
     """探测远端是否可达。
 
-    返回 ``None`` 表示可达（或该地址不适用探测），否则返回可读的错误信息。
+    返回 ``None`` 表示可达、该地址不适用探测，或失败原因**不确定**
+    （例如临时 DNS 抖动）——后两种都应交由 git 自己去尝试并重试，
+    预检只负责拦下**确定**不可达的情况，避免误杀。
 
     **代理场景**：配置了代理时必须探测代理本身，而不是直连目标主机——
     否则内网环境里直连必然失败，会把「走代理能通」的仓库误判为不可达，
-    导致部署在连通性预检阶段就被中止。
+    导致部署在连通性预检阶段就被中止。``no_proxy`` 命中的主机则相反，
+    必须直连探测，否则又会在代理不可用时误报。
     """
     target = _split_host_port(repo_url)
     if target is None:
         return None
     host, port = target
 
-    if proxy_url:
+    # 应用设置里的代理优先；没配则回退到进程环境（git 同样会读它）。
+    effective_proxy = (proxy_url or "").strip() or config.env_proxy_url()
+    bypass = (no_proxy or "").strip() or config.env_no_proxy()
+    if effective_proxy and not config.no_proxy_bypassed(host, bypass):
         from urllib.parse import urlparse
 
         try:
-            parsed = urlparse(proxy_url)
+            parsed = urlparse(effective_proxy)
         except ValueError:
-            return f"代理地址无法解析: {proxy_url}"
+            return f"代理地址无法解析: {effective_proxy}"
         proxy_host = parsed.hostname
         if proxy_host:
             proxy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            import socket
-
             try:
                 with socket.create_connection((proxy_host, proxy_port), timeout=timeout):
                     # 代理可达即认为可继续：目标主机由代理去连。
                     return None
             except OSError as exc:
-                return (
-                    f"代理 {proxy_host}:{proxy_port} 无法连接"
-                    f"（{exc.strerror or exc}），请检查代理设置"
-                )
-
-    import socket
+                return _probe_failure_message(proxy_host, proxy_port, exc, via_proxy=True)
 
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return None
-    except socket.timeout:
-        return f"连接 {host}:{port} 超时，请检查网络或代理设置"
     except OSError as exc:
-        return f"无法连接 {host}:{port}（{exc.strerror or exc}）"
+        return _probe_failure_message(host, port, exc)
 
 
 def _run_git(
@@ -481,7 +541,9 @@ def sync_checkout(
     # Fail fast when the remote host is unreachable. Without this check, an
     # unreachable GitHub costs three ~75s TCP timeouts before the run fails.
     # 走代理时探测代理本身（见 check_reachable 的说明）。
-    unreachable = check_reachable(repo_url, proxy_url=_proxy_url_of(proxy))
+    unreachable = check_reachable(
+        repo_url, proxy_url=_proxy_url_of(proxy), no_proxy=_no_proxy_of(proxy)
+    )
     if unreachable:
         raise GitError(unreachable)
 
@@ -526,7 +588,7 @@ def sync_checkout(
             # git's raw output.
             if "Remote branch" in result.output and "not found" in result.output:
                 raise GitError(f"远程分支 {branch!r} 不存在")
-            hint = _credential_hint(result.output)
+            hint = _credential_hint(result.output) or _network_hint(result.output)
             if hint:
                 raise GitError(hint)
             raise GitError(result.error or "git clone 失败")
@@ -554,7 +616,7 @@ def sync_checkout(
             retry_budget_seconds=timeout,
         )
         if not result.ok:
-            hint = _credential_hint(result.output)
+            hint = _credential_hint(result.output) or _network_hint(result.output)
             if hint:
                 raise GitError(hint)
             raise GitError(result.error or "git fetch 失败")
@@ -716,7 +778,17 @@ def _proxy_url_of(proxy: Mapping[str, str] | None) -> str:
     """从代理环境变量里取出 URL，供连通性探测使用。"""
     if not proxy:
         return ""
-    return str(proxy.get("https_proxy") or proxy.get("http_proxy") or "")
+    return str(
+        proxy.get("https_proxy") or proxy.get("http_proxy")
+        or proxy.get("HTTPS_PROXY") or proxy.get("HTTP_PROXY") or ""
+    )
+
+
+def _no_proxy_of(proxy: Mapping[str, str] | None) -> str:
+    """从代理环境变量里取出 no_proxy，探测必须与 git 用同一份。"""
+    if not proxy:
+        return ""
+    return str(proxy.get("no_proxy") or proxy.get("NO_PROXY") or "")
 
 
 def test_credentials(
@@ -742,7 +814,9 @@ def test_credentials(
     if credential.kind == "https_token" and not credential.token:
         return False, "HTTPS 凭据缺少访问令牌"
 
-    unreachable = check_reachable(repo_url, proxy_url=_proxy_url_of(proxy))
+    unreachable = check_reachable(
+        repo_url, proxy_url=_proxy_url_of(proxy), no_proxy=_no_proxy_of(proxy)
+    )
     if unreachable:
         return False, unreachable
 
@@ -795,7 +869,9 @@ def ls_remote_tags(
 
     # 先探测可达性：不可达时几秒内给出「无法连接 <host>:<port>」，
     # 而不是让更新检查干等一次完整的 ls-remote 超时。
-    unreachable = check_reachable(repo_url, proxy_url=_proxy_url_of(proxy))
+    unreachable = check_reachable(
+        repo_url, proxy_url=_proxy_url_of(proxy), no_proxy=_no_proxy_of(proxy)
+    )
     if unreachable:
         return CommandResult(
             command="git ls-remote --tags", exit_code=1, output="", duration_ms=0, error=unreachable
@@ -803,7 +879,7 @@ def ls_remote_tags(
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
     env = _git_env(proxy=proxy, tmp_dir=tmp_dir)
-    return _run_git(
+    result = _run_git(
         ["ls-remote", "--tags", "--", repo_url],
         cwd=None,
         env=env,
@@ -813,6 +889,13 @@ def ls_remote_tags(
         attempts=attempts,
         retry_budget_seconds=timeout,
     )
+    if not result.ok:
+        # DNS 抖动重试后仍失败时，git 只会留下 ``could not resolve host``；
+        # 换成可操作的中文提示，避免用户拿着「命令退出码 128」无从下手。
+        hint = _credential_hint(result.output) or _network_hint(result.output)
+        if hint:
+            result.error = hint
+    return result
 
 
 def _remove_tree(path: Path) -> None:

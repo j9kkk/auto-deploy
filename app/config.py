@@ -465,6 +465,46 @@ def proxy_env(settings: "Settings", *, for_scripts: bool = False) -> dict[str, s
     return env
 
 
+def no_proxy_bypassed(host: str, no_proxy: str) -> bool:
+    """``no_proxy`` 是否覆盖该主机。
+
+    ``urllib`` 的 ``proxy_bypass`` 只读进程环境变量，而这里的代理可能来自应用
+    设置，因此必须自己按 ``no_proxy`` 判断，否则内网更新源会被强行推过外网代理。
+    """
+    host = (host or "").strip().lower()
+    if not host or not no_proxy:
+        return False
+    for entry in str(no_proxy).split(","):
+        entry = entry.strip().lower().lstrip(".")
+        if not entry:
+            continue
+        if entry == "*" or host == entry or host.endswith("." + entry):
+            return True
+    return False
+
+
+def env_proxy_url() -> str:
+    """进程环境里配置的代理地址；git 会读它，连通性探测也必须一致。
+
+    应用的「网络代理」设置以环境变量下发给 git 子进程，但运维也可能直接在
+    systemd 单元里设置 ``http_proxy``。此时 git 会走代理，而探测若直连目标主机
+    就会把「走代理能通」误判为不可达。
+    """
+    for name in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def env_no_proxy() -> str:
+    for name in ("no_proxy", "NO_PROXY"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def describe_proxy(settings: "Settings") -> str:
     """给界面显示的代理描述，绝不包含密码。"""
     if not settings.proxy_enabled:

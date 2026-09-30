@@ -445,6 +445,78 @@ def run() -> int:
     check("解析 http 主机端口", _split_host_port("https://h/a.git") == ("h", 443))
     check("解析自定义端口", _split_host_port("http://h:8080/a") == ("h", 8080))
 
+    # 临时 DNS 抖动（EAI_AGAIN）不得被视为不可达：它按语义就是「稍后重试即可」，
+    # 若在预检阶段就判定失败，git 自己的重试与抗抖配置根本没机会运行，用户会看到
+    # 「检查失败：无法连接 github.com:443（Temporary failure in name resolution）」，
+    # 而此时在服务器上手动访问一切正常——正是本次上报的现象。
+    from unittest.mock import patch as probe_patch
+
+    import socket
+
+    from app import gitops as gitops_module
+    from app.gitops import _probe_failure_message
+
+    with probe_patch.object(gitops_module.socket, "create_connection",
+                            side_effect=socket.gaierror(
+                                socket.EAI_AGAIN, "Temporary failure in name resolution")):
+        transient = check_reachable("https://github.com/a/b.git", timeout=2)
+    check("临时 DNS 失败不判定为不可达", transient is None, str(transient))
+
+    # 域名确实不存在（EAI_NONAME）是确定失败，必须给出可读原因。
+    with probe_patch.object(gitops_module.socket, "create_connection",
+                            side_effect=socket.gaierror(
+                                socket.EAI_NONAME,
+                                "nodename nor servname provided, or not known")):
+        missing = check_reachable("https://no-such-host.invalid/a.git", timeout=2)
+    check("域名不存在仍快速报告且指出是解析问题",
+          missing is not None and "解析" in missing and "no-such-host.invalid" in missing,
+          str(missing))
+
+    # 连接被拒绝是确定失败，保留原有可读原因；临时解析失败则不属于确定失败。
+    check("连接被拒绝属于确定失败",
+          _probe_failure_message("h", 443, ConnectionRefusedError(61, "Connection refused")) is not None)
+    check("临时解析失败不属于确定失败",
+          _probe_failure_message("h", 443,
+                                 socket.gaierror(socket.EAI_AGAIN, "temporary")) is None)
+
+    # 进程环境里的代理（systemd 单元可能设置）git 会使用，探测必须一致；
+    # 否则「走代理能通」会被直连探测误判为不可达。
+    # 用替身记录被连的地址，既不真连网络，又能断言探测确实指向代理。
+    probed = []
+
+    class _FakeConnection:
+        def __init__(self, address):
+            probed.append(address)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    def record_connection(address, *args, **kwargs):
+        return _FakeConnection(address)
+
+    with probe_patch.object(gitops_module.socket, "create_connection",
+                            side_effect=record_connection), \
+            probe_patch.dict(os.environ, {"https_proxy": "http://127.0.0.1:9"}, clear=False):
+        os.environ.pop("no_proxy", None)
+        os.environ.pop("NO_PROXY", None)
+        check_reachable("https://github.com/a/b.git", timeout=2)
+    check("探测使用进程环境里的代理（连的是代理而非目标主机）",
+          probed == [("127.0.0.1", 9)], str(probed))
+
+    # no_proxy 命中的主机必须直连探测：此时即使代理不可用也不能误报，
+    # 探测目标是仓库主机本身。
+    probed.clear()
+    with probe_patch.object(gitops_module.socket, "create_connection",
+                            side_effect=record_connection), \
+            probe_patch.dict(os.environ, {"https_proxy": "http://127.0.0.1:9",
+                                          "no_proxy": "github.com"}, clear=False):
+        bypassed = check_reachable("https://github.com/a/b.git", timeout=2)
+    check("no_proxy 命中的主机直连探测而非走代理",
+          bypassed is None and probed == [("github.com", 443)], f'{bypassed!r} {probed}')
+
     # 私有仓库未配凭据时，必须给出可操作提示而不是只报「命令退出码 128」。
     from app.gitops import _credential_hint
 
@@ -460,6 +532,17 @@ def run() -> int:
     check("本地权限错误不误报为密钥问题",
           _credential_hint("fatal: could not create work tree dir '/x': Permission denied") == "")
     check("无认证问题时不给凭据提示", _credential_hint("fatal: Remote branch nope not found") == "")
+
+    # git 自己的解析失败同样要给可操作提示，且不得断言「不可达」——
+    # 抖动重试后仍失败时，用户拿到的应是指向 DNS 的说明。
+    from app.gitops import _network_hint
+
+    check("git 解析失败给出 DNS 提示",
+          "解析" in _network_hint("fatal: unable to access 'https://github.com/x/y.git/': "
+                                  "Could not resolve host: github.com"))
+    check("非网络问题不给 DNS 提示", _network_hint("fatal: Remote branch nope not found") == "")
+    check("DNS 提示不误判为确定不可达",
+          "不可达" not in _network_hint("could not resolve host: github.com"))
 
     # ------------------------------------------------------------------
     section("命令执行与取消")
@@ -1934,6 +2017,27 @@ def run() -> int:
     check('不可达时预检即返回原因且不启动 git',
           not unreachable.ok and '无法连接' in (unreachable.error or '') and not ran_git,
           f'{unreachable.error!r} ran_git={bool(ran_git)}')
+
+    # 预检「无法判定」（例如临时 DNS 抖动）时返回 None，必须继续交给 git：
+    # 这正是本次上报的回归点——预检把抖动当成确定失败，git 根本没机会重试。
+    inconclusive_ran = []
+
+    def inconclusive_git(args, **kwargs):
+        inconclusive_ran.append(list(args))
+        return SimpleNamespace(ok=False, cancelled=False, timed_out=False,
+                               output='fatal: unable to access: '
+                                      'Could not resolve host: github.com',
+                               error='命令退出码 128', exit_code=128, duration_ms=1)
+
+    with patch.object(gitops, 'check_reachable', return_value=None), \
+            patch.object(gitops, 'run_command', side_effect=inconclusive_git):
+        after_blip = gitops.ls_remote_tags(repo_url='https://github.com/j9kkk/git-deploy.git',
+                                           tmp_dir=tmp_root / 'ls-remote-blip', timeout=30)
+    check('预检无法判定时仍执行 git（不误杀）', len(inconclusive_ran) >= 1,
+          f'ran={len(inconclusive_ran)}')
+    check('git 解析失败被翻译为可操作提示',
+          '解析' in (after_blip.error or '') and '命令退出码' not in (after_blip.error or ''),
+          repr(after_blip.error))
 
     # 失败结果不得进入 10 分钟缓存：否则界面会持续显示「检查失败」，
     # 用户点多少次都只是拿到同一个缓存的错误。
