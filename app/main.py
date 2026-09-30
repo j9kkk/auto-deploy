@@ -25,6 +25,7 @@ from .api import runs as run_routes
 from .api import settings as settings_routes
 from .api import stats as stats_routes
 from .api import tasks as task_routes
+from .api import webhooks as webhook_routes
 from .service import Service
 
 logger = logging.getLogger("autodeploy")
@@ -61,6 +62,7 @@ def create_app(service: Service | None = None) -> FastAPI:
     app.include_router(auth_routes.router)
     app.include_router(credential_routes.router)
     app.include_router(task_routes.router)
+    app.include_router(webhook_routes.router)
     app.include_router(run_routes.router)
     app.include_router(stats_routes.router)
     app.include_router(settings_routes.router)

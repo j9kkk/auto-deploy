@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     schedule_type            TEXT    NOT NULL DEFAULT 'interval',
     schedule_expression      TEXT    NOT NULL DEFAULT '1h',
     enabled                  INTEGER NOT NULL DEFAULT 1,
+    -- Webhook 触发令牌：拼在触发地址路径里，持有者即可触发一次部署；
+    -- 为空表示待生成（v4 迁移或首次保存时补齐）。
+    webhook_secret           TEXT    NOT NULL DEFAULT '',
 
     deploy_method            TEXT    NOT NULL DEFAULT 'script',
     prepare_script           TEXT    NOT NULL DEFAULT '',
@@ -264,6 +267,8 @@ class Database:
             self._migrate_v1_to_v2(conn)
         if current < 3:
             self._migrate_v2_to_v3(conn)
+        if current < 4:
+            self._migrate_v3_to_v4(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
@@ -368,6 +373,30 @@ class Database:
                 "REFERENCES credentials(id) ON DELETE SET NULL"
             )
 
+    def _migrate_v3_to_v4(self, conn: sqlite3.Connection) -> None:
+        """v4: 任务增加 Webhook 触发令牌。
+
+        新库由 SCHEMA 直接建列；这里只给老库补列，并为所有还没有令牌的
+        存量任务生成一个，保证每个任务开箱即有一个可用的触发地址。
+        """
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        if "webhook_secret" not in columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN webhook_secret TEXT NOT NULL DEFAULT ''"
+            )
+        from .security import new_token
+
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE webhook_secret = ''"
+        ).fetchall():
+            conn.execute(
+                "UPDATE tasks SET webhook_secret = ? WHERE id = ?",
+                (new_token(), row["id"]),
+            )
+
     def schema_version(self) -> int:
         try:
             return int(self.scalar("SELECT MAX(version) FROM schema_version", default=0) or 0)
@@ -399,6 +428,8 @@ def decode_task(row: dict[str, Any] | None) -> dict[str, Any] | None:
     task["has_token"] = bool(task.get("git_token"))
     # Never leak the stored credential; the UI only needs to know one is set.
     task.pop("git_token", None)
+    # webhook_secret 与 git_token 不同：触发地址要在界面上完整展示与复制，
+    # 因此随已登录接口返回（导出与备份由各自出口负责剥离）。
     return task
 
 

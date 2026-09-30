@@ -26,6 +26,7 @@ from ..deployer import (
     stop_task_containers,
 )
 from ..schedule import iso, next_run_time, utcnow
+from ..security import new_token
 from ..service import Service
 from ..store import TaskNameConflict, decode_task
 from ..validation import (
@@ -38,7 +39,7 @@ from .deps import audit, client_ip, current_user, get_service, require_admin
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 
-def _decorate(task: dict[str, Any], service: Service) -> dict[str, Any]:
+def _decorate(task: dict[str, Any], service: Service, request: Request | None = None) -> dict[str, Any]:
     """Add derived fields the UI needs but the table does not store."""
     if task is None:
         return {}
@@ -47,6 +48,13 @@ def _decorate(task: dict[str, Any], service: Service) -> dict[str, Any]:
     enriched["method_label"] = METHOD_LABELS.get(
         str(task.get("deploy_method") or ""), str(task.get("deploy_method") or "")
     )
+    # 触发地址按请求的 scheme/host 拼接，反代后也能拿到正确的外网地址。
+    secret = str(task.get("webhook_secret") or "")
+    if secret and task.get("id") is not None:
+        base = str(request.base_url).rstrip("/") if request is not None else ""
+        enriched["webhook_url"] = f"{base}/api/webhooks/{task['id']}/{secret}"
+    else:
+        enriched["webhook_url"] = ""
     enriched["active_run"] = None
     runs = service.store.runs.list_for_task(int(task["id"]), limit=1)
     if runs:
@@ -73,10 +81,14 @@ def _decorate(task: dict[str, Any], service: Service) -> dict[str, Any]:
 
 @router.get("")
 def list_tasks(
+    request: Request,
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
-    tasks = [_decorate(decode_task(row) or {}, service) for row in service.store.tasks.list_all()]
+    tasks = [
+        _decorate(decode_task(row) or {}, service, request)
+        for row in service.store.tasks.list_all()
+    ]
     active_by_task: dict[int, dict[str, Any]] = {}
     for run in service.store.runs.active():
         active_by_task.setdefault(int(run["task_id"]), run)
@@ -107,7 +119,7 @@ def create_task(
             detail={"message": "参数校验失败", "errors": {"name": str(exc)}},
         ) from exc
     service.scheduler.reschedule(task_id)
-    task = _decorate(decode_task(service.store.tasks.get(task_id)) or {}, service)
+    task = _decorate(decode_task(service.store.tasks.get(task_id)) or {}, service, request)
     audit(
         service, "task_created", actor=user["username"],
         target=f"task:{task_id}", detail=body.get("name", ""), ip=client_ip(request),
@@ -129,13 +141,14 @@ def create_task(
 @router.get("/{task_id}")
 def get_task(
     task_id: int,
+    request: Request,
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
     row = service.store.tasks.get(task_id)
     if row is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    task = _decorate(decode_task(row) or {}, service)
+    task = _decorate(decode_task(row) or {}, service, request)
     releases_root, current_link = resolve_release_paths(row)
     releases = [
         {
@@ -184,7 +197,7 @@ def update_task(
                 detail={"message": "参数校验失败", "errors": {"name": str(exc)}},
             ) from exc
         service.scheduler.reschedule(task_id)
-    task = _decorate(decode_task(service.store.tasks.get(task_id)) or {}, service)
+    task = _decorate(decode_task(service.store.tasks.get(task_id)) or {}, service, request)
     changed = sorted(body.keys())
     audit(
         service, "task_updated", actor=user["username"], target=f"task:{task_id}",
@@ -319,6 +332,26 @@ def run_task(
     return {"ok": True, "run_id": run_id}
 
 
+@router.post("/{task_id}/webhook/reset")
+def reset_task_webhook(
+    task_id: int,
+    request: Request,
+    service: Service = Depends(get_service),
+    user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """重新生成 Webhook 触发令牌；已分发的旧地址随之立即失效。"""
+    if service.store.tasks.get(task_id) is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    secret = new_token()
+    service.store.tasks.update(task_id, {"webhook_secret": secret})
+    base = str(request.base_url).rstrip("/")
+    audit(
+        service, "webhook_reset", actor=user["username"], target=f"task:{task_id}",
+        ip=client_ip(request),
+    )
+    return {"ok": True, "webhook_url": f"{base}/api/webhooks/{task_id}/{secret}"}
+
+
 @router.post("/{task_id}/toggle")
 def toggle_task(
     task_id: int,
@@ -423,6 +456,7 @@ def rollback(
 @router.get("/{task_id}/preflight")
 def task_preflight(
     task_id: int,
+    request: Request,
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
@@ -430,7 +464,7 @@ def task_preflight(
     if row is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     releases_root, current_link = resolve_release_paths(row)
-    task = _decorate(decode_task(row) or {}, service)
+    task = _decorate(decode_task(row) or {}, service, request)
     return {
         "checks": preflight(row),
         "required_binaries": sorted({*REQUIRED_BINARIES, *METHOD_BINARIES.values()}),
@@ -495,6 +529,9 @@ def export_task(
         raise HTTPException(status_code=404, detail="任务不存在")
     task = decode_task(row) or {}
     task.pop("git_token", None)
+    # 触发地址含机密令牌，导出的定义文件不得携带。
+    task.pop("webhook_secret", None)
+    task.pop("webhook_url", None)
     payload = json.dumps({"version": 1, "task": task}, ensure_ascii=False, indent=2)
     filename = f"task-{task_id}.json"
     return PlainTextResponse(

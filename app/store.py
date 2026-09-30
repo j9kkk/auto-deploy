@@ -12,6 +12,7 @@ from typing import Any
 from . import sshkey
 from .db import Database, decode_run, decode_task, encode_env_vars
 from .schedule import iso, utcnow
+from .security import new_token
 
 # ---------------------------------------------------------------------------
 # Column definitions
@@ -21,7 +22,7 @@ TASK_INSERT_COLUMNS = (
     "name", "description",
     "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username", "git_token",
     "credential_id",
-    "schedule_type", "schedule_expression", "enabled",
+    "schedule_type", "schedule_expression", "enabled", "webhook_secret",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
     "artifact_paths", "target_dir", "keep_releases",
     "service_name", "docker_image", "docker_command", "docker_compose_file",
@@ -33,7 +34,7 @@ TASK_UPDATE_COLUMNS = (
     "name", "description",
     "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username", "git_token",
     "credential_id",
-    "schedule_type", "schedule_expression", "enabled",
+    "schedule_type", "schedule_expression", "enabled", "webhook_secret",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
     "artifact_paths", "target_dir", "keep_releases",
     "service_name", "docker_image", "docker_command", "docker_compose_file",
@@ -335,6 +336,10 @@ class TaskRepository:
 
     def create(self, data: dict[str, Any]) -> int:
         payload = self._payload(data)
+        # Webhook 触发令牌由仓储层兜底生成：调用方（校验层）不产出该字段，
+        # 每个任务都必须有一个可用触发地址，缺失会导致迁移后才补齐。
+        if not str(payload.get("webhook_secret") or ""):
+            payload["webhook_secret"] = new_token()
         now = iso(utcnow())
         columns = [c for c in TASK_INSERT_COLUMNS if c in payload]
         values = [payload[c] for c in columns]
@@ -882,8 +887,14 @@ class Store:
 
     def export_snapshot(self) -> dict[str, Any]:
         """Everything needed for a backup, with secrets stripped."""
+        tasks = []
+        for row in self.tasks.list_all():
+            task = decode_task(row) or {}
+            # Webhook 触发令牌同样属于机密，不写入备份文件。
+            task.pop("webhook_secret", None)
+            tasks.append(task)
         return {
             "exported_at": iso(utcnow()),
-            "tasks": [decode_task(row) for row in self.tasks.list_all()],
+            "tasks": tasks,
             "runs": self.runs.list_recent(limit=2000),
         }

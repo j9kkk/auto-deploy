@@ -184,7 +184,7 @@ window.AD = window.AD || {};
   };
 
   AD.triggerLabel = function (trigger) {
-    return { manual: '手动', schedule: '定时', rollback: '回滚', system: '系统' }[trigger] || trigger;
+    return { manual: '手动', schedule: '定时', webhook: 'Webhook', rollback: '回滚', system: '系统' }[trigger] || trigger;
   };
 
   // ------------------------------------------------------------------ toasts

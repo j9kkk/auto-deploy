@@ -20,6 +20,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -631,6 +632,22 @@ def run() -> int:
     check("更新可写入任务内令牌", store.tasks.get(task_id)["git_token"] == "rotated-token")
     store.tasks.update(task_id, {"git_token": ""})
     check("更新可清除任务内令牌", store.tasks.get(task_id)["git_token"] == "")
+
+    # Webhook 触发令牌：创建任务时自动生成、可重置；导出快照必须剥离。
+    webhook_secret = store.tasks.get(task_id)["webhook_secret"]
+    check("创建任务自动生成触发令牌", bool(webhook_secret))
+    check("解码行保留触发令牌", store.tasks.get_decoded(task_id)["webhook_secret"] == webhook_secret)
+    store.tasks.update(task_id, {"webhook_secret": "rotated-webhook-secret"})
+    check("更新可重写触发令牌", store.tasks.get(task_id)["webhook_secret"] == "rotated-webhook-secret")
+    snapshot = store.export_snapshot()
+    check("导出快照剥离触发令牌", all("webhook_secret" not in t for t in snapshot["tasks"]))
+
+    # 存量库升级：v3 库补列后必须为空令牌任务自动补齐，老任务才有触发地址。
+    store.db.execute("UPDATE tasks SET webhook_secret = ''")
+    store.db.execute("UPDATE schema_version SET version = 3")
+    store.db.init_schema()
+    check("v4 迁移为存量任务补齐触发令牌", all(
+        bool(t["webhook_secret"]) for t in store.tasks.list_all()))
 
     # 结构护栏：校验层能产出的字段必须都能落库，否则会在某一侧被静默丢弃。
     from app import validation as _validation
@@ -1369,6 +1386,85 @@ def run() -> int:
         check("删除任务成功", response.status_code == 200)
         response = client.get("/api/tasks")
         check("任务列表已为空", response.json()["total"] == 0)
+
+        # --- webhook 触发 ---------------------------------------------
+        webhook_created = client.post(
+            "/api/tasks",
+            json={
+                "name": "Webhook_Test",
+                "repo_url": str(origin),
+                "repo_branch": "main",
+                "schedule_type": "manual",
+                "deploy_method": "release",
+            },
+        )
+        check("创建 Webhook 测试任务成功", webhook_created.status_code == 201,
+              webhook_created.text[:200])
+        webhook_task = webhook_created.json()["task"]
+        webhook_id = webhook_task["id"]
+        webhook_url = webhook_task["webhook_url"]
+        webhook_secret = webhook_task["webhook_secret"]
+        check("任务返回触发地址", "/api/webhooks/" in webhook_url and webhook_secret in webhook_url,
+              webhook_url[:120])
+        webhook_path = urlsplit(webhook_url).path
+
+        webhook_response = client.post(webhook_path)
+        check("Webhook POST 触发部署",
+              webhook_response.status_code == 200 and webhook_response.json()["run_id"] > 0,
+              webhook_response.text[:200])
+        webhook_run = webhook_response.json()["run_id"]
+        deadline = time.monotonic() + 60
+        webhook_status = "queued"
+        while time.monotonic() < deadline:
+            webhook_status = client.get(f"/api/runs/{webhook_run}").json()["run"]["status"]
+            if webhook_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        check("Webhook 触发的运行结束", webhook_status in ("success", "skipped"), webhook_status)
+        check("触发方式记录为 webhook",
+              client.get(f"/api/runs/{webhook_run}").json()["run"]["trigger"] == "webhook")
+
+        get_response = client.get(webhook_path)
+        check("Webhook GET 同样可触发", get_response.status_code == 200, get_response.text[:150])
+        get_run = get_response.json()["run_id"]
+        deadline = time.monotonic() + 60
+        get_status = "queued"
+        while time.monotonic() < deadline:
+            get_status = client.get(f"/api/runs/{get_run}").json()["run"]["status"]
+            if get_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        check("无变化时 Webhook 触发被跳过", get_status == "skipped", get_status)
+
+        check("错误令牌返回 404", client.post(webhook_path + "x").status_code == 404)
+        check("错误任务号返回 404",
+              client.post(f"/api/webhooks/999999/{webhook_secret}").status_code == 404)
+        check("非数字任务号返回 404", client.post("/api/webhooks/abc/xyz").status_code == 404)
+
+        service.selfupdate._save_state({"stage": "applying", "log": [], "operation_id": "wh-check"})
+        response = client.post(webhook_path)
+        check("自更新期间 Webhook 拒绝触发", response.status_code == 409)
+        service.selfupdate._save_state({"stage": "idle", "log": []})
+
+        response = client.post(f"/api/tasks/{webhook_id}/webhook/reset")
+        check("重置触发令牌成功",
+              response.status_code == 200 and "/api/webhooks/" in response.json()["webhook_url"],
+              response.text[:150])
+        new_path = urlsplit(response.json()["webhook_url"]).path
+        check("旧触发地址已失效", client.post(webhook_path).status_code == 404)
+        reset_response = client.post(new_path)
+        check("新触发地址可触发", reset_response.status_code == 200, reset_response.text[:150])
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            reset_status = client.get(f"/api/runs/{reset_response.json()['run_id']}").json()["run"]["status"]
+            if reset_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        response = client.delete(f"/api/tasks/{webhook_id}")
+        check("清理 Webhook 测试任务", response.status_code == 200, response.text[:150])
+        check("Webhook 触发写入审计日志", any(
+            a["action"] == "run_triggered" and a["actor"] == "webhook"
+            for a in service.store.audit.list_recent(limit=50)))
 
         # --- cancellation -------------------------------------------
         cancel_task = client.post(

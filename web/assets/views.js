@@ -1060,6 +1060,21 @@ AD.views = {};
         <label for="f-enabled">启用定时调度</label>
       </div>
 
+      <div class="section-title">Webhook 触发</div>
+      ${isEdit && t.webhook_url ? `
+      <div class="form-grid">
+        <div class="field span-2">
+          <label>触发地址</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="text" id="f-webhook_url" readonly value="${a(t.webhook_url)}" spellcheck="false" style="flex:1">
+            <button type="button" class="ghost" id="webhook-copy">复制</button>
+            <button type="button" class="ghost" id="webhook-reset">重新生成</button>
+          </div>
+          <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。</div>
+        </div>
+      </div>` : `
+      <div class="hint" style="margin:-6px 0 12px">任务创建后自动生成 Webhook 触发地址，可在编辑页复制使用。</div>`}
+
       <div class="section-title">部署方式</div>
       <div class="field">
         <select id="f-deploy_method">
@@ -1176,6 +1191,26 @@ AD.views = {};
     };
     methodSelect.addEventListener('change', applyMethodVisibility);
     applyMethodVisibility();
+
+    const webhookUrlInput = backdrop.querySelector('#f-webhook_url');
+    if (webhookUrlInput) {
+      backdrop.querySelector('#webhook-copy').addEventListener('click', () => {
+        AD.copyToClipboard(webhookUrlInput.value);
+      });
+      const resetButton = backdrop.querySelector('#webhook-reset');
+      resetButton.addEventListener('click', async () => {
+        AD.setBusy(resetButton, true, '生成中…');
+        try {
+          const result = await AD.api.post(`/api/tasks/${taskId}/webhook/reset`);
+          webhookUrlInput.value = result.webhook_url;
+          AD.toastSuccess('已重新生成触发地址，旧地址已失效');
+        } catch (err) {
+          AD.toastError(err.message);
+        } finally {
+          AD.setBusy(resetButton, false);
+        }
+      });
+    }
 
     const typeSelect = backdrop.querySelector('#f-schedule_type');
     const exprInput = backdrop.querySelector('#f-schedule_expression');
