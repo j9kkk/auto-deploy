@@ -451,6 +451,7 @@ def run() -> int:
     # 而此时在服务器上手动访问一切正常——正是本次上报的现象。
     from unittest.mock import patch as probe_patch
 
+    import errno
     import socket
 
     from app import gitops as gitops_module
@@ -473,8 +474,12 @@ def run() -> int:
           str(missing))
 
     # 连接被拒绝是确定失败，保留原有可读原因；临时解析失败则不属于确定失败。
+    # 用 errno 常量而非字面量：ECONNREFUSED 在 Linux 是 111、在 macOS 是 61，
+    # 写死数字会让同一份自检在不同平台上得到相反结论。
     check("连接被拒绝属于确定失败",
-          _probe_failure_message("h", 443, ConnectionRefusedError(61, "Connection refused")) is not None)
+          _probe_failure_message(
+              "h", 443,
+              ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")) is not None)
     check("临时解析失败不属于确定失败",
           _probe_failure_message("h", 443,
                                  socket.gaierror(socket.EAI_AGAIN, "temporary")) is None)
@@ -1434,6 +1439,38 @@ def run() -> int:
           and 'if [ ! -f "/etc/sudoers.d/$SERVICE_NAME" ]' not in install_sh)
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     check("README 含自我更新章节", "## 自我更新" in readme)
+
+    # ------------------------------------------------------------------
+    section("一键安装脚本")
+    bootstrap_sh = (ROOT / "scripts" / "bootstrap.sh").read_text(encoding="utf-8")
+    check("一键脚本把系统改动全部委托给 install.sh（升级自动继承新授权/单元）",
+          "scripts/install.sh" in bootstrap_sh)
+    check("一键脚本默认安装最新发布版本（与应用内自更新一致）",
+          "releases/latest" in bootstrap_sh and "archive/refs/tags" in bootstrap_sh)
+    check("一键脚本识别并沿用既有安装的自定义配置",
+          "WorkingDirectory=" in bootstrap_sh
+          and "AUTODEPLOY_SERVICE_NAME" in bootstrap_sh
+          and "AUTODEPLOY_PORT" in bootstrap_sh
+          and "AUTODEPLOY_INSTALL_DIR" in bootstrap_sh)
+    check("一键脚本校验压缩包完整性（损坏的下载不会半途安装）",
+          "tar -tzf" in bootstrap_sh)
+    check("一键脚本非 root 执行时自动提权（管道模式先落盘再 sudo）",
+          "AUTODEPLOY_ESCALATED" in bootstrap_sh
+          and "AUTODEPLOY_SAVED_SCRIPT" in bootstrap_sh)
+    check("install.sh 随程序复制 scripts 与 README（一键安装后可就地卸载/修复）",
+          "for item in app web requirements.txt run.sh scripts README.md" in install_sh)
+    check("install.sh 校验 Python 版本（老系统一键安装时给出明确提示）",
+          "version_info >= (3, 10)" in install_sh)
+    check("install.sh 重建失效虚拟环境（系统 Python 升级后仍可一键升级）",
+          "重建虚拟环境" in install_sh
+          and 'rm -rf "${INSTALL_DIR:?}/.venv"' in install_sh)
+    for script_name in ("install.sh", "uninstall.sh", "bootstrap.sh"):
+        syntax = subprocess.run(
+            ["bash", "-n", str(ROOT / "scripts" / script_name)],
+            capture_output=True, text=True,
+        )
+        check(f"{script_name} 语法有效（bash -n）", syntax.returncode == 0,
+              syntax.stderr.strip())
 
     # ------------------------------------------------------------------
     section("凭据与代理")
