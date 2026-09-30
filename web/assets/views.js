@@ -39,6 +39,8 @@ AD.views = {};
     refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v4h-4"/></svg>',
     download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>',
     rollback: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>',
+    // 升级到新版本：向上的箭头，常用于「更新」动作。
+    upgrade: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19.5V7"/><path d="m6.5 12.5 5.5-5.5 5.5 5.5"/><path d="M4.5 4.5h15"/></svg>',
     trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16"/><path d="M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7"/><path d="M6.5 7l.8 11.2A2 2 0 0 0 9.3 20h5.4a2 2 0 0 0 2-1.8L17.5 7"/><path d="M10.5 11v5M13.5 11v5"/></svg>',
   };
   AD.ICONS = ICONS;
@@ -2221,12 +2223,7 @@ AD.views = {};
           <div class="spacer"></div>
           <span class="faint">程序代码更新</span>
         </div>
-        <div id="upd-body">
-          <div class="row">
-            <button class="primary" id="upd-check">检查更新</button>
-            <span class="faint" id="upd-hint">查询远程仓库的最新发布版本</span>
-          </div>
-        </div>
+        <div id="upd-body"></div>
       </div>
 
       <div class="grid cols-2">
@@ -2340,6 +2337,7 @@ AD.views = {};
         <h1>凭据</h1>
         <span class="badge neutral">${items.length} 个</span>
         <div class="spacer"></div>
+        <button id="cred-guide">怎么获取？</button>
         <button class="primary" id="cred-new">+ 新建凭据</button>
       </div>
 
@@ -2363,6 +2361,10 @@ AD.views = {};
 
     container.querySelector('#cred-new')?.addEventListener('click', () => AD.openCredentialForm(null));
     container.querySelector('#cred-new-empty')?.addEventListener('click', () => AD.openCredentialForm(null));
+    container.querySelector('#cred-guide')?.addEventListener('click', () => AD.openCredentialGuide());
+
+    container.querySelectorAll('[data-cred-pubkey]').forEach((b) =>
+      b.addEventListener('click', () => AD.showCredentialPublicKey(Number(b.dataset.credPubkey))));
 
     container.querySelectorAll('[data-cred-edit]').forEach((b) =>
       b.addEventListener('click', () => AD.openCredentialForm(Number(b.dataset.credEdit))));
@@ -2397,6 +2399,7 @@ AD.views = {};
       <td>${item.used_by ? `<span class="badge neutral">${item.used_by} 个任务</span>` : '<span class="faint">未使用</span>'}</td>
       <td>
         <div class="table-actions">
+          ${item.kind === 'ssh_key' ? `<button class="sm" data-cred-pubkey="${item.id}">公钥</button>` : ''}
           <button class="sm" data-cred-test="${item.id}">测试</button>
           <button class="sm" data-cred-edit="${item.id}">编辑</button>
           <button class="sm danger" data-cred-delete="${item.id}">删除</button>
@@ -2485,8 +2488,19 @@ AD.views = {};
       </div>
       <div class="field">
         <label id="c-secret-label">密钥<span class="req">*</span></label>
+        <div class="row hidden" id="c-generate-row" style="margin-bottom:8px">
+          <button class="sm" id="c-generate">自动生成密钥对</button>
+          <select id="c-key-type" class="sm" style="width:auto">
+            <option value="ed25519">ED25519（推荐）</option>
+            <option value="rsa">RSA 4096（兼容旧环境）</option>
+          </select>
+          <span class="faint" id="c-generate-hint">不必手工运行 ssh-keygen</span>
+        </div>
         <textarea id="c-secret" rows="5" placeholder=""></textarea>
         <div class="hint" id="c-secret-hint"></div>
+      </div>
+      <div class="field hidden" id="c-pubkey-wrap">
+        <div id="c-pubkey-body"></div>
       </div>
       <div class="field hidden" id="c-passphrase-wrap">
         <label>私钥口令</label>
@@ -2520,6 +2534,10 @@ AD.views = {};
         ? 'SSH 地址通常使用 git，留空则默认 git' : 'GitHub 使用 x-access-token；留空则使用默认值';
       backdrop.querySelector('#c-username-wrap').classList.toggle('hidden', false);
       backdrop.querySelector('#c-passphrase-wrap').classList.toggle('hidden', kind !== 'ssh_key');
+      // 只有新建 SSH 凭据才需要「自动生成」：已有凭据的私钥不回传，
+      // 没有可替换的对象。
+      backdrop.querySelector('#c-generate-row').classList.toggle('hidden', kind !== 'ssh_key' || isEdit);
+      if (kind !== 'ssh_key') backdrop.querySelector('#c-pubkey-wrap').classList.add('hidden');
       if (isEdit) {
         secretInput.placeholder = t.has_secret ? '已保存，留空表示不修改' : '';
         secretInput.required = false;
@@ -2527,6 +2545,35 @@ AD.views = {};
     };
     kindSelect.addEventListener('change', applyKind);
     applyKind();
+
+    // 自动生成密钥对：私钥回填到输入框（保存时才提交），公钥立即展示供复制。
+    // 这样用户不必运行 ssh-keygen，也不会把公钥私钥搞混。
+    backdrop.querySelector('#c-generate')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      AD.setBusy(button, true, '生成中…');
+      try {
+        const result = await AD.api.post('/api/credentials/generate-keypair', {
+          key_type: backdrop.querySelector('#c-key-type').value,
+          comment: backdrop.querySelector('#c-name').value.trim() || 'autodeploy',
+        });
+        backdrop.querySelector('#c-secret').value = result.private_key;
+        const wrap = backdrop.querySelector('#c-pubkey-wrap');
+        wrap.classList.remove('hidden');
+        backdrop.querySelector('#c-pubkey-body').innerHTML =
+          publicKeyPanel(result.public_key, result.fingerprint, {
+            intro: '密钥已生成，私钥已填入下方输入框（保存后不再回传）。'
+                 + '现在请把公钥添加到 GitHub 的 Deploy Keys：',
+          });
+        bindPublicKeyPanel(backdrop, result.public_key);
+        backdrop.querySelector('#c-username').value =
+          backdrop.querySelector('#c-username').value.trim() || 'git';
+        backdrop.querySelector('#c-generate-hint').textContent = '已生成，可直接保存';
+        AD.toastSuccess('密钥已生成，请复制公钥到 GitHub');
+      } catch (err) {
+        credError(backdrop, err.message);
+      }
+      AD.setBusy(button, false);
+    });
 
     backdrop.querySelector('#cred-save').addEventListener('click', async (event) => {
       const button = event.currentTarget;
@@ -2558,6 +2605,95 @@ AD.views = {};
     });
   };
 
+  // ----------------------------------------------------------------------
+  // 公钥展示：生成密钥或查看已有 SSH 凭据时复用同一块 UI。
+  // 公钥不是机密，可以放心显示与复制；私钥永不进入这里。
+  // ----------------------------------------------------------------------
+  function publicKeyPanel(publicKey, fingerprint, options) {
+    const opts = options || {};
+    return `
+      <div class="alert info">
+        ${opts.intro || '把下面这行公钥添加到 GitHub 的 Deploy Keys，私钥会安全保存在服务端。'}
+      </div>
+      <div class="field">
+        <label>公钥（复制这一整行）</label>
+        <textarea id="pk-value" rows="3" readonly class="mono">${e(publicKey)}</textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="primary sm" id="pk-copy">复制公钥</button>
+          <span class="faint" id="pk-copied"></span>
+        </div>
+      </div>
+      ${fingerprint ? `<div class="field">
+        <label>指纹</label>
+        <div class="mono">${e(fingerprint)}</div>
+        <div class="hint">指纹只是用来核对：与 GitHub 上显示的一致即表示两处是同一把钥匙。</div>
+      </div>` : ''}
+      <div class="section-title">接下来这样配置</div>
+      <ol class="cred-steps">
+        <li>打开仓库的 <span class="code-inline">Settings → Deploy Keys → Add deploy key</span></li>
+        <li>把公钥粘贴到 <span class="code-inline">Key</span> 输入框。</li>
+        <li><strong>不要勾选</strong> <span class="code-inline">Allow write access</span>——部署只需要读取权限。</li>
+        <li>保存后回到本页点「测试」验证是否能连上仓库。</li>
+      </ol>
+    `;
+  }
+
+  function bindPublicKeyPanel(backdrop, publicKey) {
+    backdrop.querySelector('#pk-copy')?.addEventListener('click', async () => {
+      await AD.copyToClipboard(publicKey);
+      const note = backdrop.querySelector('#pk-copied');
+      if (note) note.textContent = '已复制，去 GitHub 粘贴即可';
+    });
+  }
+
+  /** 查看已有 SSH 凭据的公钥，便于重新添加 Deploy Key 或核对指纹。 */
+  AD.showCredentialPublicKey = async function (credentialId) {
+    let data;
+    try {
+      data = await AD.api.get(`/api/credentials/${credentialId}/public-key`);
+    } catch (err) { AD.toastError(err.message); return; }
+    const backdrop = AD.Modal.open({
+      title: 'SSH 公钥',
+      body: '<div id="pk-body">' + publicKeyPanel(data.public_key, data.fingerprint, {
+        intro: '这是该凭据对应的公钥。如果服务器已重装或 GitHub 上的 Deploy Key 被删除，'
+             + '可以重新复制这行公钥添加回去，无需更换凭据。',
+      }) + '</div>',
+      footer: '<button data-close>关闭</button>',
+    });
+    bindPublicKeyPanel(backdrop, data.public_key);
+  };
+
+  /** 凭据获取指引：把「去哪点、要什么权限」讲清楚。 */
+  AD.openCredentialGuide = async function () {
+    let guide;
+    try { guide = await AD.api.get('/api/credentials/guide'); }
+    catch (err) { AD.toastError(err.message); return; }
+
+    const section = (item) => `
+      <div class="cred-guide-block">
+        <h3>${e(item.label)}<span class="badge neutral" style="margin-left:8px">${e(item.best_for)}</span></h3>
+        <div class="field">
+          <label>在 GitHub 上操作</label>
+          <div><a class="code-inline" href="${a(item.create_url)}" target="_blank" rel="noopener noreferrer">${e(item.create_url)}</a></div>
+          <div class="hint">在新标签页打开。${item.create_url.includes('REPO_OWNER')
+            ? '把链接里的 REPO_OWNER/REPO_NAME 换成你自己的仓库路径。' : ''}</div>
+        </div>
+        <ol class="cred-steps">${item.steps.map((s) => `<li>${e(s)}</li>`).join('')}</ol>
+        <div class="hint" style="margin-top:8px">
+          ${item.notes.map((n) => `<div>· ${e(n)}</div>`).join('')}
+        </div>
+      </div>`;
+
+    const backdrop = AD.Modal.open({
+      title: '如何获取仓库凭据',
+      size: 'wide',
+      body: `<div class="alert info">${e(guide.intro)}</div>
+             ${guide.kinds.map(section).join('<div class="divider"></div>')}`,
+      footer: '<button data-close>知道了</button>',
+    });
+    return backdrop;
+  };
+
   function credError(backdrop, message) {
     const box = backdrop.querySelector('#cred-error');
     box.textContent = message;
@@ -2567,14 +2703,26 @@ AD.views = {};
 
   // ======================================================================
   // 一键更新
+  //
+  // 卡片只占一行：当前版本 / 最新版本 / 升级日志 / 配置。所有状态变化都只重绘
+  // 行与进度区这两个容器，绝不整页重渲染——否则正在看的升级日志、滚动位置和
+  // 页面上的其它交互都会丢失。
   // ======================================================================
   let updateSession = null;
   const versionText = (v) => 'v' + String(v || '').replace(/^[vV]+/, '');
+  const bareVersion = (v) => String(v || '').replace(/^[vV]+/, '');
+  const UPD_STAGE_LABELS = {
+    queued: '排队中', checking: '检查中', downloading: '下载中', backing_up: '备份代码',
+    applying: '替换代码', dependencies: '更新依赖', restarting: '等待重启确认',
+    done: '已确认完成', failed: '失败', error: '失败', idle: '尚未更新',
+    unverified: '历史操作未确认',
+  };
+
   AD.stopUpdatePanel = function () {
     if (!updateSession) return;
     updateSession.stopped = true;
     clearTimeout(updateSession.timer);
-    updateSession.controller?.abort();
+    updateSession.controllers.forEach((controller) => controller.abort());
     updateSession = null;
   };
   window.addEventListener('pagehide', AD.stopUpdatePanel);
@@ -2583,19 +2731,34 @@ AD.views = {};
     const previous = updateSession?.panel === panel ? updateSession : null;
     AD.stopUpdatePanel();
     if (!panel) return;
-    const ctx = { panel, stopped: false, timer: null, failures: 0, polls: 0,
-      deadline: Date.now() + 15 * 60 * 1000, state: previous?.state || null,
-      logView: previous?.logView || { open: false, top: 0, left: 0, follow: true },
-      logRendered: previous?.logRendered || false };
+    const ctx = {
+      panel, stopped: false, timer: null, failures: 0, polls: 0,
+      deadline: Date.now() + 15 * 60 * 1000,
+      state: previous?.state || null,
+      check: previous?.check || null,
+      checking: false,
+      settings: previous?.settings || null,
+      // 正在预览的滚动位置；重绘日志时要还原，不能把读者拽回底部。
+      logView: previous?.logView || { top: 0, left: 0, follow: true },
+      rowSig: null, progSig: null,
+      controllers: new Set(),
+    };
     updateSession = ctx;
-    pollUpdateStatus(ctx); // 先恢复持久化状态，不用 health 推断成功。
+    panel.querySelector('#upd-body').innerHTML =
+      '<div class="upd-row" id="upd-row"></div>'
+      + '<div id="upd-alerts"></div>'
+      + '<div id="upd-progress"></div>';
+    loadUpdateSettings(ctx);  // 更新源与代理说明用于确认弹窗和配置弹窗
+    drawUpdateRow(ctx);
+    drawUpdateProgress(ctx);
+    pollUpdateStatus(ctx);    // 先恢复持久化状态，不用 health 推断成功。
   };
   const updateAlive = (ctx) => !ctx.stopped && ctx.panel.isConnected;
 
-  async function updateRequest(ctx, path, method = 'GET', payload) {
+  async function updateRequest(ctx, path, method = 'GET', payload, timeout = 10000) {
     const controller = new AbortController();
-    ctx.controller = controller;
-    const timer = setTimeout(() => controller.abort(), 10000);
+    ctx.controllers.add(controller);
+    const timer = setTimeout(() => controller.abort(), timeout);
     try {
       const response = await fetch(path, { method, credentials: 'same-origin', cache: 'no-store',
         signal: controller.signal, headers: { 'Content-Type': 'application/json' },
@@ -2608,80 +2771,139 @@ AD.views = {};
         throw err;
       }
       return data;
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); ctx.controllers.delete(controller); }
   }
 
   function updateError(ctx, message) {
     if (!updateAlive(ctx)) return;
-    const body = ctx.panel.querySelector('#upd-body');
-    body.querySelector('#upd-error')?.remove();
-    body.insertAdjacentHTML('beforeend', '<div id="upd-error" class="alert error">' + e(message)
-      + '<div><button id="upd-resume">重新读取状态</button></div></div>');
-    body.querySelector('#upd-resume')?.addEventListener('click', () => AD.renderUpdatePanel(ctx.panel));
+    const box = ctx.panel.querySelector('#upd-alerts');
+    box.innerHTML = '<div id="upd-error" class="alert error">' + e(message)
+      + '<div><button id="upd-resume">重新读取状态</button></div></div>';
+    box.querySelector('#upd-resume')?.addEventListener('click', () => AD.renderUpdatePanel(ctx.panel));
   }
 
+  async function loadUpdateSettings(ctx) {
+    try {
+      const data = await updateRequest(ctx, '/api/settings');
+      if (updateAlive(ctx)) ctx.settings = data;
+    } catch (err) { /* 说明文字退化为默认文案，不影响升级主流程 */ }
+  }
+
+  /** 严格确认：只有重启后进程身份与版本都对齐才认定成功。 */
   function updateConfirmed(state) {
     return state.stage === 'done' && state.confirmed_operation_id === state.operation_id && state.operation_id
       && state.confirmed_operation === state.operation && ['update', 'rollback'].includes(state.operation)
       && state.boot_id && state.boot_id !== state.before_boot_id && state.pid !== state.before_pid
-      && String(state.current_version).replace(/^[vV]+/, '') === state.expected_version
-      && String(state.version).replace(/^[vV]+/, '') === state.expected_version;
+      && bareVersion(state.current_version) === state.expected_version
+      && bareVersion(state.version) === state.expected_version;
   }
 
-  function drawUpdateState(ctx, state) {
-    const body = ctx.panel.querySelector('#upd-body');
+  // ----------------------------------------------------------- 单行展示区
+  function drawUpdateRow(ctx) {
+    const row = ctx.panel.querySelector('#upd-row');
+    if (!row) return;
+    const state = ctx.state || {};
+    const current = state.current_version || (ctx.check && ctx.check.current) || '';
+    const active = Boolean(state.active);
+    let latest;
+    if (ctx.checking) {
+      latest = '<span class="upd-latest dim">正在检查最新版本…</span>';
+    } else if (!ctx.check) {
+      latest = '<span class="upd-latest dim">尚未检查</span>';
+    } else if (ctx.check.error) {
+      latest = '<span class="upd-latest danger" title="' + a(ctx.check.error) + '">检查失败：'
+        + e(ctx.check.error) + '</span><button class="ghost sm" id="upd-recheck">重试</button>';
+    } else if (ctx.check.update_available) {
+      const target = versionText(ctx.check.latest);
+      latest = '<span class="upd-latest">最新版本 <strong class="mono">' + e(target) + '</strong></span>'
+        + '<button class="icon-btn run" id="upd-upgrade" title="升级到 ' + a(target) + '"'
+        + (active ? ' disabled' : '') + ' aria-label="升级到 ' + a(target) + '">' + ICONS.upgrade + '</button>';
+    } else {
+      latest = '<span class="upd-latest dim">当前已是最新版本</span>';
+    }
+    // 轮询每 1.5s 触发一次；只有内容真的变了才重建节点，避免打断悬停与焦点。
+    const signature = [current, active, ctx.checking, latest].join('|');
+    if (signature === ctx.rowSig) return;
+    ctx.rowSig = signature;
+    row.innerHTML = '<span class="upd-item">当前版本 <strong class="mono">'
+      + e(current ? versionText(current) : '未知') + '</strong></span>'
+      + '<span class="upd-item" id="upd-latest">' + latest + '</span>'
+      + '<div class="spacer"></div>'
+      + '<button class="sm" id="upd-history">升级日志</button>'
+      + '<button class="sm" id="upd-config">配置</button>';
+    row.querySelector('#upd-recheck')?.addEventListener('click', () => runUpdateCheck(ctx, true));
+    row.querySelector('#upd-upgrade')?.addEventListener('click',
+      () => startUpdateOperation(ctx, 'update', ctx.check.latest));
+    row.querySelector('#upd-history')?.addEventListener('click', () => openUpdateHistory(ctx));
+    row.querySelector('#upd-config')?.addEventListener('click', () => openUpdateConfig(ctx));
+  }
+
+  // ------------------------------------------------------------- 进度区域
+  function drawUpdateProgress(ctx) {
+    const box = ctx.panel.querySelector('#upd-progress');
+    if (!box) return;
+    const state = ctx.state;
     const view = ctx.logView;
-    const rememberLog = (details, log) => {
-      if (!details || !log) return;
-      view.open = details.open;
-      // 收起的 details 没有可用尺寸，不能用它覆盖历史阅读位置。
-      if (details.open && log.clientHeight > 0) {
-        view.top = log.scrollTop;
-        view.left = log.scrollLeft;
-        view.follow = log.scrollHeight - log.clientHeight - log.scrollTop <= 32;
-      }
-    };
-    if (ctx.logRendered) rememberLog(body.querySelector('#upd-logs'), body.querySelector('#upd-log'));
+    // 重绘前记住阅读位置：正在翻升级日志时不能被拉到底部或顶部。
+    const previousLog = box.querySelector('#upd-log');
+    if (previousLog && previousLog.clientHeight > 0) {
+      view.top = previousLog.scrollTop;
+      view.left = previousLog.scrollLeft;
+      view.follow = previousLog.scrollHeight - previousLog.clientHeight - previousLog.scrollTop <= 32;
+    }
+    if (!state || (state.stage === 'idle' && !state.operation && !state.error)) {
+      if (box.innerHTML) box.innerHTML = '';
+      ctx.progSig = '';
+      return;
+    }
     const confirmed = updateConfirmed(state);
     const unverified = state.stage === 'unverified' || (state.stage === 'done' && !confirmed)
       || (state.stage === 'restarting' && !state.active);
-    const labels = { queued: '排队中', checking: '检查中', downloading: '下载中', backing_up: '备份代码', applying: '替换代码',
-      dependencies: '更新依赖', restarting: '等待重启确认', done: '已确认完成', failed: '失败',
-      error: '失败', idle: '尚未更新', unverified: '历史操作未确认' };
-    const tone = state.error || ['failed', 'error'].includes(state.stage) ? 'error'
-      : unverified ? 'warning' : confirmed ? 'success' : state.active ? 'info' : 'neutral';
-    const label = unverified ? '历史操作未确认' : labels[state.stage] || state.stage || '状态未知';
+    const failed = Boolean(state.error) || ['failed', 'error'].includes(state.stage);
+    const tone = failed ? 'error' : unverified ? 'warning' : confirmed ? 'success' : state.active ? 'info' : 'neutral';
+    const label = unverified ? '历史操作未确认' : UPD_STAGE_LABELS[state.stage] || state.stage || '状态未知';
     const logs = state.log || [];
-    body.innerHTML = '<div class="upd-current">当前运行版本：<strong>'
-      + e(state.current_version ? versionText(state.current_version) : '未知') + '</strong></div>'
-      + '<div id="upd-operation" class="alert ' + tone + '">'
+    const signature = [state.stage, state.active, tone, label, confirmed, unverified,
+      state.target_version, state.version, state.error, state.notice, logs.length, logs[logs.length - 1]]
+      .join('|');
+    if (signature === ctx.progSig) return;
+    ctx.progSig = signature;
+    let html = '<div id="upd-operation" class="alert ' + tone + '" data-upd-stage="' + a(state.stage || '') + '">'
       + (state.active ? '当前操作状态：' : '上次操作状态：') + e(label)
       + (state.target_version ? ' · 目标版本 ' + e(versionText(state.target_version)) : '')
-      + (state.legacy_stage && state.legacy_stage !== state.stage ? ' · 原记录阶段：' + e(state.legacy_stage === 'done' ? '完成（未经确认）' : labels[state.legacy_stage] || state.legacy_stage) : '')
-      + (state.error ? '<div class="upd-operation-error">' + e(state.error) + '</div>' : '') + '</div>'
-      + (state.notice ? '<div class="alert warning">' + e(state.notice) + '</div>'
-        : unverified ? '<div class="alert warning">缺少目标版本及操作的完整确认，不能判定成功或自动刷新；可重新读取状态或检查更新。</div>' : '')
-      + '<details id="upd-logs" class="upd-logs"' + (view.open ? ' open' : '') + '>'
-      + '<summary>操作日志（' + logs.length + ' 条）<span class="dim"> · 展开 / 收起</span></summary>'
-      + '<div id="upd-log" class="log-view" tabindex="0" aria-label="更新操作日志">'
-      + (logs.length ? logs.map(e).join('\n') : '暂无日志') + '</div></details>';
-    const details = body.querySelector('#upd-logs');
-    const log = body.querySelector('#upd-log');
-    const restoreLog = () => {
-      if (!details.open) return;
+      + (state.error ? '<div class="upd-operation-error">' + e(state.error) + '</div>' : '') + '</div>';
+    if (state.notice) {
+      html += '<div class="alert warning">' + e(state.notice) + '</div>';
+    } else if (unverified) {
+      html += '<div class="alert warning">缺少目标版本及操作的完整确认，不能判定成功或自动刷新；可重新读取状态或检查更新。</div>';
+    }
+    if (confirmed) {
+      html += '<div class="alert success" id="upd-done">版本已更新为 <strong class="mono">'
+        + e(versionText(state.version || state.target_version)) + '</strong>，请刷新页面以加载新界面。'
+        + '<div><button class="primary sm" id="upd-reload">刷新页面</button></div></div>';
+    }
+    if (state.active || logs.length) {
+      html += '<div class="upd-log-wrap"><div class="upd-log-head">升级过程日志'
+        + '<span class="dim"> · ' + logs.length + ' 条</span></div>'
+        + '<div id="upd-log" class="log-view" tabindex="0" aria-label="更新操作日志">'
+        + (logs.length ? logs.map(e).join('\n') : '暂无日志') + '</div></div>';
+    }
+    box.innerHTML = html;
+    const log = box.querySelector('#upd-log');
+    if (log) {
       log.scrollTop = view.follow ? Math.max(0, log.scrollHeight - log.clientHeight) : view.top;
       log.scrollLeft = view.left;
-    };
-    restoreLog();
-    details.addEventListener('toggle', () => {
-      if (!updateAlive(ctx) || body.querySelector('#upd-logs') !== details) return;
-      view.open = details.open;
-      restoreLog();
+      log.addEventListener('scroll', () => {
+        if (!updateAlive(ctx) || ctx.panel.querySelector('#upd-log') !== log) return;
+        view.top = log.scrollTop;
+        view.left = log.scrollLeft;
+        view.follow = log.scrollHeight - log.clientHeight - log.scrollTop <= 32;
+      });
+    }
+    box.querySelector('#upd-reload')?.addEventListener('click', () => {
+      AD.stopUpdatePanel();
+      location.reload();
     });
-    log.addEventListener('scroll', () => {
-      if (updateAlive(ctx) && body.querySelector('#upd-log') === log) rememberLog(details, log);
-    });
-    ctx.logRendered = true;
   }
 
   async function pollUpdateStatus(ctx) {
@@ -2696,87 +2918,215 @@ AD.views = {};
         updateError(ctx, '操作标识已变化，停止自动刷新，请重新读取状态'); return;
       }
       ctx.state = state;
-      drawUpdateState(ctx, state);
+      drawUpdateRow(ctx);
+      drawUpdateProgress(ctx);
       if (updateConfirmed(state)) {
-        const key = 'autodeploy-reloaded-' + state.operation_id;
-        try {
-          if (!sessionStorage.getItem(key)) {
-            sessionStorage.setItem(key, '1');
-            AD.stopUpdatePanel();
-            location.reload(); return;
-          }
-        } catch (_) { updateError(ctx, '无法保存刷新标记，请手动刷新页面'); }
+        // 已确认：不再轮询状态（操作已结束），但保持会话存活，让重查能重绘
+        // 行与进度区；刷新入口由 drawUpdateProgress 在原位给出。不自动整页
+        // reload，那会打断用户正在看的日志或页面上的其它操作。
+        // 且必须重查一次：上一次检查是拿重启前的版本比出来的，直接沿用会显示
+        // 「可升级到刚装上的那个版本」，点下去只会被后端拒绝。
+        runUpdateCheck(ctx, true);
+        return;
       }
-      if (!state.active) { await updateControls(ctx, state); return; }
+      if (!state.active) { runUpdateCheck(ctx, false); return; }
     } catch (err) {
       if (!updateAlive(ctx)) return;
-      // HTTP 错误不是重启成功；网络错误总预算不因一次连通而重置。
-      if (err.status || ++ctx.failures >= 40) { updateError(ctx, err.message || '重连预算耗尽'); return; }
-      if (!ctx.state) ctx.panel.querySelector('#upd-body').textContent = '暂时失联，正在有限重连…';
+      // HTTP 错误不代表重启成功；网络错误的总预算不因一次连通而重置。
+      if (err.status) { updateError(ctx, err.message || '状态查询失败'); return; }
+      if (++ctx.failures >= 40) { updateError(ctx, '重连预算耗尽，请重新读取状态'); return; }
+      const progress = ctx.panel.querySelector('#upd-progress');
+      if (!ctx.state && progress && !progress.innerHTML) progress.textContent = '暂时失联，正在有限重连…';
     }
     if (updateAlive(ctx)) ctx.timer = setTimeout(() => pollUpdateStatus(ctx), 1500);
   }
 
-  async function updateControls(ctx, state) {
-    const body = ctx.panel.querySelector('#upd-body');
-    const rollbackReason = state.backup_notice || (state.can_rollback
-      ? '备份仅包含代码，数据库和 Python 依赖不会回滚。'
-      : '没有通过结构及版本校验的代码备份，无法自动回滚。');
-    body.insertAdjacentHTML('beforeend', '<div class="field upd-source"><label for="upd-repo">更新源（只使用可信仓库）</label>'
-      + '<div class="upd-source-row"><input id="upd-repo" type="url" placeholder="https://github.com/组织/仓库">'
-      + '<button id="upd-check">保存更新源并强制检查</button></div></div>'
-      + '<section class="upd-check-section" aria-labelledby="upd-check-title"><h3 id="upd-check-title">本次检查结果</h3>'
-      + '<div id="upd-check-result" aria-live="polite"><div class="dim">尚未检查；上次操作状态不代表本次检查结果。</div></div></section>'
-      + '<div class="upd-recovery"><button id="upd-read-state">重新读取状态</button>'
-      + '<button id="upd-rollback"' + (state.can_rollback ? '' : ' disabled aria-describedby="upd-rollback-reason"')
-      + '>回滚上一版本</button></div>'
-      + '<div id="upd-rollback-reason" class="upd-rollback-reason">' + e(rollbackReason) + '</div>');
-    body.querySelector('#upd-read-state').addEventListener('click', () => AD.renderUpdatePanel(ctx.panel));
-    if (state.can_rollback) body.querySelector('#upd-rollback').addEventListener('click', () => startUpdateOperation(ctx, 'rollback'));
+  async function runUpdateCheck(ctx, force) {
+    if (ctx.checking || !updateAlive(ctx)) return;
+    ctx.checking = true;
+    drawUpdateRow(ctx);
     try {
-      const settings = await updateRequest(ctx, '/api/settings');
+      // 后端一次检查最坏是 Releases API（15s）之后再回退 git ls-remote（30s），
+      // 所以这里必须给足预算；沿用 10s 会让界面在后端还没返回时就报「检查失败」。
+      ctx.check = await updateRequest(
+        ctx, '/api/system/update/check' + (force ? '?force=true' : ''), 'GET', undefined, 60000);
+    } catch (err) {
       if (!updateAlive(ctx)) return;
-      body.querySelector('#upd-repo').value = settings.settings.update_repo || '';
-    } catch (err) { updateError(ctx, err.message); }
-    if (!updateAlive(ctx)) return;
-    body.querySelector('#upd-check').addEventListener('click', async (event) => {
-      event.target.disabled = true;
-      const result = body.querySelector('#upd-check-result');
-      result.innerHTML = '<div class="dim">正在保存更新源并检查…</div>';
-      try {
-        await updateRequest(ctx, '/api/settings', 'PUT', { update_repo: body.querySelector('#upd-repo').value.trim() });
-        const check = await updateRequest(ctx, '/api/system/update/check?force=true');
-        if (!updateAlive(ctx)) return;
-        if (check.error) throw new Error(check.error);
-        result.innerHTML = '<div>检查时运行版本 ' + e(versionText(check.current)) + '，更新源最新版本 ' + e(versionText(check.latest)) + '</div>'
-          + (check.update_available ? '<button id="upd-start">更新到 ' + e(versionText(check.latest)) + '</button>' : '<div>本次检查未发现可用更新</div>');
-        result.querySelector('#upd-start')?.addEventListener('click', () => startUpdateOperation(ctx, 'update', check.latest));
-      } catch (err) {
-        if (updateAlive(ctx)) result.innerHTML = '<div class="alert error">本次检查失败：' + e(err.message) + '</div>';
-      }
-      finally { if (updateAlive(ctx)) event.target.disabled = false; }
-    });
+      const current = (ctx.state && ctx.state.current_version) || '';
+      ctx.check = { error: err.message || '检查失败', current, latest: '', update_available: false };
+    } finally {
+      ctx.checking = false;
+      if (updateAlive(ctx)) drawUpdateRow(ctx);
+    }
   }
 
+  // -------------------------------------------------------- 升级 / 回滚
+  /** 返回是否已被后端受理；调用方可据此决定要不要关闭当前弹窗。 */
   async function startUpdateOperation(ctx, operation, target) {
-    if (ctx.submitting) return;
+    if (ctx.submitting) return false;
     ctx.submitting = true;
     try {
-      const confirmed = await AD.confirm({ title: operation === 'update' ? '更新到 ' + versionText(target) : '回滚上一版本',
-        message: '将替换程序代码并重启服务。仅在后端确认目标版本运行后自动刷新。',
-        detail: '备份仅含代码，不回滚数据库或 Python 依赖；降级可能不兼容。',
-        confirmText: '确认执行', danger: operation === 'rollback' });
-      if (!confirmed || !updateAlive(ctx)) return;
-      const result = await updateRequest(ctx, '/api/system/self-update' + (operation === 'rollback' ? '/rollback' : ''),
-        'POST', operation === 'update' ? { target_version: target } : {});
-      if (!updateAlive(ctx)) return;
+      const settings = (ctx.settings && ctx.settings.settings) || {};
+      const repo = settings.update_repo || '默认更新源（github.com/j9kkk/git-deploy）';
+      const proxy = (ctx.settings && ctx.settings.proxy_description) || '未启用';
+      const confirmed = await AD.confirm({
+        title: operation === 'update' ? '更新到 ' + versionText(target) : '回滚到 ' + versionText(target),
+        message: '将替换程序代码并重启服务；只有重启后确认目标版本运行才算成功。',
+        detail: '更新源：' + repo + '；网络代理：' + proxy
+          + '；备份仅含代码，不回滚数据库或 Python 依赖，降级可能不兼容。',
+        confirmText: '确认执行',
+        danger: operation === 'rollback',
+      });
+      if (!confirmed || !updateAlive(ctx)) return false;
+      const path = '/api/system/self-update' + (operation === 'rollback' ? '/rollback' : '');
+      const result = await updateRequest(ctx, path, 'POST', { target_version: target }, 30000);
+      if (!updateAlive(ctx)) return false;
       ctx.operationId = result.state.operation_id;
       ctx.deadline = Date.now() + 15 * 60 * 1000;
       ctx.polls = 0;
       ctx.failures = 0;
+      ctx.state = { ...(ctx.state || {}), ...result.state, active: true };
+      drawUpdateRow(ctx);
+      drawUpdateProgress(ctx);
       pollUpdateStatus(ctx);
-    } catch (err) { updateError(ctx, err.message + '；请求可能已送达，可重新读取状态确认'); }
-    finally { ctx.submitting = false; }
+      return true;
+    } catch (err) {
+      // HTTP 状态码是确定的拒绝（后端已校验并返回原因），不必提示「可能已送达」；
+      // 只有请求本身没拿到响应（网络中断/超时）才需要提醒用户核对状态。
+      updateError(ctx, err.status
+        ? err.message
+        : err.message + '；请求可能已送达，可重新读取状态确认');
+      return false;
+    } finally { ctx.submitting = false; }
+  }
+
+  // ----------------------------------------------------------- 配置弹窗
+  function openUpdateConfig(ctx) {
+    const settings = (ctx.settings && ctx.settings.settings) || {};
+    const proxy = (ctx.settings && ctx.settings.proxy_description) || '未启用';
+    AD.Modal.open({
+      title: '更新源配置',
+      size: 'narrow',
+      body: '<div class="field"><label for="upd-repo">更新源（只使用可信仓库）</label>'
+        + '<input id="upd-repo" type="url" value="' + a(settings.update_repo || '') + '" '
+        + 'placeholder="https://github.com/组织/仓库">'
+        + '<div class="hint">GitHub 仓库优先查 Releases，失败后回退到 git ls-remote；'
+        + '也可填内网镜像或本地路径。保存后会立即强制检查一次。</div></div>'
+        + '<dl class="kv"><dt>网络代理</dt><dd>' + e(proxy) + '</dd></dl>'
+        + '<div id="upd-config-result"></div>',
+      footer: '<button data-close>关闭</button><button class="primary" id="upd-config-save">保存并检查</button>',
+      onMount(backdrop) {
+        backdrop.querySelector('#upd-config-save').addEventListener('click', async (event) => {
+          const result = backdrop.querySelector('#upd-config-result');
+          const repo = backdrop.querySelector('#upd-repo').value.trim();
+          AD.setBusy(event.currentTarget, true, '保存中…');
+          try {
+            const saved = await updateRequest(ctx, '/api/settings', 'PUT', { update_repo: repo }, 20000);
+            if (!updateAlive(ctx)) return;
+            ctx.settings = { ...(ctx.settings || {}), ...saved };
+            ctx.check = await updateRequest(
+              ctx, '/api/system/update/check?force=true', 'GET', undefined, 60000);
+            if (!updateAlive(ctx)) return;
+            drawUpdateRow(ctx);
+            result.innerHTML = ctx.check.error
+              ? '<div class="alert error">本次检查失败：' + e(ctx.check.error) + '</div>'
+              : '<div class="alert success">更新源已保存：最新版本 ' + e(versionText(ctx.check.latest))
+                + (ctx.check.update_available ? '，可升级' : '（当前已是最新）') + '</div>';
+          } catch (err) {
+            if (updateAlive(ctx)) result.innerHTML = '<div class="alert error">保存失败：' + e(err.message) + '</div>';
+          } finally { AD.setBusy(event.currentTarget, false); }
+        });
+      },
+    });
+  }
+
+  // ------------------------------------------------------- 升级日志弹窗
+  function stamp(seconds) {
+    const value = Number(seconds);
+    if (!value) return '时间未知';
+    const date = new Date(value * 1000);
+    const two = (n) => String(n).padStart(2, '0');
+    return date.getFullYear() + '-' + two(date.getMonth() + 1) + '-' + two(date.getDate())
+      + ' ' + two(date.getHours()) + ':' + two(date.getMinutes());
+  }
+
+  function restoreActionHtml(entry, current, backups) {
+    // 「回滚到这个版本」= 回到本次操作替换掉的那个版本（它的备份版本）。
+    const restore = String(entry.backup_version || '');
+    if (!restore) return '<span class="faint">无备份版本</span>';
+    if (bareVersion(restore) === bareVersion(current)) return '<span class="faint">已是当前版本</span>';
+    const known = backups.some((item) => bareVersion(item.version) === bareVersion(restore));
+    if (known) return '<button class="sm" data-upd-restore="' + a(restore) + '">回滚到 '
+      + e(versionText(restore)) + '</button>';
+    return '<button class="sm" disabled title="没有该版本通过校验的代码备份">回滚到 '
+      + e(versionText(restore)) + '</button>';
+  }
+
+  function historyItemHtml(entry, current, backups) {
+    const operation = entry.operation === 'rollback' ? '回滚' : '更新';
+    const done = entry.stage === 'done';
+    const tone = done ? 'success' : entry.error ? 'failed' : 'neutral';
+    const label = done ? '已确认完成' : (UPD_STAGE_LABELS[entry.stage] || entry.stage || '未知');
+    const logs = entry.log || [];
+    return '<div class="upd-history-item">'
+      + '<div class="upd-history-head">'
+      + '<span class="badge ' + tone + '">' + e(label) + '</span>'
+      + '<span>' + operation + '到 <strong class="mono">'
+      + e(versionText(entry.target_version || entry.current_version)) + '</strong></span>'
+      + '<span class="dim">原版本 ' + e(versionText(entry.previous_version) || '未知')
+      + ' · ' + e(stamp(entry.finished_at || entry.started_at)) + '</span>'
+      + '<div class="spacer"></div>'
+      + '<span class="upd-history-actions" data-upd-actions>'
+      + restoreActionHtml(entry, current, backups) + '</span>'
+      + '</div>'
+      + (entry.error ? '<div class="alert error">' + e(entry.error) + '</div>' : '')
+      + '<div class="log-view upd-history-log">'
+      + (logs.length ? logs.map(e).join('\n') : '暂无日志') + '</div>'
+      + '</div>';
+  }
+
+  async function openUpdateHistory(ctx) {
+    let data;
+    try { data = await updateRequest(ctx, '/api/system/self-update/history', 'GET', undefined, 20000); }
+    catch (err) { if (updateAlive(ctx)) updateError(ctx, '读取升级日志失败：' + err.message); return; }
+    const entries = data.entries || [];
+    const backups = data.backups || [];
+    const current = data.current_version || '';
+    AD.Modal.open({
+      title: '升级日志',
+      size: 'wide',
+      body: (entries.length
+          ? entries.map((entry) => historyItemHtml(entry, current, backups)).join('')
+          : '<div class="empty">还没有升级记录</div>')
+        + '<div class="upd-history-note">可回滚的版本：'
+        + (backups.length
+          ? e(backups.map((item) => versionText(item.version)).join('、')) + '（仅代码，数据库与依赖不回滚）'
+          : '暂无通过校验的代码备份，无法自动回滚') + '</div>',
+      onMount(backdrop) {
+        const bindRestore = (slot, version) => {
+          slot.innerHTML = '<button class="sm" data-upd-restore="' + a(version) + '">回滚到 '
+            + e(versionText(version)) + '</button>';
+          slot.querySelector('[data-upd-restore]').addEventListener('click', () => promptRestore(slot, version));
+        };
+        const promptRestore = (slot, version) => {
+          slot.innerHTML = '<span class="dim">确认回滚到 ' + e(versionText(version)) + '？</span>'
+            + '<button class="danger sm" data-upd-confirm>确认回滚</button>'
+            + '<button class="ghost sm" data-upd-cancel>取消</button>';
+          slot.querySelector('[data-upd-cancel]').addEventListener('click', () => bindRestore(slot, version));
+          slot.querySelector('[data-upd-confirm]').addEventListener('click', async (event) => {
+            AD.setBusy(event.currentTarget, true, '回滚中…');
+            // 只有后端受理了才关闭弹窗：被拒绝时保留弹窗，错误提示才不会被遮住。
+            const accepted = await startUpdateOperation(ctx, 'rollback', version);
+            if (accepted && updateAlive(ctx)) AD.Modal.close();
+            else { AD.setBusy(event.currentTarget, false); bindRestore(slot, version); }
+          });
+        };
+        backdrop.querySelectorAll('[data-upd-restore]').forEach((button) => {
+          const version = button.dataset.updRestore;
+          button.addEventListener('click', () => promptRestore(button.closest('[data-upd-actions]'), version));
+        });
+      },
+    });
   }
 
 })(window.AD);

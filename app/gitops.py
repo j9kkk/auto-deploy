@@ -773,6 +773,48 @@ def test_credentials(
     return False, result.error or "连接失败"
 
 
+def ls_remote_tags(
+    *,
+    repo_url: str,
+    tmp_dir: Path,
+    timeout: int = 30,
+    proxy: Mapping[str, str] | None = None,
+    attempts: int = 2,
+) -> CommandResult:
+    """列出远端标签，复用与部署完全相同的 git 环境。
+
+    更新检查的 git 回退路径必须走这里，而不是自己拼 ``git ls-remote``：
+    只有这样才能拿到 ``http.version=HTTP/1.1`` 等抗抖配置、代理环境以及
+    ``GIT_TERMINAL_PROMPT=0``（否则在缺少凭据时会挂在交互提示上直到超时）。
+    """
+    problem = validate_repo_url(repo_url)
+    if problem:
+        return CommandResult(
+            command="git ls-remote --tags", exit_code=1, output="", duration_ms=0, error=problem
+        )
+
+    # 先探测可达性：不可达时几秒内给出「无法连接 <host>:<port>」，
+    # 而不是让更新检查干等一次完整的 ls-remote 超时。
+    unreachable = check_reachable(repo_url, proxy_url=_proxy_url_of(proxy))
+    if unreachable:
+        return CommandResult(
+            command="git ls-remote --tags", exit_code=1, output="", duration_ms=0, error=unreachable
+        )
+
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    env = _git_env(proxy=proxy, tmp_dir=tmp_dir)
+    return _run_git(
+        ["ls-remote", "--tags", "--", repo_url],
+        cwd=None,
+        env=env,
+        timeout=timeout,
+        log=None,
+        label="更新检查",
+        attempts=attempts,
+        retry_budget_seconds=timeout,
+    )
+
+
 def _remove_tree(path: Path) -> None:
     import shutil
 

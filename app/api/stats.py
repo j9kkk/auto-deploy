@@ -306,6 +306,23 @@ def self_update_status(
     }
 
 
+@router.get("/system/self-update/history")
+def self_update_history(
+    service: Service = Depends(get_service),
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    """历次更新的日志与可回滚的目标版本。
+
+    「升级日志」按钮的数据来源：每条记录都带该次操作的完整日志与最终结果，
+    ``backups`` 是当前仍可回滚的版本清单（按备份校验结果给出，不含路径）。
+    """
+    return {
+        "entries": service.selfupdate.history(),
+        "backups": service.selfupdate.backups(),
+        "current_version": VERSION,
+    }
+
+
 @router.post("/system/self-update")
 def start_self_update(
     payload: dict[str, Any] | None = None,
@@ -326,14 +343,18 @@ def start_self_update(
 
 @router.post("/system/self-update/rollback")
 def rollback_self_update(
+    payload: dict[str, Any] | None = None,
     request: Request = None,  # type: ignore[assignment]
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
+    body = payload or {}
+    target = body.get("target_version")
     try:
-        result = service.selfupdate.rollback()
+        result = service.selfupdate.rollback(target if isinstance(target, str) else None)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit(service, "self_update_rollback", actor=user["username"],
-          target="self-update", ip=client_ip(request) if request else "")
+          target="self-update", detail=f"target={target}" if target else "最近备份",
+          ip=client_ip(request) if request else "")
     return result
