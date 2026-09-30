@@ -6,6 +6,11 @@
 #
 # Creates a dedicated system user, installs the service and starts it.  The
 # admin password is generated on first start and printed to the journal.
+#
+# Re-running the script upgrades an existing installation in place: program
+# files and dependencies are replaced, the systemd unit and sudoers are
+# rewritten from this version, and the data directory is never touched.
+# scripts/bootstrap.sh wraps this script for one-command remote installs.
 
 set -euo pipefail
 
@@ -19,6 +24,7 @@ HOST="${AUTODEPLOY_HOST:-0.0.0.0}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 log()  { printf '\033[36m[install]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[install]\033[0m %s\n' "$*"; }
 fail() { printf '\033[31m[install]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || fail "请以 root 运行（sudo $0）"
@@ -38,8 +44,16 @@ if ! command -v git >/dev/null 2>&1; then
   fi
 fi
 
-PYTHON_BIN="$(command -v python3 || true)"
-[ -n "$PYTHON_BIN" ] || fail "未找到 python3，请先安装 Python 3.10+"
+PYTHON_BIN="${AUTODEPLOY_PYTHON:-python3}"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 \
+  || fail "未找到 Python 解释器 ${PYTHON_BIN}（需 3.10+，可用 AUTODEPLOY_PYTHON 指定）"
+PYTHON_BIN="$(command -v "$PYTHON_BIN")"
+# 老系统（如 Ubuntu 20.04 自带 3.8）上提前给出明确提示，
+# 而不是让依赖安装半途报错。
+"$PYTHON_BIN" - <<'PY' || fail "Python 3.10+ 是必需的（当前 $("$PYTHON_BIN" -V 2>&1)）。系统 python3 过旧时，可先安装新版 Python 3，再用 AUTODEPLOY_PYTHON=python3.x 指定后重试"
+import sys
+sys.exit(0 if sys.version_info >= (3, 10) else 1)
+PY
 
 # --- user ------------------------------------------------------------------
 if ! id -u "$RUN_USER" >/dev/null 2>&1; then
@@ -98,9 +112,11 @@ else
 fi
 
 # --- files -----------------------------------------------------------------
+# scripts/ 与 README.md 一并安装：一键安装（bootstrap.sh）从临时目录运行，
+# 装好后卸载/修复脚本必须有一个不依赖当初克隆位置的固定路径。
 log "复制程序文件到 $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
-for item in app web requirements.txt run.sh; do
+for item in app web requirements.txt run.sh scripts README.md; do
   rm -rf "${INSTALL_DIR:?}/$item"
   cp -R "$ROOT_DIR/$item" "$INSTALL_DIR/"
 done
@@ -110,6 +126,14 @@ mkdir -p "$DATA_DIR"
 chown -R "$RUN_USER:$RUN_USER" "$INSTALL_DIR" "$DATA_DIR"
 
 log "创建虚拟环境并安装依赖"
+# 系统升级 Python 后，旧虚拟环境的解释器软链可能悬空（-e 测不出悬空软链，
+# 需连 -L 一起判断）。先验证再用，失效则重建，避免升级卡死在依赖安装上。
+VENV_PY="$INSTALL_DIR/.venv/bin/python"
+if { [ -e "$VENV_PY" ] || [ -L "$VENV_PY" ]; } \
+    && ! "$VENV_PY" -c "import sys" >/dev/null 2>&1; then
+  log "虚拟环境不可用（系统 Python 可能已升级），重建虚拟环境"
+  rm -rf "${INSTALL_DIR:?}/.venv"
+fi
 if [ ! -x "$INSTALL_DIR/.venv/bin/python" ]; then
   sudo -u "$RUN_USER" "$PYTHON_BIN" -m venv "$INSTALL_DIR/.venv"
 fi
@@ -186,8 +210,8 @@ cat <<EOF
       systemctl restart $SERVICE_NAME
       journalctl -u $SERVICE_NAME -f
 
-  卸载：sudo $ROOT_DIR/scripts/uninstall.sh          （保留数据）
-        sudo $ROOT_DIR/scripts/uninstall.sh --purge  （连数据一起删）
+  卸载：sudo $INSTALL_DIR/scripts/uninstall.sh          （保留数据）
+        sudo $INSTALL_DIR/scripts/uninstall.sh --purge  （连数据一起删）
 
   Docker 部署方式（docker build / docker compose）所需的服务账号
   docker 组权限已自动配置。

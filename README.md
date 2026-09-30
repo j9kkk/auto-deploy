@@ -150,13 +150,38 @@ cd git-deploy
 
 ## 安装为 systemd 服务
 
+**方式一：一键安装（推荐）**——不需要先克隆仓库，在目标服务器上执行一条命令：
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/j9kkk/git-deploy/main/scripts/bootstrap.sh | sudo bash
+```
+
+脚本自动完成：下载最新发布版本 → 检查 git / Python 3.10+ → 创建系统用户与
+sudo 授权 → 复制程序到 `/opt/autodeploy` → 建立虚拟环境 → 写入并启动 systemd 单元。
+
+- **升级**：重复执行同一条命令即升级到最新发布版。数据目录不受影响
+  （任务配置、运行历史与已发布的站点都保留）；
+- **已有安装的自定义配置自动保留**：安装时用过 `AUTODEPLOY_*` 环境变量或
+  自定义服务名的，重跑时会从现有 systemd 单元读取并沿用，不会被冲回默认值；
+- 需要代理时先 `export https_proxy=…` 再执行；
+- 也可指定版本或仓库（通过 `sudo env` 透传，避免被 sudo 的环境重置丢弃）：
+  `curl -fsSL … | sudo env AUTODEPLOY_REF=v0.1.0 bash`，
+  或 `AUTODEPLOY_REPO_URL=<fork 地址>`；
+- 已克隆仓库的也可以直接 `sudo bash scripts/bootstrap.sh`，非 root 执行时会
+  自动通过 sudo 提权。
+
+**方式二：从源码目录安装**（已克隆仓库或离线机器）：
+
+```bash
+git clone https://github.com/j9kkk/git-deploy.git
+cd git-deploy
 sudo ./scripts/install.sh
 ```
 
-脚本会完成：安装 git、创建 `autodeploy` 系统用户、复制程序到 `/opt/autodeploy`、
+安装脚本会完成：安装 git、创建 `autodeploy` 系统用户、复制程序到 `/opt/autodeploy`、
 创建数据目录 `/var/lib/autodeploy`、建立虚拟环境、写入并启动 systemd 单元，
-同时为 systemd 部署方式配置最小化的 sudo 权限。
+同时为 systemd 部署方式配置最小化的 sudo 权限。重复执行同样是对已有安装的
+原地升级。
 
 查看初始密码与日志：
 
@@ -166,7 +191,9 @@ journalctl -u autodeploy -f
 ```
 
 可用环境变量调整安装位置：`AUTODEPLOY_INSTALL_DIR`、`AUTODEPLOY_DATA_DIR`、
-`AUTODEPLOY_USER`、`AUTODEPLOY_PORT`、`AUTODEPLOY_HOST`。
+`AUTODEPLOY_USER`、`AUTODEPLOY_PORT`、`AUTODEPLOY_HOST`；也可用
+`AUTODEPLOY_SERVICE_NAME` 更换服务名、`AUTODEPLOY_PYTHON` 指定 Python 解释器
+（默认 `python3`，需 3.10+）。
 
 ### Docker 部署方式
 
@@ -262,16 +289,17 @@ GitHub 仓库优先查 Releases API，失败后回退到 `git ls-remote --tags`�
 
 ### 手动方式（备用）
 
-仍可按 v1.2.1 文档的方式用一个部署任务自更新（模板见该版本 README），或直接
-重跑 `scripts/install.sh`。适用于：更新源不可用，或需要同步 systemd 单元 /
-sudoers 变更的场景。
+仍可用一个部署任务让服务部署它自己（把本仓库当作任务目标，要点见「自我更新」
+章节）。无法使用应用内更新时，重跑一键安装命令即可升级：它重新下载最新发布版
+并原地替换程序文件，数据目录不受影响。更新源不可用、或需要同步 systemd 单元 /
+sudoers 变更的场景，则在源码目录重跑 `scripts/install.sh`。
 
 ### 任务配置
 
 | 配置项 | 值 |
 |--------|-----|
 | 仓库地址 | `https://github.com/j9kkk/git-deploy.git`（或镜像前缀） |
-| 分支 | `main`；生产环境建议填稳定 tag（如 `v1.2.1`），git 拉取 tag 名同样有效 |
+| 分支 | `main`；生产环境建议填稳定 tag（如 `v0.1.0`），git 拉取 tag 名同样有效 |
 | 部署方式 | 自定义脚本 |
 | 打包路径 | `app`、`web`、`requirements.txt`、`run.sh`（每行一条） |
 | 超时 | 建议 300 秒以上（含 `pip install`） |
@@ -370,7 +398,8 @@ git-deploy/
 │   └── api/            # 路由：auth / tasks / runs / credentials / stats / settings
 ├── web/                # 控制台前端（原生 JS，无构建步骤）
 ├── tests/selfcheck.py  # 自检脚本（无 pytest 依赖，含端到端检查）
-├── scripts/install.sh  # systemd 安装脚本
+├── scripts/bootstrap.sh # 一键安装/升级（远程下载，无需克隆仓库）
+├── scripts/install.sh   # systemd 安装脚本（重复执行即原地升级）
 ├── deploy/             # 反向代理示例
 ├── .github/            # CI 工作流、Issue 与 PR 模板
 ├── run.sh              # 启动脚本

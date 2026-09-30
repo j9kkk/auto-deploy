@@ -1441,6 +1441,40 @@ def run() -> int:
     check("README 含自我更新章节", "## 自我更新" in readme)
 
     # ------------------------------------------------------------------
+    section("一键安装脚本")
+    bootstrap_sh = (ROOT / "scripts" / "bootstrap.sh").read_text(encoding="utf-8")
+    check("一键脚本把系统改动全部委托给 install.sh（升级自动继承新授权/单元）",
+          "scripts/install.sh" in bootstrap_sh)
+    check("一键脚本默认安装最新发布版本（与应用内自更新一致）",
+          "releases/latest" in bootstrap_sh and "archive/refs/tags" in bootstrap_sh)
+    check("一键脚本识别并沿用既有安装的自定义配置",
+          "WorkingDirectory=" in bootstrap_sh
+          and "AUTODEPLOY_SERVICE_NAME" in bootstrap_sh
+          and "AUTODEPLOY_PORT" in bootstrap_sh
+          and "AUTODEPLOY_INSTALL_DIR" in bootstrap_sh)
+    check("一键脚本校验压缩包完整性（损坏的下载不会半途安装）",
+          "tar -tzf" in bootstrap_sh)
+    check("一键脚本保存为文件后非 root 执行可自动提权（文件可重读）",
+          "AUTODEPLOY_ESCALATED" in bootstrap_sh and "exec sudo env" in bootstrap_sh)
+    check("一键脚本管道模式不落盘自提权（bash 增量读 stdin，落盘副本会截断）",
+          "AUTODEPLOY_SAVED_SCRIPT" not in bootstrap_sh
+          and "cat >" not in bootstrap_sh)
+    check("install.sh 随程序复制 scripts 与 README（一键安装后可就地卸载/修复）",
+          "for item in app web requirements.txt run.sh scripts README.md" in install_sh)
+    check("install.sh 校验 Python 版本（老系统一键安装时给出明确提示）",
+          "version_info >= (3, 10)" in install_sh)
+    check("install.sh 重建失效虚拟环境（系统 Python 升级后仍可一键升级）",
+          "重建虚拟环境" in install_sh
+          and 'rm -rf "${INSTALL_DIR:?}/.venv"' in install_sh)
+    for script_name in ("install.sh", "uninstall.sh", "bootstrap.sh"):
+        syntax = subprocess.run(
+            ["bash", "-n", str(ROOT / "scripts" / script_name)],
+            capture_output=True, text=True,
+        )
+        check(f"{script_name} 语法有效（bash -n）", syntax.returncode == 0,
+              syntax.stderr.strip())
+
+    # ------------------------------------------------------------------
     section("凭据与代理")
 
     from app.config import Settings, describe_proxy, proxy_env, proxy_url_with_auth

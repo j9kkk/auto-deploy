@@ -46,6 +46,8 @@ jobs:
         run: |
           bash -n run.sh
           bash -n scripts/install.sh
+          bash -n scripts/uninstall.sh
+          bash -n scripts/bootstrap.sh
 
       - name: 运行自检
         run: python tests/selfcheck.py
