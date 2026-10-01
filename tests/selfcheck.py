@@ -1526,7 +1526,7 @@ def run() -> int:
         check("退出后无法访问", response.status_code == 401)
 
     # ------------------------------------------------------------------
-    section("部署脚本（Docker Compose 一键部署）")
+    section("部署脚本（GHCR 镜像 + Compose 一键部署）")
     from app.config import UPDATE_REPO_DEFAULT as config_repo_default
     from app.selfupdate import UPDATE_REPO_DEFAULT as selfupdate_repo_default
     check("默认更新源指向 auto-deploy 仓库",
@@ -1539,19 +1539,25 @@ def run() -> int:
           "scripts/bootstrap.sh" in readme and "docker compose up" in readme)
 
     bootstrap_sh = (ROOT / "scripts" / "bootstrap.sh").read_text(encoding="utf-8")
-    check("一键脚本基于 Docker Compose 构建启动",
-          "docker compose" in bootstrap_sh and "up -d --build" in bootstrap_sh)
-    check("一键脚本默认使用 auto-deploy 仓库地址",
-          "https://github.com/j9kkk/auto-deploy.git" in bootstrap_sh)
+    check("一键脚本拉取预构建镜像启动（无需克隆仓库与本地构建）",
+          "compose pull" in bootstrap_sh and "up -d --no-build" in bootstrap_sh
+          and "git clone" not in bootstrap_sh)
+    check("一键脚本从官方仓库下载 compose 文件",
+          "raw.githubusercontent.com/j9kkk/auto-deploy" in bootstrap_sh
+          and "docker-compose.yml" in bootstrap_sh)
+    check("一键脚本自动创建安装目录 /opt/auto-deploy",
+          "/opt/auto-deploy" in bootstrap_sh and "mkdir -p" in bootstrap_sh)
     check("一键脚本自动安装缺失的 Docker 并校验 compose 插件",
           "get.docker.com" in bootstrap_sh and "docker compose version" in bootstrap_sh)
-    check("一键脚本重复执行即升级（已有安装原地拉取更新）",
-          "git -C" in bootstrap_sh and "reset --hard FETCH_HEAD" in bootstrap_sh)
+    check("一键脚本下载自动重试并校验内容（网络抖动与半截文件不会静默落盘）",
+          "for attempt in 1 2 3" in bootstrap_sh and 'grep -q "^services:"' in bootstrap_sh)
+    check("一键脚本支持版本锁定（AUTODEPLOY_VERSION 同步锁定镜像 tag）",
+          "AUTODEPLOY_VERSION" in bootstrap_sh and "AUTODEPLOY_IMAGE_TAG" in bootstrap_sh)
+    check("一键脚本支持离线安装与镜像源替换",
+          "AUTODEPLOY_COMPOSE_FILE" in bootstrap_sh and "AUTODEPLOY_IMAGE" in bootstrap_sh)
     check("一键脚本等待 /api/health 就绪（无人值守安装也能确认服务可用）",
           "/api/health" in bootstrap_sh)
     check("一键脚本从日志提取一次性初始密码", "初始密码" in bootstrap_sh)
-    check("一键脚本拉取源码自动重试（GitHub 偶发抖动）",
-          "for attempt in 1 2 3" in bootstrap_sh)
     check("一键脚本管道模式不读取自身文件（bash 增量读 stdin，落盘副本会截断）",
           "BASH_SOURCE" not in bootstrap_sh and "$0" not in bootstrap_sh)
     check("已移除 systemd 安装脚本（仅保留 Docker Compose 部署方式）",
@@ -1559,6 +1565,8 @@ def run() -> int:
           and not (ROOT / "scripts" / "uninstall.sh").exists())
 
     compose_text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    check("Compose 默认使用 GHCR 官方镜像并保留本地构建入口",
+          "ghcr.io/j9kkk/auto-deploy" in compose_text and "build: ." in compose_text)
     check("Compose 定义 autodeploy 服务并持久化 /app/data",
           "autodeploy:" in compose_text and "autodeploy-data:/app/data" in compose_text)
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
@@ -1566,6 +1574,13 @@ def run() -> int:
           "git openssh-client" in dockerfile and "docker-compose-plugin" in dockerfile)
     check("镜像以非 root 用户运行", "USER autodeploy" in dockerfile)
     check("镜像自带健康检查", "HEALTHCHECK" in dockerfile and "/api/health" in dockerfile)
+
+    docker_wf = (ROOT / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
+    check("CI 自动构建并推送 amd64/arm64 镜像到 GHCR",
+          "ghcr.io/j9kkk/auto-deploy" in docker_wf
+          and "docker/build-push-action" in docker_wf
+          and "linux/amd64,linux/arm64" in docker_wf
+          and "packages: write" in docker_wf)
     syntax = subprocess.run(
         ["bash", "-n", str(ROOT / "scripts" / "bootstrap.sh")],
         capture_output=True, text=True,

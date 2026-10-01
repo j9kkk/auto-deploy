@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
-# AutoDeploy 一键部署 / 升级脚本（Docker Compose 版）。
+# AutoDeploy 一键部署 / 升级脚本（GHCR 预构建镜像 + Docker Compose）。
+#
+# 流程：检测系统环境并安装缺失的 Docker 组件 → 创建安装目录 /opt/auto-deploy
+# → 下载 docker-compose.yml → 拉取 GitHub Actions 构建的官方镜像并启动。
+# 无需克隆仓库，无需本地构建。
 #
 # 用法：
-#   远程一键部署（自动安装 Docker、克隆源码、构建并启动）：
-#     curl -fsSL https://raw.githubusercontent.com/j9kkk/auto-deploy/main/scripts/bootstrap.sh | bash
-#   已克隆仓库时本地执行；重复执行即升级到最新代码：
-#     ./scripts/bootstrap.sh
+#   curl -fsSL https://raw.githubusercontent.com/j9kkk/auto-deploy/main/scripts/bootstrap.sh | bash
+#   重复执行同一条命令即升级到最新镜像（任务数据不受影响）。
 #
 # 可用环境变量：
-#   AUTODEPLOY_REPO_URL     代码仓库地址（默认官方仓库）
-#   AUTODEPLOY_BRANCH       分支或 tag（默认 main）
-#   AUTODEPLOY_INSTALL_DIR  源码目录（默认 /opt/auto-deploy）
-#   AUTODEPLOY_PORT         服务端口（默认 8770）
-#
-# 任务数据保存在 Docker 数据卷 auto-deploy_autodeploy-data 中，升级不影响数据。
+#   AUTODEPLOY_VERSION       部署版本：main（默认，跟随 latest 镜像）或版本 tag
+#                            （如 v0.2.0，compose 文件与镜像 tag 同步锁定）
+#   AUTODEPLOY_INSTALL_DIR   安装目录（默认 /opt/auto-deploy）
+#   AUTODEPLOY_PORT          服务端口（默认 8770）
+#   AUTODEPLOY_IMAGE         镜像地址（默认 ghcr.io/j9kkk/auto-deploy，可换成镜像仓库）
+#   AUTODEPLOY_COMPOSE_FILE  本地 docker-compose.yml 路径（离线安装用，跳过在线下载）
 
 set -euo pipefail
 
-REPO_URL="${AUTODEPLOY_REPO_URL:-https://github.com/j9kkk/auto-deploy.git}"
-BRANCH="${AUTODEPLOY_BRANCH:-main}"
+RAW_BASE="https://raw.githubusercontent.com/j9kkk/auto-deploy"
+VERSION="${AUTODEPLOY_VERSION:-main}"
 INSTALL_DIR="${AUTODEPLOY_INSTALL_DIR:-/opt/auto-deploy}"
 PORT="${AUTODEPLOY_PORT:-}"
 
@@ -27,15 +29,14 @@ fail() { printf '\033[31m[auto-deploy]\033[0m %s\n' "$*" >&2; exit 1; }
 
 command -v curl >/dev/null 2>&1 || fail "缺少 curl，请先安装（apt/dnf/yum install curl）"
 
-# 系统级改动（安装 Docker、写 /opt）逐条显式 sudo。
-# 绝不把本脚本落盘后再提权重跑：bash 从管道增量读 stdin，落盘副本会截断。
+# 系统级改动逐条显式 sudo；绝不落盘自提权（bash 管道增量读 stdin，落盘副本会截断）。
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null 2>&1 || fail "当前非 root 且未安装 sudo，请改用 root 执行"
   SUDO="sudo"
 fi
 
-# ---- Docker 引擎与 compose 插件 ----
+# ---- Docker 引擎与 compose 插件：缺失则自动安装 ----
 if ! command -v docker >/dev/null 2>&1; then
   log "未检测到 Docker，正在通过官方脚本安装（需要几分钟）…"
   curl -fsSL https://get.docker.com | ${SUDO} sh \
@@ -47,71 +48,71 @@ if ! docker compose version >/dev/null 2>&1; then
   fail "缺少 Docker Compose 插件（v2），请先安装 docker-compose-plugin 后重试"
 fi
 
-# 非 root 且不在 docker 组时，docker 命令统一走 sudo（组成员需重新登录才生效）
 if docker info >/dev/null 2>&1; then
   DOCKER="docker"
 else
-  DOCKER="${SUDO} docker"
+  DOCKER="${SUDO} docker"   # 非 root 且不在 docker 组：统一走 sudo
 fi
 
-# ---- git ----
-if ! command -v git >/dev/null 2>&1; then
-  log "未检测到 git，尝试用系统包管理器安装…"
-  if command -v apt-get >/dev/null 2>&1; then
-    ${SUDO} apt-get update -y || true
-    ${SUDO} apt-get install -y git || true
-  elif command -v dnf >/dev/null 2>&1; then
-    ${SUDO} dnf install -y git || true
-  elif command -v yum >/dev/null 2>&1; then
-    ${SUDO} yum install -y git || true
-  elif command -v apk >/dev/null 2>&1; then
-    ${SUDO} apk add git || true
-  fi
-  command -v git >/dev/null 2>&1 || fail "请先安装 git 后重试"
+# ---- 安装目录 ----
+# 旧版脚本曾把仓库克隆到安装目录；克隆残留与镜像部署混放会互相覆盖，直接拒绝。
+if [ -d "${INSTALL_DIR}/.git" ]; then
+  fail "目录 ${INSTALL_DIR} 是旧版克隆安装的残留，请先备份其中的 .env 后删除该目录再重试"
 fi
-
-# ---- 源码：首次克隆，已有安装则原地更新 ----
-# GitHub 偶发抖动，失败自动重试三次。
-if [ -d "${INSTALL_DIR}" ] && [ ! -d "${INSTALL_DIR}/.git" ] \
-   && [ -n "$(ls -A "${INSTALL_DIR}" 2>/dev/null)" ]; then
-  fail "目录 ${INSTALL_DIR} 已存在且不是本仓库的工作副本，请更换 AUTODEPLOY_INSTALL_DIR 或手动清理"
+if ! mkdir -p "${INSTALL_DIR}" 2>/dev/null; then
+  ${SUDO} mkdir -p "${INSTALL_DIR}"
 fi
-
-UPDATED=0
-for attempt in 1 2 3; do
-  if [ -d "${INSTALL_DIR}/.git" ]; then
-    if ${SUDO} git -C "${INSTALL_DIR}" fetch --depth 1 origin "${BRANCH}" \
-       && ${SUDO} git -C "${INSTALL_DIR}" reset --hard FETCH_HEAD \
-       && ${SUDO} git -C "${INSTALL_DIR}" clean -fdx; then
-      UPDATED=1
-      break
-    fi
-  else
-    if ${SUDO} git clone --depth 1 --branch "${BRANCH}" "${REPO_URL}" "${INSTALL_DIR}"; then
-      break
-    fi
-    # 半途失败的克隆清掉重来，避免残留目录卡死后续重试
-    ${SUDO} rm -rf "${INSTALL_DIR}"
-  fi
-  log "网络抖动，3 秒后重试（第 ${attempt} 次）…"
-  if [ "${attempt}" -eq 3 ]; then
-    fail "源码获取失败：请确认能访问 GitHub（必要时配置代理）后重试"
-  fi
-  sleep 3
-done
-
 cd "${INSTALL_DIR}"
+if [ -w . ]; then
+  SUDO=""   # 目录当前用户可写：后续文件操作无需提权
+fi
 
-# ---- 端口：写入 .env 供 compose 读取；已有 .env 时尊重现有配置 ----
-if [ ! -f .env ] || [ -n "${PORT}" ]; then
-  printf 'AUTODEPLOY_PORT=%s\n' "${PORT:-8770}" | ${SUDO} tee .env >/dev/null
+# ---- docker-compose.yml：在线下载（自动重试），或离线指定本地文件 ----
+if [ -n "${AUTODEPLOY_COMPOSE_FILE:-}" ]; then
+  [ -f "${AUTODEPLOY_COMPOSE_FILE}" ] || fail "离线文件不存在：${AUTODEPLOY_COMPOSE_FILE}"
+  ${SUDO} install -m 644 "${AUTODEPLOY_COMPOSE_FILE}" ./docker-compose.yml
+  log "已使用本地 compose 文件（离线安装）"
+else
+  log "下载 docker-compose.yml（${VERSION}）…"
+  TMP_COMPOSE="$(mktemp)"
+  DOWNLOADED=0
+  for attempt in 1 2 3; do
+    if curl -fsSL "${RAW_BASE}/${VERSION}/docker-compose.yml" -o "${TMP_COMPOSE}"; then
+      DOWNLOADED=1
+      break
+    fi
+    log "下载失败，3 秒后重试（第 ${attempt} 次）…"
+    sleep 3
+  done
+  [ "${DOWNLOADED}" -eq 1 ] || fail "compose 文件下载失败：请确认能访问 GitHub 后重试（受限网络可先 export https_proxy=代理地址 再执行）"
+  grep -q "^services:" "${TMP_COMPOSE}" || fail "下载内容不是有效的 compose 文件，已中止"
+  ${SUDO} install -m 644 "${TMP_COMPOSE}" ./docker-compose.yml
+  rm -f "${TMP_COMPOSE}"
+fi
+
+# ---- 端口 / 镜像：写入 .env 供 compose 读取；已有 .env 时尊重现有配置 ----
+if [ ! -f .env ] || [ -n "${PORT}" ] || [ -n "${AUTODEPLOY_IMAGE+x}" ] \
+   || { [ -n "${AUTODEPLOY_VERSION+x}" ] && [ "${VERSION}" != "main" ]; }; then
+  {
+    printf 'AUTODEPLOY_PORT=%s\n' "${PORT:-8770}"
+    if [ -n "${AUTODEPLOY_VERSION+x}" ] && [ "${VERSION}" != "main" ]; then
+      # 锁定版本时同步锁定镜像 tag（GHCR 的语义化标签不含 v 前缀）
+      printf 'AUTODEPLOY_IMAGE_TAG=%s\n' "${VERSION#v}"
+    fi
+    if [ -n "${AUTODEPLOY_IMAGE+x}" ]; then
+      printf 'AUTODEPLOY_IMAGE=%s\n' "${AUTODEPLOY_IMAGE}"
+    fi
+  } | ${SUDO} tee .env >/dev/null
 fi
 SERVICE_PORT="$(grep -E '^AUTODEPLOY_PORT=' .env 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
 SERVICE_PORT="${SERVICE_PORT:-8770}"
 
-# ---- 构建并启动 ----
-log "构建并启动服务（首次构建需要几分钟）…"
-${DOCKER} compose up -d --build
+# ---- 拉取镜像并启动 ----
+log "拉取官方镜像并启动（首次需要下载几百 MB）…"
+if ! ${DOCKER} compose pull; then
+  log "镜像拉取失败；若离线环境已通过 docker load 导入镜像，将使用本地镜像继续"
+fi
+${DOCKER} compose up -d --no-build
 
 # ---- 健康检查 ----
 log "等待服务就绪（最长 90 秒）…"
@@ -132,8 +133,8 @@ if ${DOCKER} compose logs autodeploy 2>&1 | grep -q "首次启动"; then
   echo
   log "管理员账号已创建，初始密码如下（仅显示这一次，请立即登录并修改）："
   ${DOCKER} compose logs autodeploy 2>&1 | grep -A 3 "首次启动" || true
-elif [ "${UPDATED}" -eq 1 ]; then
-  log "已升级到最新代码，任务数据不受影响"
+else
+  log "服务已就绪。重复执行本脚本即可升级到最新镜像，任务数据不受影响"
 fi
 
 echo
@@ -142,4 +143,4 @@ log "常用命令（在 ${INSTALL_DIR} 下执行）："
 echo "  查看日志:  docker compose logs -f autodeploy"
 echo "  停止服务:  docker compose down        （数据保留）"
 echo "  彻底删除:  docker compose down -v     （连数据卷一起删除）"
-log "升级方式：重新执行本脚本，拉取最新代码并重新构建，任务数据不受影响"
+log "升级方式：重新执行本脚本，拉取最新镜像并滚动重启，任务数据不受影响"

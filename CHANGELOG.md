@@ -8,6 +8,20 @@
 > git 记录）。1.0 之前均为功能打磨期，按 0.x.y 迭代；
 > **发布 1.0 需仓库所有者明确确认**。
 
+## [未发布]
+
+### 变更
+
+- 一键部署不再克隆仓库、无需本地构建：脚本自动创建 `/opt/auto-deploy`、在线下载
+  `docker-compose.yml`（自动重试与内容校验）、检测系统环境并安装缺失的 Docker 组件，
+  然后 `compose pull` 拉取官方镜像并以 `--no-build` 启动；支持 `AUTODEPLOY_VERSION`
+  锁定版本、`AUTODEPLOY_IMAGE` 更换镜像源、`AUTODEPLOY_COMPOSE_FILE` 离线安装
+
+### 新增
+
+- CI 新增 Docker 工作流（`.github/workflows/docker.yml`）：push 到 main 自动构建
+  amd64/arm64 双架构镜像推送 GHCR（`latest` 标签），push `v*` 标签追加语义化版本标签
+
 ## [0.2.0] - 2026-10-01
 
 ### 变更

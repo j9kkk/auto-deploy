@@ -33,7 +33,9 @@
 
 ## 快速开始
 
-在装好 Docker 的服务器上一条命令完成部署（自动安装缺失的 Docker、克隆源码、构建并启动）：
+一条命令完成部署。脚本自动检测系统环境并安装缺失的 Docker 组件，创建
+`/opt/auto-deploy`，下载 `docker-compose.yml` 并从 GHCR 拉取官方镜像启动——
+无需克隆仓库、无需本地构建：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/j9kkk/auto-deploy/main/scripts/bootstrap.sh | bash
@@ -42,9 +44,10 @@ curl -fsSL https://raw.githubusercontent.com/j9kkk/auto-deploy/main/scripts/boot
 或手动执行：
 
 ```bash
-git clone https://github.com/j9kkk/auto-deploy.git
-cd auto-deploy
-docker compose up -d --build
+sudo mkdir -p /opt/auto-deploy && cd /opt/auto-deploy
+sudo curl -fsSLo docker-compose.yml \
+  https://raw.githubusercontent.com/j9kkk/auto-deploy/main/docker-compose.yml
+docker compose pull && docker compose up -d
 ```
 
 首次启动会自动创建管理员账号，初始密码只打印一次：
@@ -53,7 +56,7 @@ docker compose up -d --build
 docker compose logs autodeploy | grep -A 3 "首次启动"
 ```
 
-浏览器访问 `http://<服务器IP>:8770/` 即可使用。常用命令（在仓库目录下）：
+浏览器访问 `http://<服务器IP>:8770/` 即可使用。常用命令（在安装目录下）：
 
 ```bash
 docker compose logs -f autodeploy   # 查看日志
@@ -62,10 +65,23 @@ docker compose down                 # 停止（任务数据保留）
 docker compose down -v              # 停止并删除数据卷
 ```
 
+本地开发需要自行构建镜像：
+
+```bash
+git clone https://github.com/j9kkk/auto-deploy.git
+cd auto-deploy
+docker compose up --build -d
+```
+
 ## 配置
 
-- **端口**：执行脚本前 `export AUTODEPLOY_PORT=9000`，或写入仓库目录下的 `.env`
+- **端口**：执行脚本前 `export AUTODEPLOY_PORT=9000`，或写入安装目录下的 `.env`
   （`AUTODEPLOY_PORT=9000`）
+- **版本锁定**：`AUTODEPLOY_VERSION=v0.2.0` 部署指定版本（compose 文件与镜像 tag
+  同步锁定）；默认跟随 `latest` 镜像（由 CI 随 main 分支自动构建）
+- **镜像源**：GHCR 访问不畅时可换镜像地址 `AUTODEPLOY_IMAGE=<registry>/auto-deploy`
+- **离线安装**：`AUTODEPLOY_COMPOSE_FILE=/path/docker-compose.yml` 跳过在线下载
+  （镜像仍需 `docker load` 预先导入）
 - **其他设置**：环境变量命名规则为 `AUTODEPLOY_` + 设置名大写（如
   `AUTODEPLOY_MAX_GLOBAL_WORKERS`），优先级高于界面设置
 - **部署 Docker 应用**：任务可选 Docker / Docker Compose 方式，需在 docker-compose.yml
@@ -85,9 +101,10 @@ docker compose down -v              # 停止并删除数据卷
 
 ## 升级与回滚
 
-重复执行一键脚本即升级（拉取最新代码并重新构建，数据卷不受影响），
-或手动：`cd auto-deploy && git pull && docker compose up -d --build`。
-回滚：`git checkout <旧版本 tag>` 后重新构建启动即可。
+重复执行一键脚本即升级（拉取最新镜像并滚动重启，数据卷不受影响），
+或手动：`cd /opt/auto-deploy && docker compose pull && docker compose up -d`。
+回滚：`AUTODEPLOY_VERSION=v旧版本号` 重跑脚本，或改 `.env` 中的
+`AUTODEPLOY_IMAGE_TAG` 后 `docker compose up -d`。
 
 任务数据（数据库、工作副本、发布产物、日志）保存在 Docker 数据卷
 `auto-deploy_autodeploy-data` 中，备份示例：
