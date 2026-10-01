@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,10 +62,40 @@ def run_checks(ok, TMP):
 
             lock = AdmissionLock()
             blocked = [False]
+            dispatched = []
+            outcomes = []
+            rollback_log = []
+
+            def fake_execute_rollback(run_id, task_row, selected_run, **kwargs):
+                dispatched.append((run_id, task_row, selected_run, kwargs))
+                # 复用真实 rollback_task 的校验与执行语义：切换软链、必要时执行
+                # 命令（由外层 command_guard/fake_command 接管），并按结果落终态。
+                lines: list[str] = []
+                ok_flag, message = deployer.rollback_task(
+                    task_row,
+                    log=lines.append,
+                    timeout=kwargs.get("timeout", 300),
+                    kill_grace_seconds=kwargs.get("kill_grace_seconds", 7),
+                    selected_run=selected_run,
+                )
+                rollback_log.extend(lines)
+                rollback_log.append(message)
+                status = "success" if ok_flag else "failed"
+                store.runs.mark_running(run_id)
+                store.runs.mark_finished(
+                    run_id, status=status, exit_code=0 if ok_flag else 1, error="" if ok_flag else message
+                )
+                store.tasks.record_run_finished(
+                    int(task_row["id"]), run_id=run_id, status=status, duration_ms=1
+                )
+                outcomes.append((run_id, ok_flag, message))
+
             service = SimpleNamespace(
                 store=store, settings=config.Settings(), scheduler=SimpleNamespace(_lock=lock),
                 selfupdate=SimpleNamespace(deployment_blocked=lambda: blocked[0]),
+                runner=SimpleNamespace(execute_rollback=fake_execute_rollback),
             )
+            service.settings.kill_grace_seconds = 7
             app = FastAPI()
             app.state.service = service
             app.include_router(tasks.router)
@@ -98,7 +129,17 @@ def run_checks(ok, TMP):
 
             def request(payload=None, *, task_id=None):
                 body = b"" if payload is None else json.dumps(payload).encode()
-                return asyncio.run(send_request(body, task_id or task["id"]))
+                result = asyncio.run(send_request(body, task_id or task["id"]))
+                if result[0] == 202:
+                    # API 在独立线程里跑回滚，等它落终态再断言，避免竞态。
+                    run_id = result[1]["run_id"]
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        row = store.runs.get(run_id)
+                        if row is not None and row["status"] not in ("queued", "running"):
+                            break
+                        time.sleep(0.02)
+                return result
 
             task_id = store.tasks.create({
                 "name": "回滚隔离测试", "repo_url": "https://example.invalid/rollback.git",
@@ -126,18 +167,34 @@ def run_checks(ok, TMP):
             add_run(middle)
             latest_id = add_run(latest)
             deployer.swap_symlink(current, latest)
+            # 回滚已异步化：接口只做准入并返回 202 + 新 run_id，切换由后台 runner 完成。
             status, result = request({"run_id": old_id})
-            ok("指定运行回滚到所选版本而非最近版本", status == 200 and result["run_id"] == old_id and current.resolve() == old)
+            ok("指定运行回滚到所选版本而非最近版本", status == 202
+               and result["run_id"] > 0 and dispatched
+               and dispatched[0][1]["id"] == int(task["id"])
+               and (dispatched[0][2] or {}).get("id") == old_id
+               and current.resolve() == old)
             deployer.swap_symlink(current, latest)
             status, result = request()
-            ok("无请求体兼容上一版本回滚", status == 200 and result["run_id"] is None and current.resolve() == middle)
+            ok("无请求体兼容上一版本回滚", status == 202 and result["run_id"] > 0
+               and len(dispatched) == 2 and dispatched[1][2] is None
+               and current.resolve() == middle)
             deployer.swap_symlink(current, latest)
 
             def rejected(label, payload, expected=400):
+                """非法回滚请求的两层防线：接口 4xx 拒绝，或 202 受理后后台运行失败。"""
                 before = os.readlink(current)
                 calls = command_guard.call_count
                 swap_count = swaps.call_count
                 status, result = request(payload)
+                if status == 202:
+                    # 已受理：请求本身合法，但后台校验应判失败且不切换软链。
+                    row = store.runs.get(result["run_id"])
+                    ok(label, row is not None and row["status"] == "failed"
+                       and os.readlink(current) == before
+                       and command_guard.call_count == calls and swaps.call_count == swap_count,
+                       f"运行状态 {(row or {}).get('status')} 错误 {(row or {}).get('error')}")
+                    return
                 ok(label, status == expected and os.readlink(current) == before
                    and command_guard.call_count == calls and swaps.call_count == swap_count, str(result))
 
@@ -229,13 +286,13 @@ def run_checks(ok, TMP):
             alias.symlink_to(root / "target", target_is_directory=True)
             alias_id = add_run(alias / "releases" / old.name)
             status, result = request({"run_id": alias_id})
-            ok("运行记录祖先软链别名可回滚", status == 200 and current.resolve() == old)
+            ok("运行记录祖先软链别名可回滚", status == 202 and current.resolve() == old)
             deployer.swap_symlink(current, latest)
             if str(old).startswith("/private/"):
                 mac_alias = Path(str(old)[len("/private"):])
                 if mac_alias.exists() and mac_alias.resolve() == old:
                     status, result = request({"run_id": add_run(mac_alias)})
-                    ok("macOS临时目录祖先别名可回滚", status == 200 and current.resolve() == old)
+                    ok("macOS临时目录祖先别名可回滚", status == 202 and current.resolve() == old)
                     deployer.swap_symlink(current, latest)
 
             # Legacy previous_release accepted non-hidden direct child names.
@@ -243,11 +300,11 @@ def run_checks(ok, TMP):
             legacy = releases / "legacy-release"
             legacy.mkdir()
             status, result = request()
-            ok("旧无请求体回滚兼容非标准历史目录名", status == 200 and current.resolve() == legacy)
+            ok("旧无请求体回滚兼容非标准历史目录名", status == 202 and current.resolve() == legacy)
             legacy.rmdir()
             deployer.swap_symlink(current, missing)
             status, result = request()
-            ok("旧无请求体回滚兼容根内悬空current", status == 200 and current.resolve() == latest)
+            ok("旧无请求体回滚兼容根内悬空current", status == 202 and current.resolve() == latest)
 
             # Exercise the actual generator, including nogit and collision suffix,
             # through the default layout with a configured ancestor alias.
@@ -264,14 +321,14 @@ def run_checks(ok, TMP):
                 generated_id = add_run(generated_old, owner=other)
                 deployer.swap_symlink(other_current, generated_new)
                 status, result = request({"run_id": generated_id}, task_id=other_id)
-                ok("默认发布布局兼容祖先别名与nogit目录", status == 200 and other_current.resolve() == generated_old.resolve())
+                ok("默认发布布局兼容祖先别名与nogit目录", status == 202 and other_current.resolve() == generated_old.resolve())
                 deployer.swap_symlink(other_current, generated_new)
                 status, result = request(task_id=other_id)
-                ok("默认布局上一版不误选当前且兼容生成序号", status == 200
+                ok("默认布局上一版不误选当前且兼容生成序号", status == 202
                    and generated_new.name.endswith("-nogit-2") and other_current.resolve() == generated_old.resolve())
                 generated_new_id = add_run(generated_new, owner=other)
                 status, result = request({"run_id": generated_new_id}, task_id=other_id)
-                ok("指定运行兼容真实生成的重名序号", status == 200 and other_current.resolve() == generated_new.resolve())
+                ok("指定运行兼容真实生成的重名序号", status == 202 and other_current.resolve() == generated_new.resolve())
 
             store.tasks.update(task_id, {"target_dir": str(root / "changed-target")})
             rejected("目标目录配置改变时不跨旧根回滚", {"run_id": old_id})
@@ -282,7 +339,8 @@ def run_checks(ok, TMP):
                 matching_id = add_run(old, owner={**task, "deploy_method": method})
                 status, result = request({"run_id": matching_id})
                 limitation = "不会自动重新打包、替换已有产物或执行部署" if method == "artifact" else "不会自动重新部署容器或同步远端"
-                ok(f"{method}明确实际回滚限制", status == 200 and limitation in result["message"])
+                outcome = next(o for o in outcomes if o[0] == result["run_id"])
+                ok(f"{method}明确实际回滚限制", status == 202 and outcome[1] and limitation in outcome[2])
                 deployer.swap_symlink(current, latest)
             ok("普通回滚不执行容器或远端命令", command_guard.call_count == 0)
 
@@ -296,13 +354,17 @@ def run_checks(ok, TMP):
 
             with patch.object(deployer, "run_command", fake_command), patch.object(deployer, "command_exists", return_value=True):
                 status, result = request({"run_id": systemd_id})
-            ok("指定版本复用回滚脚本与systemd语义", status == 200 and len(calls) == 2
-               and calls[0][1]["cwd"] == old and calls[0][1]["env"]["AUTODEPLOY_RUN_ID"] == str(systemd_id)
+            outcome = next(o for o in outcomes if o[0] == result["run_id"])
+            ok("指定版本复用回滚脚本与systemd语义", status == 202 and len(calls) == 2
+               and calls[0][1]["cwd"] == old
+               # AUTODEPLOY_RUN_ID/AUTODEPLOY_COMMIT 均指向所选历史版本。
+               and calls[0][1]["env"]["AUTODEPLOY_RUN_ID"] == str(systemd_id)
                and calls[0][1]["env"]["AUTODEPLOY_COMMIT"] == "a" * 40
                and calls[1][0] == ["systemctl", "restart", "isolated-test.service"]
-               and all(call[2] for call in calls))
-            ok("明确提示使用当前脚本和服务配置而非历史快照", status == 200
-               and any("历史运行未保存这些配置的快照" in line for line in result["log"]))
+               # 回滚在锁外后台执行：准入校验在锁内，实际执行不应占住调度锁。
+               and not any(call[2] for call in calls) and outcome[1])
+            ok("明确提示使用当前脚本和服务配置而非历史快照", status == 202
+               and any("历史运行未保存这些配置的快照" in line for line in rollback_log))
             ok("所有命令均为模拟未实际重启", command_guard.call_count == 0)
 
 

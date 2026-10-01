@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,6 @@ from ..deployer import (
     preflight,
     purge_target_release_history,
     resolve_release_paths,
-    rollback_task,
     stop_task_containers,
 )
 from ..schedule import iso, next_run_time, utcnow
@@ -38,9 +38,21 @@ from .deps import audit, client_ip, current_user, get_service, require_admin
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
+_UNSET = object()
 
-def _decorate(task: dict[str, Any], service: Service, request: Request | None = None) -> dict[str, Any]:
-    """Add derived fields the UI needs but the table does not store."""
+
+def _decorate(
+    task: dict[str, Any],
+    service: Service,
+    request: Request | None = None,
+    *,
+    last_run: Any = _UNSET,
+) -> dict[str, Any]:
+    """Add derived fields the UI needs but the table does not store.
+
+    ``last_run`` 由调用方批量预取（列表页一次查询取回全部任务的最近运行）；
+    未预取时才逐任务回查，保持单任务装饰路径不变。
+    """
     if task is None:
         return {}
     enriched = dict(task)
@@ -56,9 +68,10 @@ def _decorate(task: dict[str, Any], service: Service, request: Request | None = 
     else:
         enriched["webhook_url"] = ""
     enriched["active_run"] = None
-    runs = service.store.runs.list_for_task(int(task["id"]), limit=1)
-    if runs:
-        enriched["last_run"] = runs[0]
+    if last_run is _UNSET:
+        runs = service.store.runs.list_for_task(int(task["id"]), limit=1)
+        last_run = runs[0] if runs else None
+    enriched["last_run"] = last_run
     # Report whether the checkout exists so the UI can offer a first run hint.
     try:
         workspace = config.workspace_dir_for_task(task)
@@ -85,9 +98,17 @@ def list_tasks(
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
+    rows = service.store.tasks.list_all()
+    # 一次查询取回全部任务的最近运行，避免逐任务 N+1。
+    latest_runs = service.store.runs.latest_by_task()
     tasks = [
-        _decorate(decode_task(row) or {}, service, request)
-        for row in service.store.tasks.list_all()
+        _decorate(
+            decode_task(row) or {},
+            service,
+            request,
+            last_run=latest_runs.get(int(row["id"])) if row["id"] is not None else None,
+        )
+        for row in rows
     ]
     active_by_task: dict[int, dict[str, Any]] = {}
     for run in service.store.runs.active():
@@ -412,7 +433,7 @@ def cancel_task_run(
     return {"ok": True, "cancelled": cancelled}
 
 
-@router.post("/{task_id}/rollback")
+@router.post("/{task_id}/rollback", status_code=status.HTTP_202_ACCEPTED)
 def rollback(
     task_id: int,
     request: Request,
@@ -420,13 +441,13 @@ def rollback(
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
+    """发起后台回滚：立即返回 202 与 run_id，进度经运行详情/增量日志轮询获取。"""
     run_id = None
     if payload is not None:
         run_id = payload.get("run_id")
         if set(payload) != {"run_id"} or type(run_id) is not int or not 0 < run_id <= 2**63 - 1:
             raise HTTPException(status_code=422, detail="回滚参数必须仅包含正整数 run_id")
 
-    lines: list[str] = []
     with service.scheduler._lock:
         row = service.store.tasks.get(task_id)
         if row is None:
@@ -436,21 +457,28 @@ def rollback(
             raise HTTPException(status_code=409, detail="任务正在运行，无法回滚")
         if service.selfupdate.deployment_blocked():
             raise HTTPException(status_code=409, detail="系统正在更新或回滚，暂不能回滚部署")
+        # 准入通过后立即占位：先建运行记录再放锁，杜绝并发触发同名任务。
+        # 运行版本合法性（存在/成功/目录有效）留到后台执行时校验——那需要
+        # 解析发布目录的软链与路径边界，放在锁内会拖住其它调度操作。
         selected_run = (service.store.runs.get(run_id) or {}) if run_id is not None else None
-        ok, message = rollback_task(
-            row,
-            log=lines.append,
-            timeout=min(600, int(row.get("timeout_seconds") or 300)),
-            kill_grace_seconds=service.settings.kill_grace_seconds,
-            selected_run=selected_run,
-        )
+        rollback_run_id = service.store.runs.create(row, trigger="rollback")
+
+    threading.Thread(
+        target=service.runner.execute_rollback,
+        args=(rollback_run_id, row, selected_run),
+        kwargs={
+            "timeout": min(600, int(row.get("timeout_seconds") or 300)),
+            "kill_grace_seconds": service.settings.kill_grace_seconds,
+        },
+        name=f"rollback-{rollback_run_id}",
+        daemon=True,
+    ).start()
     audit(
         service, "rollback", actor=user["username"], target=f"task:{task_id}",
-        detail=(f"run:{run_id} " if run_id is not None else "") + message, ip=client_ip(request),
+        detail=(f"run:{run_id} " if run_id is not None else "") + f"已发起回滚 run:{rollback_run_id}",
+        ip=client_ip(request),
     )
-    if not ok:
-        raise HTTPException(status_code=400, detail={"message": message, "log": lines})
-    return {"ok": True, "message": message, "log": lines, "run_id": run_id}
+    return {"ok": True, "run_id": rollback_run_id, "message": "回滚已开始"}
 
 
 @router.get("/{task_id}/preflight")

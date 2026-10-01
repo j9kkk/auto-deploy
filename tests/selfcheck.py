@@ -239,6 +239,36 @@ def run() -> int:
     check("打包路径去重", cleaned["artifact_paths"] == "dist\npackage.json")
     check("环境变量文本解析", cleaned["env_vars"] == {"A": "1", "B": "two"})
 
+    # 互斥字段：方式专属字段与部署方式不匹配时显式报错；未提交该字段则放行。
+    conflicting = [
+        ("systemd 方式不应填镜像名", {"docker_image": "a:b"}, "docker_image"),
+        ("rsync 方式不应填服务名", {"service_name": "a.service"}, "service_name"),
+        ("docker 方式不应填 rsync 目标", {"rsync_target": "u@h:/srv"}, "rsync_target"),
+        ("compose 方式不应填启动命令", {"docker_command": "docker ps"}, "docker_command"),
+    ]
+    for label, extra, field in conflicting:
+        base = {"name": "x", "repo_url": "https://github.com/a/b.git",
+                "deploy_method": "script", "deploy_script": "echo hi"}
+        try:
+            validate_task_payload({**base, **extra})
+        except ValidationError as exc:
+            check(label, field in exc.errors, f"错误字段为 {list(exc.errors)}")
+        else:
+            check(label, False, "未抛出校验错误")
+    # 存量脏数据局部编辑（未显式提交互斥字段）不被误伤。
+    legacy_task = {"name": "legacy", "repo_url": "https://github.com/a/b.git",
+                   "deploy_method": "rsync", "rsync_target": "u@h:/srv",
+                   "docker_image": "stale:image"}
+    result = validate_task_payload({"description": "改备注"}, partial=True, existing=legacy_task)
+    check("存量脏字段局部编辑放行", "docker_image" not in result and result["description"] == "改备注")
+    # manual 调度下表达式不参与校验，存任意文本也能通过。
+    manual_task = validate_task_payload(
+        {"name": "x", "repo_url": "https://github.com/a/b.git",
+         "deploy_method": "script", "deploy_script": "echo hi",
+         "schedule_type": "manual", "schedule_expression": "不是表达式"}
+    )
+    check("manual 调度忽略表达式", manual_task["schedule_expression"] == "不是表达式")
+
     # ------------------------------------------------------------------
     section("发布目录与暂存")
     from app.deployer import (
@@ -1252,6 +1282,44 @@ def run() -> int:
             time.sleep(0.4)
         check("无变化时运行被跳过", status2 == "skipped",
               f"状态 {status2}，错误 {detail2.get('error')}")
+
+        # --- rollback runs in the background ------------------------
+        # 回滚已改为后台执行：接口立即返回 202 与 run_id，随后作为一条
+        # trigger=rollback 的运行记录呈现在运行历史与增量日志轮询里。
+        response = client.post(f"/api/tasks/{task_id}/rollback")
+        check("回滚接口立即返回 202", response.status_code == 202, response.text[:200])
+        rollback_run = response.json().get("run_id")
+        check("回滚返回运行编号", isinstance(rollback_run, int) and rollback_run > 0)
+        response = client.get(f"/api/runs/{rollback_run}")
+        check("回滚运行记录可查询", response.status_code == 200
+              and response.json()["run"]["trigger"] == "rollback")
+
+        rollback_status = "queued"
+        deadline = time.monotonic() + 60
+        rollback_detail = {}
+        while time.monotonic() < deadline:
+            rollback_detail = client.get(f"/api/runs/{rollback_run}").json()["run"]
+            rollback_status = rollback_detail["status"]
+            if rollback_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        check("后台回滚结束", rollback_status not in ("queued", "running"),
+              f"最终状态 {rollback_status}")
+        check("后台回滚成功", rollback_status == "success",
+              f"状态 {rollback_status}，错误 {rollback_detail.get('error')}")
+        tail = client.get(f"/api/runs/{rollback_run}/tail?after=0").json()
+        check("回滚日志经增量接口可读", tail["total"] > 0 and not tail["active"])
+        response = client.post(f"/api/tasks/{task_id}/rollback")
+        check("回滚成功后可再次发起", response.status_code == 202, response.text[:200])
+        second_rollback = response.json().get("run_id")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            second_detail = client.get(f"/api/runs/{second_rollback}").json()["run"]
+            if second_detail["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        check("第二次后台回滚成功", second_detail["status"] == "success",
+              f"状态 {second_detail.get('status')}，错误 {second_detail.get('error')}")
 
         # --- dashboard / stats / storage ----------------------------
         response = client.get("/api/dashboard")

@@ -340,6 +340,20 @@ def validate_task_payload(
     method = out.get("deploy_method", existing.get("deploy_method", "script"))
     if not partial or "deploy_method" in payload:
         _check_method_requirements(method, out, existing, errors)
+        # 互斥字段显式报错而非静默忽略：方式专属字段与当前方式不匹配时，
+        # 只有在本次请求显式提交了该字段才拦截，避免误伤存量脏数据的
+        # 无关编辑（与 git_token「未提交即不改」的语义一致）。
+        method_labels = {
+            "systemd": [("service_name", "systemd 服务名")],
+            "docker": [("docker_image", "Docker 镜像名称"),
+                       ("docker_command", "容器启动命令")],
+            "docker_compose": [("docker_compose_file", "compose 文件路径")],
+            "rsync": [("rsync_target", "rsync 目标")],
+        }
+        for owner_method, fields in method_labels.items():
+            for field, label in fields:
+                if owner_method != method and field in payload and str(payload.get(field) or "").strip():
+                    errors[field] = f"部署方式为 {method} 时无需填写{label}，请清空后再保存"
 
     if errors:
         raise ValidationError(errors)

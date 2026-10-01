@@ -839,6 +839,8 @@ def rollback_task(
     timeout: int = 300,
     kill_grace_seconds: int = 10,
     selected_run: dict[str, Any] | None = None,
+    handles: list[Any] | None = None,
+    check_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[bool, str]:
     """Switch to a validated stored run, or retain the legacy previous selection.
 
@@ -882,9 +884,13 @@ def rollback_task(
             timeout=timeout,
             log=log,
             label="rollback",
+            handle_out=handles if handles is not None else None,
+            check_cancelled=check_cancelled,
             kill_grace_seconds=kill_grace_seconds,
         )
         if not result.ok:
+            if check_cancelled is not None and check_cancelled():
+                return False, "回滚已被取消"
             return False, f"回滚脚本执行失败: {result.error}"
 
     service = (task.get("service_name") or "").strip()
@@ -898,9 +904,13 @@ def rollback_task(
             timeout=timeout,
             log=log,
             label="systemd",
+            handle_out=handles if handles is not None else None,
+            check_cancelled=check_cancelled,
             kill_grace_seconds=kill_grace_seconds,
         )
         if not result.ok:
+            if check_cancelled is not None and check_cancelled():
+                return False, "回滚已被取消"
             return False, f"重启服务失败: {result.error}"
     message = f"已回滚到 {target.name}"
     if task.get("deploy_method") in {"docker", "docker_compose", "rsync"}:

@@ -160,7 +160,22 @@ def tail_run(
     if run is None:
         raise HTTPException(status_code=404, detail="运行记录不存在")
 
-    active = service.runner.is_active(run_id)
+    status_payload = {
+        "status": run.get("status"),
+        "status_label": STATUS_LABELS.get(str(run.get("status")), str(run.get("status"))),
+        "duration_ms": run.get("duration_ms"),
+        "exit_code": run.get("exit_code"),
+    }
+
+    def response(lines: list[str], total: int, *, reset: bool, active: bool) -> dict[str, Any]:
+        return {"lines": lines, "total": total, "reset": reset, "active": active, **status_payload}
+
+    # 活跃运行先用轻量计数比对：客户端已追平输出时直接返回空增量，
+    # 免去复制整个 2000 行环形缓冲的开销。
+    active, live_total = service.runner.tail_meta(run_id)
+    if active and after == live_total:
+        return response([], live_total, reset=False, active=True)
+
     if active:
         lines = service.runner.tail(run_id, limit=LOG_WINDOW_LINES) or []
     else:
@@ -170,29 +185,11 @@ def tail_run(
         # The client holds more lines than the server can see (the in-memory
         # ring buffer was trimmed, or the service restarted). Tell it to reset
         # and resend the whole tail so both sides agree again.
-        return {
-            "lines": lines,
-            "total": len(lines),
-            "reset": True,
-            "active": active,
-            "status": run.get("status"),
-            "status_label": STATUS_LABELS.get(str(run.get("status")), str(run.get("status"))),
-            "duration_ms": run.get("duration_ms"),
-            "exit_code": run.get("exit_code"),
-        }
+        return response(lines, len(lines), reset=True, active=active)
     # `after == len(lines)` means the client is fully caught up; the slice below
     # then yields an empty list, which is what keeps the live view from
     # duplicating output on every poll.
-    return {
-        "lines": lines[after:],
-        "total": len(lines),
-        "reset": False,
-        "active": active,
-        "status": run.get("status"),
-        "status_label": STATUS_LABELS.get(str(run.get("status")), str(run.get("status"))),
-        "duration_ms": run.get("duration_ms"),
-        "exit_code": run.get("exit_code"),
-    }
+    return response(lines[after:], len(lines), reset=False, active=active)
 
 
 @router.post("/{run_id}/cancel")

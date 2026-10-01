@@ -121,6 +121,8 @@
 
   /** Keep the header badge and the active view roughly in sync. */
   async function refreshStatus() {
+    // 后台标签页不发心跳；回到前台时立即补一次，保持状态及时。
+    if (document.hidden) return;
     const badge = document.getElementById('scheduler-status');
     try {
       const health = await AD.api.get('/api/health');
@@ -135,6 +137,10 @@
     // 运行状态收敛（例如部署结束、取消生效）由视图就地更新，不再整页重绘。
     AD.pollRunStates();
   }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && AD.state.pollTimer) refreshStatus();
+  });
 
   // ------------------------------------------------- run state convergence
   // 当前视图注册 viewRefresh 后，这里只负责触发；视图自己决定要不要发请求

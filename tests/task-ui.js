@@ -164,6 +164,10 @@ async function scenario(runs = [run(30), run(20)], taskExtra = {}, options = {})
     } else if (method === 'POST' && url === '/api/settings/schedule/preview') result = { ok: true, description: '固定间隔', next_runs: [] };
     else if (method === 'GET' && /^\/api\/runs\/\d+$/.test(url) && runs.some(r => url.endsWith('/' + r.id))) {
       result = { run: runs.find(r => url.endsWith('/' + r.id)) };
+    } else if (method === 'GET' && /^\/api\/runs\/\d+$/.test(url)) {
+      // 回滚异步化后前端会打开后台回滚运行的详情；给一个进行中的最小快照。
+      result = { run: { id: Number(url.split('/').pop()), task_id: 1, status: 'running', is_active: true,
+        trigger: 'rollback', log_tail: [] } };
     } else { unexpected.push(method + ' ' + url); throw new Error('未配置的模拟请求：' + url); }
     if (result instanceof Error) throw result;
     return structuredClone(await result);
@@ -444,10 +448,8 @@ async function runDetailIsolationChecks() {
     '运行结束后列表行的取消按钮必须消失');
   assert.ok(active.document.querySelector('[data-run-row="31"] [data-run-status] .badge.success'),
     '列表行状态应就地更新为成功');
-  // 弹窗打开时排入的 250ms 首次探测随后会因终态而停止轮询。
-  active.enqueue('GET', '/api/runs/31/tail?after=1', { total: 1, lines: [], active: false });
-  await active.kickoffTick();
-  assert.equal(active.intervalCount(), 0, '运行结束后不得继续轮询');
+  // 运行结束就地停止轮询时，250ms 首次探测一并被清理，不再补发请求。
+  assert.equal(active.timers.size, 0, '终态后不得残留首探定时器');
   active.closeModal();
   active.finish();
 }
@@ -481,12 +483,14 @@ async function rollbackChecks() {
     assert.match(prompt.title, selector === selected ? /运行 #20/ : /上一版本/);
     for (const text of ['当前配置', '回滚脚本', 'systemd', 'Docker / Compose', 'rsync', '数据库不会自动恢复']) assert.ok(prompt.detail.includes(text));
     assert.equal(prompt.danger, true);
-    test.enqueue('POST', '/api/tasks/1/rollback', { message: '回滚已完成' });
+    test.enqueue('POST', '/api/tasks/1/rollback', { ok: true, run_id: 40, message: '回滚已开始' });
     confirmation.resolve(true); await clicking; await flush();
     assert.equal(posts(test).length, 1); assert.equal(posts(test)[0].url, '/api/tasks/1/rollback');
     assert.deepEqual(posts(test)[0].body === undefined ? undefined : JSON.parse(JSON.stringify(posts(test)[0].body)),
       selector === selected ? { run_id: 20 } : undefined);
-    assert.deepEqual(test.successes, ['回滚已完成']);
+    assert.deepEqual(test.successes, ['回滚已开始']);
+    // 回滚异步化后前端会打开后台回滚运行的详情弹窗（含轮询定时器），先关掉再收尾。
+    test.closeModal();
     test.confirmWith(true); test.enqueue('POST', '/api/tasks/1/rollback', new Error('发布目录已清理，不能回滚'));
     await test.click(selector); assert.deepEqual(test.errors, ['发布目录已清理，不能回滚']);
     assert.equal(test.q(selector).disabled, false); test.finish();
@@ -611,6 +615,8 @@ async function formChecks() {
       await test.AD.openTaskForm(editing ? 1 : null); await flush();
       test.q('#f-name').value = name; test.q('#f-description').value = '中文部署备注';
       test.q('#f-repo_url').value = 'https://example.test/repo.git';
+      // 默认方式为自定义脚本，部署脚本必填（前端前置校验会拦截空值）。
+      test.q('#f-deploy_script').value = 'echo deploy';
       const method = editing ? 'PUT' : 'POST', url = editing ? '/api/tasks/1' : '/api/tasks';
       test.enqueue(method, url, {}); await test.click('#form-save');
       const request = test.requests.at(-1); assert.equal(request.method, method); assert.equal(request.url, url);

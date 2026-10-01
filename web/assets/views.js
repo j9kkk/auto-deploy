@@ -665,7 +665,9 @@ AD.views = {};
         if (!ok || !root.isConnected) return;
         AD.setBusy(button, true);
         const result = await AD.api.post(`/api/tasks/${taskId}/rollback`, run ? { run_id: run.id } : undefined);
-        AD.toastSuccess(result.message);
+        // 回滚已改为后台运行：立即返回 run_id，进度在运行详情里轮询。
+        AD.toastSuccess(result.message || `已开始回滚（运行 #${result.run_id}）`);
+        AD.openRunDetail(result.run_id);
       } catch (err) { AD.toastError(err.message); }
       finally {
         AD.setBusy(button, false);
@@ -1030,6 +1032,7 @@ AD.views = {};
           <input type="password" id="f-git_token" autocomplete="new-password"
                  placeholder="${isEdit ? (t.has_token ? '已配置，留空表示不修改' : '未配置') : '私有仓库才需要'}">
           <div class="hint">仅该任务使用；以 GIT_ASKPASS 传递，不会写入命令行或日志</div>
+          <div class="hint hidden" id="token-override-hint" style="color:var(--warning, #b58900)">已选择集中凭据：拉取仓库时将使用该凭据，此处令牌不会生效</div>
           ${isEdit && t.has_token ? '<div class="checkbox-row" style="margin-top:6px"><input type="checkbox" id="f-clear_token"><label for="f-clear_token">清除已保存的令牌</label></div>' : ''}
         </div>
       </div>
@@ -1083,18 +1086,18 @@ AD.views = {};
         </select>
       </div>
 
-      <div class="form-grid">
+      <div class="form-grid" id="releases-fields">
         <div class="field span-2">
           <label>打包路径</label>
           <textarea id="f-artifact_paths" rows="3" placeholder="dist&#10;package.json">${e(t.artifact_paths || '')}</textarea>
           <div class="hint">每行一条，支持通配符（如 <code class="code-inline">dist/**</code>）。留空则打包整个仓库</div>
         </div>
-        <div class="field">
+        <div class="field" data-release-field>
           <label>目标目录</label>
           <input type="text" id="f-target_dir" value="${a(t.target_dir || '')}" placeholder="/var/www/myapp">
           <div class="hint">发布目录与 current 软链会放在这里</div>
         </div>
-        <div class="field">
+        <div class="field" data-release-field>
           <label>保留版本数</label>
           <input type="number" id="f-keep_releases" min="0" max="1000" value="${a(t.keep_releases !== undefined ? t.keep_releases : 5)}">
           <div class="hint">超出后自动清理最旧的发布</div>
@@ -1107,24 +1110,25 @@ AD.views = {};
           <textarea id="f-prepare_script" rows="4" placeholder="# 构建命令，例如&#10;npm ci&#10;npm run build">${e(t.prepare_script || '')}</textarea>
           <div class="hint">在源码目录执行，用于安装依赖与构建（对应 CI 的 build 阶段）</div>
         </div>
-        <div class="field span-2">
-          <label>部署脚本</label>
+        <div class="field span-2" data-method-field="script release systemd">
+          <label>部署脚本<span class="req req-deploy_script hidden">*</span></label>
           <textarea id="f-deploy_script" rows="4" placeholder="# 发布后动作，例如&#10;systemctl restart myapp">${e(t.deploy_script || '')}</textarea>
           <div class="hint">在发布完成后执行；使用「自定义脚本」方式时必填</div>
         </div>
         <div class="field span-2">
           <label>回滚脚本</label>
           <textarea id="f-rollback_script" rows="3" placeholder="# 可选，回滚时执行">${e(t.rollback_script || '')}</textarea>
+          <div class="hint" id="rollback-hint">回滚时在目标发布目录执行</div>
         </div>
       </div>
 
       <div class="form-grid">
         <div class="field" data-method-field="systemd">
-          <label>systemd 服务名</label>
+          <label>systemd 服务名<span class="req req-service_name hidden">*</span></label>
           <input type="text" id="f-service_name" value="${a(t.service_name || '')}" placeholder="myapp.service">
         </div>
-        <div class="field" data-method-field="docker docker_compose">
-          <label>镜像名称</label>
+        <div class="field" data-method-field="docker">
+          <label>镜像名称<span class="req req-docker_image hidden">*</span></label>
           <input type="text" id="f-docker_image" value="${a(t.docker_image || '')}" placeholder="myapp:latest">
         </div>
         <div class="field span-2" data-method-field="docker_compose">
@@ -1136,7 +1140,7 @@ AD.views = {};
           <textarea id="f-docker_command" rows="3" placeholder="docker rm -f myapp || true&#10;docker run -d --name myapp -p 8080:80 myapp:latest">${e(t.docker_command || '')}</textarea>
         </div>
         <div class="field span-2" data-method-field="rsync">
-          <label>rsync 目标</label>
+          <label>rsync 目标<span class="req req-rsync_target hidden">*</span></label>
           <input type="text" id="f-rsync_target" value="${a(t.rsync_target || '')}" placeholder="user@host:/var/www/myapp/">
         </div>
         <div class="field" data-method-field="rsync">
@@ -1182,15 +1186,78 @@ AD.views = {};
     });
 
     const methodSelect = backdrop.querySelector('#f-deploy_method');
+    // 方式专属必填项：对应后端 _check_method_requirements。
+    const METHOD_REQUIRED = {
+      script: ['deploy_script'],
+      systemd: ['service_name'],
+      docker: ['docker_image'],
+      rsync: ['rsync_target'],
+    };
+    // 每种方式用到的方法专属字段（data-method-field 标签已声明），此处仅
+    // 用于判断"哪些字段与当前方式无关需要清空"。
+    const METHOD_FIELDS = {};
+    backdrop.querySelectorAll('[data-method-field]').forEach((field) => {
+      field.dataset.methodField.split(' ').forEach((method) => {
+        (METHOD_FIELDS[method] = METHOD_FIELDS[method] || []).push(field);
+      });
+    });
+    const FIELD_IDS = ['deploy_script', 'service_name', 'docker_image',
+      'docker_compose_file', 'docker_command', 'rsync_target', 'rsync_options'];
+    // 是否为用户主动切换（编辑已有任务首次渲染时不清空存量脏数据）。
+    let methodTouched = false;
+
     const applyMethodVisibility = () => {
-      const method = methodSelect.value;
-      backdrop.querySelectorAll('[data-method-field]').forEach((field) => {
+      const method = methodSelect.value;      backdrop.querySelectorAll('[data-method-field]').forEach((field) => {
         const applies = field.dataset.methodField.split(' ').includes(method);
         field.classList.toggle('hidden', !applies);
+        if (methodTouched && !applies) {
+          // 换方式后隐藏字段不再属于该任务：就地清空，避免看不见的旧值
+          // 被提交保存成脏配置。
+          FIELD_IDS.forEach((id) => {
+            const input = field.querySelector('#f-' + id);
+            if (input && input.value && input.value !== input.dataset.methodDefault) {
+              input.dataset.methodDefault = '';
+              input.value = '';
+            }
+          });
+        }
       });
+      // 必填星号 + 生效范围提示
+      const required = METHOD_REQUIRED[method] || [];
+      FIELD_IDS.forEach((id) => {
+        const mark = backdrop.querySelector('.req-' + id);
+        if (mark) mark.classList.toggle('hidden', !required.includes(id));
+      });
+      const rollbackHint = backdrop.querySelector('#rollback-hint');
+      if (rollbackHint) {
+        rollbackHint.textContent = method === 'systemd'
+          ? '回滚时在目标发布目录执行，随后重启服务 ' + (backdrop.querySelector('#f-service_name').value.trim() || '(尚未填写服务名)')
+          : '回滚时在目标发布目录执行；该方式回滚只切换本地软链，不会重建容器或同步远端';
+      }
+      const keepGroup = backdrop.querySelector('#releases-fields');
+      if (keepGroup) {
+        // 打包/发布三件套对仅打包、自定义脚本方式基本无效，直接隐藏。
+        const groupHidden = (method === 'artifact' || method === 'script') && methodTouched;
+        keepGroup.classList.toggle('hidden', groupHidden);
+      }
+      methodTouched = true;
     };
     methodSelect.addEventListener('change', applyMethodVisibility);
     applyMethodVisibility();
+
+    // 凭据 > 任务内令牌的互斥提示：选了集中凭据就地提醒令牌不生效。
+    const credSelect = backdrop.querySelector('#f-credential_id');
+    const tokenInput = backdrop.querySelector('#f-git_token');
+    const overrideHint = backdrop.querySelector('#token-override-hint');
+    const applyCredentialHint = () => {
+      if (overrideHint && tokenInput) {
+        overrideHint.classList.toggle('hidden', !(credSelect && credSelect.value));
+      }
+    };
+    if (credSelect) {
+      credSelect.addEventListener('change', applyCredentialHint);
+      applyCredentialHint();
+    }
 
     const webhookUrlInput = backdrop.querySelector('#f-webhook_url');
     if (webhookUrlInput) {
@@ -1217,16 +1284,24 @@ AD.views = {};
     const hint = backdrop.querySelector('#schedule-hint');
     const preview = backdrop.querySelector('#schedule-preview');
 
-    const refreshPreview = AD.debounce(async () => {
-      const type = typeSelect.value;
-      if (type === 'manual') {
-        hint.textContent = '仅手动点击「运行」时执行';
+    const applyScheduleVisibility = () => {
+      // manual 下表达式不会生效：禁用并置灰，避免"填了却不跑"的误解。
+      const manual = typeSelect.value === 'manual';
+      exprInput.disabled = manual;
+      exprInput.classList.toggle('muted', manual);
+      if (manual) {
+        hint.textContent = '仅手动点击「运行」时执行，表达式不生效';
         preview.textContent = '';
         return;
       }
-      hint.textContent = type === 'interval'
+      hint.textContent = typeSelect.value === 'interval'
         ? '间隔格式：30s / 15m / 6h / 2d（最小 30 秒）'
         : 'Cron 格式：分 时 日 月 周，例如 0 */6 * * *';
+    };
+
+    const refreshPreview = AD.debounce(async () => {
+      const type = typeSelect.value;
+      if (type === 'manual') return;
       try {
         const result = await AD.api.post('/api/settings/schedule/preview', {
           schedule_type: type, schedule_expression: exprInput.value, count: 5,
@@ -1240,8 +1315,9 @@ AD.views = {};
       } catch (err) { preview.textContent = ''; }
     }, 320);
 
-    typeSelect.addEventListener('change', refreshPreview);
+    typeSelect.addEventListener('change', () => { applyScheduleVisibility(); refreshPreview(); });
     exprInput.addEventListener('input', refreshPreview);
+    applyScheduleVisibility();
     refreshPreview();
 
     backdrop.querySelector('#form-save').addEventListener('click', async (event) => {
@@ -1252,6 +1328,24 @@ AD.views = {};
         return;
       }
       if (!payload.repo_url) { showFormError(backdrop, '请填写仓库地址'); return; }
+
+      // 方式专属必填项前置校验（与后端 _check_method_requirements 一致），
+      // 让错误就地出现在对应字段而不是提交后才弹后端报错。
+      const methodRequired = METHOD_REQUIRED[payload.deploy_method] || [];
+      for (const id of methodRequired) {
+        if (!String(payload[id] || '').trim()) {
+          const labels = { deploy_script: '部署脚本', service_name: 'systemd 服务名',
+            docker_image: '镜像名称', rsync_target: 'rsync 目标' };
+          showFormError(backdrop, `部署方式为「${methodLabel(payload.deploy_method)}」时必须填写「${labels[id] || id}」`);
+          const input = backdrop.querySelector('#f-' + id);
+          if (input) {
+            if (typeof input.focus === 'function') input.focus();
+            input.classList.toggle('input-error', true);
+            input.addEventListener('input', () => input.classList.remove('input-error'), { once: true });
+          }
+          return;
+        }
+      }
 
       AD.setBusy(button, true, isEdit ? '保存中…' : '创建中…');
       try {
@@ -1474,11 +1568,14 @@ AD.views = {};
       if (!confirmed) { AD.openTaskDetail(taskId); return; }
       AD.setBusy(event.currentTarget, true, '回滚中…');
       try {
+        // 回滚已改为后台运行：立即返回 run_id，进度在运行详情里轮询。
         const result = await AD.api.post(`/api/tasks/${taskId}/rollback`);
-        AD.toastSuccess(result.message);
+        AD.toastSuccess(result.message || '回滚已开始');
         AD.Modal.close();
+        AD.openRunDetail(result.run_id);
       } catch (err) {
         AD.toastError(err.message);
+        AD.setBusy(event.currentTarget, false);
       }
     });
 
@@ -1767,6 +1864,8 @@ AD.views = {};
     const metaEl = backdrop.querySelector('#rd-log-meta');
     let lineCount = 0;
     let buffer = [];
+    // 与行内日志一致的上限：超长日志只保留尾部 800 行，避免 DOM 与内存膨胀。
+    const LOG_DOM_LIMIT = 800;
 
     const paint = (lines, reset) => {
       if (reset) { buffer = []; logEl.innerHTML = ''; }
@@ -1775,10 +1874,12 @@ AD.views = {};
         return;
       }
       buffer = buffer.concat(lines);
+      if (buffer.length > LOG_DOM_LIMIT) buffer = buffer.slice(-LOG_DOM_LIMIT);
       const atBottom = followEl.checked;
       const html = lines.map((line) => `<div class="log-line">${colorize(line)}</div>`).join('');
       logEl.insertAdjacentHTML('beforeend', html);
-      metaEl.textContent = '共 ' + buffer.length + ' 行';
+      while (logEl.childElementCount > LOG_DOM_LIMIT) logEl.removeChild(logEl.firstElementChild);
+      metaEl.textContent = '共 ' + lineCount + ' 行（显示最近 ' + buffer.length + ' 行）';
       if (atBottom) logEl.scrollTop = logEl.scrollHeight;
     };
 
@@ -1826,7 +1927,15 @@ AD.views = {};
 
     AD.state.currentRunId = runId;
     AD.state.liveTimer = setInterval(poll, 1200);
-    setTimeout(poll, 250);
+    // 首探也纳入清理：弹窗关闭后不再补发这一次探测。
+    const kickoff = setTimeout(() => {
+      if (AD.state.liveTimer) poll();
+    }, 250);
+    AD.stopLiveLog = function () {
+      if (AD.state.liveTimer) { clearInterval(AD.state.liveTimer); AD.state.liveTimer = null; }
+      clearTimeout(kickoff);
+      AD.state.currentRunId = null;
+    };
 
     backdrop.querySelector('#rd-copy').addEventListener('click', () => AD.copyToClipboard(buffer.join('\n')));
     backdrop.querySelector('#rd-download').addEventListener('click', () => {

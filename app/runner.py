@@ -34,6 +34,7 @@ from .deployer import (
     run_script_stage,
     stage_release,
     parse_path_list,
+    rollback_task,
 )
 from .executor import ProcessHandle, redact
 from .schedule import iso, utcnow
@@ -57,16 +58,21 @@ class ActiveRun:
     handles: list[ProcessHandle] = field(default_factory=list)
     tail: deque[str] = field(default_factory=deque)
     tail_bytes: int = 0
+    # 累计写入行数（不随环形缓冲裁剪而减少），用作增量轮询的快速游标比对。
+    tail_count: int = 0
     started_monotonic: float = field(default_factory=time.monotonic)
     log_file: Any = None
     lock: threading.Lock = field(default_factory=threading.Lock)
     # Exit code of the most recent command, reported as the run's exit code.
     last_exit_code: int | None = None
+    # 在流水线开始时一次性捕获，避免每写一行日志都读配置。
+    log_max_bytes: int = 1_000_000
 
     def append_tail(self, line: str) -> None:
         with self.lock:
             self.tail.append(line)
             self.tail_bytes += len(line) + 1
+            self.tail_count += 1
             while self.tail and (
                 len(self.tail) > LOG_TAIL_LINES or self.tail_bytes > LOG_TAIL_BYTES
             ):
@@ -77,6 +83,11 @@ class ActiveRun:
         with self.lock:
             lines = list(self.tail)
         return lines[-limit:]
+
+    def tail_total(self) -> int:
+        """累计输出行数（含已被环形缓冲裁掉的），供增量轮询快速比对。"""
+        with self.lock:
+            return self.tail_count
 
 
 def resolve_git_depth(task: Mapping[str, Any]) -> int:
@@ -128,6 +139,17 @@ class DeployRunner:
         with self._active_lock:
             return run_id in self._active
 
+    def tail_meta(self, run_id: int) -> tuple[bool, int | None]:
+        """活跃运行轻量探测：返回 (是否活跃, 累计日志行数或 None)。
+
+        供增量轮询端点在客户端已追平输出时跳过整个 tail 快照的拷贝。
+        """
+        with self._active_lock:
+            active = self._active.get(run_id)
+        if active is None:
+            return False, None
+        return True, active.tail_total()
+
     def cancel(self, run_id: int) -> bool:
         """Request cancellation; the worker stops at the next safe point."""
         with self._active_lock:
@@ -158,7 +180,11 @@ class DeployRunner:
             )
             return
 
-        active = ActiveRun(run_id=run_id, task_id=int(run["task_id"]))
+        active = ActiveRun(
+            run_id=run_id,
+            task_id=int(run["task_id"]),
+            log_max_bytes=config.load_settings().log_max_bytes,
+        )
         log_path = config.run_log_path(run_id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -422,6 +448,105 @@ class DeployRunner:
         active.last_exit_code = ctx.last_exit_code
         return "success", ctx.last_exit_code
 
+    # -- rollback ----------------------------------------------------------
+    def execute_rollback(
+        self,
+        run_id: int,
+        task_row: dict[str, Any],
+        selected_run: dict[str, Any] | None,
+        *,
+        timeout: int,
+        kill_grace_seconds: int,
+    ) -> None:
+        """后台执行一次回滚，作为 run 记录呈现。调用方已完成准入校验。"""
+        active = ActiveRun(
+            run_id=run_id,
+            task_id=int(task_row["id"]),
+            log_max_bytes=config.load_settings().log_max_bytes,
+        )
+        log_path = config.run_log_path(run_id)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            active.log_file = log_path.open("a", encoding="utf-8", errors="replace")
+        except OSError:
+            active.log_file = None
+
+        with self._active_lock:
+            self._active[run_id] = active
+        self.store.runs.mark_running(run_id)
+
+        status = "failed"
+        error = ""
+        exit_code: int | None = None
+        started = time.monotonic()
+
+        def log(line: str) -> None:
+            self._write_log(active, line)
+
+        try:
+            log("=" * 72)
+            log(f"任务: {task_row.get('name', '')} (id={task_row['id']})  运行: #{run_id}")
+            log("触发方式: rollback   开始时间: " + iso(utcnow()))
+            log("=" * 72)
+            ok, message = rollback_task(
+                task_row,
+                log=log,
+                timeout=timeout,
+                kill_grace_seconds=kill_grace_seconds,
+                selected_run=selected_run,
+                handles=active.handles,
+                check_cancelled=active.cancel_event.is_set,
+            )
+            if ok:
+                status = "success"
+                error = ""
+            elif active.cancel_event.is_set():
+                status = "cancelled"
+                error = "回滚已被取消"
+            else:
+                status = "failed"
+                error = message
+            log(message)
+        except Exception as exc:  # noqa: BLE001 - a rollback must never kill the worker
+            status = "failed"
+            error = f"未预期的错误: {exc.__class__.__name__}: {exc}"
+            log(f"! {error}")
+        finally:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if active.cancel_event.is_set() and status == "failed":
+                status = "cancelled"
+            log("-" * 72)
+            log(f"结果: {STATUS_LABELS.get(status, status)}   耗时: {duration_ms / 1000:.1f}s")
+            if error:
+                log(f"错误: {error}")
+            log("=" * 72)
+
+            log_bytes = 0
+            if active.log_file is not None:
+                try:
+                    active.log_file.flush()
+                    log_bytes = active.log_file.tell()
+                    active.log_file.close()
+                except OSError:
+                    pass
+
+            self.store.runs.mark_finished(
+                run_id, status=status, exit_code=exit_code,
+                error=error, duration_ms=duration_ms,
+            )
+            self.store.runs.set_log(run_id, str(log_path), log_bytes)
+            self.store.tasks.record_run_finished(
+                int(task_row["id"]), run_id=run_id, status=status, duration_ms=duration_ms
+            )
+            with self._active_lock:
+                self._active.pop(run_id, None)
+
+            if self.on_finished is not None:
+                try:
+                    self.on_finished(run_id, status)
+                except Exception:  # noqa: BLE001 - notification must not break cleanup
+                    pass
+
     # -- helpers -----------------------------------------------------------
     def _task_env(self, task: dict[str, Any]) -> dict[str, str]:
         raw = task.get("env_vars") or "{}"
@@ -443,7 +568,7 @@ class DeployRunner:
             return
         try:
             active.log_file.write(cleaned + "\n")
-            if active.log_file.tell() > config.load_settings().log_max_bytes:
+            if active.log_file.tell() > active.log_max_bytes:
                 active.log_file.write("! 日志超过大小上限，后续输出被截断\n")
                 active.log_file.flush()
                 active.log_file.close()
