@@ -107,6 +107,58 @@ fi
 SERVICE_PORT="$(grep -E '^AUTODEPLOY_PORT=' .env 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
 SERVICE_PORT="${SERVICE_PORT:-8770}"
 
+# ---- Docker socket 挂载：任务使用「Docker / Docker Compose」部署方式所需 ----
+# 自动写入本目录的 docker-compose.override.yml（compose 自动合并，升级重写主文件不影响）。
+# 默认开启；AUTODEPLOY_MOUNT_DOCKER_SOCKET=0 可关闭。docker 组权限等价 root，勿暴露公网。
+MOUNT_SOCKET=1
+case "${AUTODEPLOY_MOUNT_DOCKER_SOCKET:-1}" in
+  0|false|FALSE|no|NO|off|OFF) MOUNT_SOCKET=0 ;;
+esac
+
+OVERRIDE_FILE="docker-compose.override.yml"
+HAS_OVERRIDE=0
+OURS_OVERRIDE=0
+if [ -f "${OVERRIDE_FILE}" ]; then
+  HAS_OVERRIDE=1
+  if grep -q "AutoDeploy 自动生成" "${OVERRIDE_FILE}"; then
+    OURS_OVERRIDE=1
+  fi
+fi
+
+SOCKET_GID=""
+if [ "${MOUNT_SOCKET}" -eq 1 ]; then
+  if [ -S /var/run/docker.sock ]; then
+    SOCKET_GID="$(stat -c %g /var/run/docker.sock 2>/dev/null || true)"
+  fi
+  if [ -z "${SOCKET_GID}" ]; then
+    SOCKET_GID="$(getent group docker 2>/dev/null | cut -d: -f3 || true)"
+  fi
+fi
+
+if [ "${MOUNT_SOCKET}" -eq 1 ] && [ -n "${SOCKET_GID}" ]; then
+  if [ "${HAS_OVERRIDE}" -eq 1 ] && [ "${OURS_OVERRIDE}" -eq 0 ]; then
+    log "检测到自定义的 docker-compose.override.yml，未改动；如需脚本代管 socket 挂载请移除该文件后重跑"
+  else
+    {
+      echo "# AutoDeploy 自动生成（scripts/bootstrap.sh 管理，重新执行脚本会更新本文件）"
+      echo "services:"
+      echo "  autodeploy:"
+      echo "    volumes:"
+      echo "      - /var/run/docker.sock:/var/run/docker.sock"
+      echo "    group_add:"
+      echo "      - \"${SOCKET_GID}\""
+    } | ${SUDO} tee "${OVERRIDE_FILE}" >/dev/null
+    log "已挂载宿主机 Docker socket（docker 组 GID ${SOCKET_GID}），任务可直接使用 Docker / Docker Compose 部署方式"
+  fi
+elif [ "${MOUNT_SOCKET}" -eq 1 ]; then
+  log "警告：未检测到 /var/run/docker.sock 的 docker 组 GID，本次不挂载 socket；Docker / Docker Compose 部署方式将不可用（其余部署方式不受影响）"
+else
+  if [ "${HAS_OVERRIDE}" -eq 1 ] && [ "${OURS_OVERRIDE}" -eq 1 ]; then
+    ${SUDO} rm -f "${OVERRIDE_FILE}"
+  fi
+  log "已按 AUTODEPLOY_MOUNT_DOCKER_SOCKET=0 跳过 socket 挂载"
+fi
+
 # ---- 拉取镜像并启动 ----
 log "拉取官方镜像并启动（首次需要下载几百 MB）…"
 if ! ${DOCKER} compose pull; then

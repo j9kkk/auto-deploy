@@ -1555,6 +1555,13 @@ def run() -> int:
           "AUTODEPLOY_VERSION" in bootstrap_sh and "AUTODEPLOY_IMAGE_TAG" in bootstrap_sh)
     check("一键脚本支持离线安装与镜像源替换",
           "AUTODEPLOY_COMPOSE_FILE" in bootstrap_sh and "AUTODEPLOY_IMAGE" in bootstrap_sh)
+    check("一键脚本自动挂载宿主机 Docker socket（无需手动编辑文件）",
+          "docker-compose.override.yml" in bootstrap_sh
+          and "stat -c %g" in bootstrap_sh and "group_add" in bootstrap_sh)
+    check("一键脚本只管理自己生成的 override，不覆盖用户手写文件",
+          "AutoDeploy 自动生成" in bootstrap_sh)
+    check("一键脚本可关闭 socket 挂载",
+          "AUTODEPLOY_MOUNT_DOCKER_SOCKET" in bootstrap_sh)
     check("一键脚本等待 /api/health 就绪（无人值守安装也能确认服务可用）",
           "/api/health" in bootstrap_sh)
     check("一键脚本从日志提取一次性初始密码（重试避免与日志落盘竞态）",

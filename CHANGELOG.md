@@ -17,6 +17,9 @@
   然后 `compose pull` 拉取官方镜像并以 `--no-build` 启动；支持 `AUTODEPLOY_VERSION`
   锁定版本、`AUTODEPLOY_IMAGE` 更换镜像源、`AUTODEPLOY_COMPOSE_FILE` 离线安装；
   初始密码提取带短暂重试，避免健康检查先于日志落盘的竞态
+- 一键脚本默认自动挂载宿主机 Docker socket（自动检测 docker 组 GID 写入
+  `docker-compose.override.yml`，任务开箱即可用 Docker / Docker Compose 部署方式）：
+  不覆盖用户手写的 override，`AUTODEPLOY_MOUNT_DOCKER_SOCKET=0` 可关闭
 
 ### 新增
 
