@@ -298,6 +298,14 @@ class CredentialRepository:
             or 0
         )
 
+    def usage_counts(self) -> dict[int, int]:
+        """全部凭据的引用数，一条 GROUP BY 取回，供列表页避免 N+1。"""
+        rows = self.db.query(
+            "SELECT credential_id, COUNT(*) AS n FROM tasks "
+            "WHERE credential_id IS NOT NULL GROUP BY credential_id"
+        )
+        return {int(row["credential_id"]): int(row["n"]) for row in rows}
+
     def record_test(self, credential_id: int, *, ok: bool, error: str = "") -> None:
         self.db.execute_rowcount(
             """
@@ -524,6 +532,18 @@ class RunRepository:
                 (task_id, limit, offset),
             )
         ]
+
+    def latest_by_task(self) -> dict[int, dict[str, Any]]:
+        """每条任务取最近一次运行，供任务列表批量装饰，避免 N+1 查询。"""
+        rows = self.db.query(
+            "SELECT * FROM runs WHERE id IN "
+            "(SELECT MAX(id) FROM runs GROUP BY task_id)"
+        )
+        return {
+            int(row["task_id"]): decode_run(row) or {}
+            for row in rows
+            if row["task_id"] is not None
+        }
 
     def list_recent(
         self,

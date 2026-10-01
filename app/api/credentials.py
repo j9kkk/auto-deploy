@@ -33,10 +33,11 @@ def list_credentials(
 ) -> dict[str, Any]:
     """列出全部凭据。**永不返回密钥明文**，只返回是否已设置与测试结果。"""
     items = []
+    counts = service.store.credentials.usage_counts()
     for row in service.store.credentials.list_decoded():
         item = dict(row)
         item["kind_label"] = KIND_LABELS.get(str(item.get("kind")), str(item.get("kind")))
-        item["used_by"] = service.store.credentials.usage_count(int(item["id"]))
+        item["used_by"] = counts.get(int(item["id"]), 0)
         items.append(item)
     return {
         "credentials": items,

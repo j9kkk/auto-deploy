@@ -128,8 +128,26 @@ def settings_path() -> Path:
     return DATA_DIR / "config.json"
 
 
+# 配置文件读多写少，按 (mtime_ns, size) 缓存解析结果；未变化时免磁盘 IO。
+# 单线程写（save_settings 后主动失效），多线程读，最坏情况是重复构建一次。
+_settings_cache: Settings | None = None
+_settings_cache_key: tuple[int, int] | None = None
+
+
+def _settings_fingerprint() -> tuple[int, int] | None:
+    try:
+        stat = settings_path().stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
 def load_settings() -> Settings:
     """Build the effective settings object from file + environment."""
+    global _settings_cache, _settings_cache_key
+    fingerprint = _settings_fingerprint()
+    if _settings_cache is not None and fingerprint == _settings_cache_key:
+        return _settings_cache
     settings = Settings()
     path = settings_path()
     if path.exists():
@@ -156,6 +174,8 @@ def load_settings() -> Settings:
                 setattr(settings, field_info.name, raw)
 
     _coerce(settings)
+    _settings_cache = settings
+    _settings_cache_key = _settings_fingerprint()
     return settings
 
 
@@ -181,6 +201,9 @@ def save_settings(settings: Settings) -> None:
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
+    global _settings_cache, _settings_cache_key
+    _settings_cache = None
+    _settings_cache_key = None
 
 
 def data_dir() -> Path:
