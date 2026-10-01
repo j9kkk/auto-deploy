@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from .. import __version__ as VERSION
 from .. import config
+from .. import selfupdate
 from ..selfupdate import ACTIVE_STAGES
 from ..deployer import METHOD_LABELS, cleanup_path
 from ..runner import STATUS_LABELS
@@ -292,17 +293,35 @@ def check_update(
     return service.selfupdate.check(force=force).as_dict()
 
 
+def _upgrade_hint() -> str:
+    """按部署形态给出升级途径说明；可自升级时为空。"""
+    mode = selfupdate.docker_run_mode()
+    if mode == "docker":
+        return ""
+    if mode == "docker_no_socket":
+        return ("容器内未挂载 Docker socket，面板无法自升级。请在服务器执行一键脚本，"
+                "或手动：cd 安装目录 && docker compose pull && docker compose up -d")
+    if mode == "systemd":
+        return ""
+    return ("当前运行环境不支持面板自升级（未检测到 systemd 单元或容器形态）。"
+            "请使用一键脚本或 docker compose 拉取新镜像升级。")
+
+
 @router.get("/system/self-update/status")
 def self_update_status(
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
     state = service.selfupdate.state()
+    mode = selfupdate.docker_run_mode()
     return {
         **state,
         "active": state.get("stage") in ACTIVE_STAGES,
         **service.selfupdate.backup_status(),
         "current_version": VERSION,
+        "run_mode": mode,
+        "docker_available": mode == "docker",
+        "upgrade_hint": _upgrade_hint(),
     }
 
 
@@ -314,19 +333,21 @@ def self_update_history(
     """历次更新的日志与可回滚的目标版本。
 
     「升级日志」按钮的数据来源：每条记录都带该次操作的完整日志与最终结果，
-    ``backups`` 是当前仍可回滚的版本清单（按备份校验结果给出，不含路径）。
+    ``backups`` 是当前仍可回滚的版本清单（按备份校验结果给出，不含路径）；
+    Docker 形态的记录额外带 ``from_image``/``to_image``，供界面按镜像 tag 回退。
     """
     return {
         "entries": service.selfupdate.history(),
         "backups": service.selfupdate.backups(),
         "current_version": VERSION,
+        "run_mode": selfupdate.docker_run_mode(),
     }
 
 
 @router.post("/system/self-update")
 def start_self_update(
     payload: dict[str, Any] | None = None,
-    request: Request = None,  # type: ignore[assignment]
+    request: Request = None,  # type: ignore[assignment]  # FastAPI 按名注入；显式默认 None 仅为审计容错
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -334,6 +355,9 @@ def start_self_update(
     try:
         state = service.selfupdate.start(body.get("target_version"))
     except RuntimeError as exc:
+        audit(service, "self_update_rejected", actor=user["username"],
+              target="self-update", detail=f"target={body.get('target_version')} error={exc}",
+              ip=client_ip(request) if request else "")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit(service, "self_update_started", actor=user["username"],
           target="self-update", detail=f"target={state.get('target_version')}",
@@ -344,17 +368,25 @@ def start_self_update(
 @router.post("/system/self-update/rollback")
 def rollback_self_update(
     payload: dict[str, Any] | None = None,
-    request: Request = None,  # type: ignore[assignment]
+    request: Request = None,  # type: ignore[assignment]  # FastAPI 按名注入；显式默认 None 仅为审计容错
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
     body = payload or {}
     target = body.get("target_version")
+    target_image = body.get("target_image")
     try:
-        result = service.selfupdate.rollback(target if isinstance(target, str) else None)
+        result = service.selfupdate.rollback(
+            target if isinstance(target, str) else None,
+            target_image if isinstance(target_image, str) else None,
+        )
     except RuntimeError as exc:
+        audit(service, "self_update_rejected", actor=user["username"],
+              target="self-update", detail=f"rollback target={target or target_image} error={exc}",
+              ip=client_ip(request) if request else "")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit(service, "self_update_rollback", actor=user["username"],
-          target="self-update", detail=f"target={target}" if target else "最近备份",
+          target="self-update",
+          detail=f"image={target_image}" if target_image else (f"target={target}" if target else "最近备份"),
           ip=client_ip(request) if request else "")
     return result

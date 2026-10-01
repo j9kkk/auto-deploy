@@ -1996,6 +1996,132 @@ def run() -> int:
             mgr._save_state(dict(saved, stage='applying'))
             mgr.reconcile_on_startup()
             check('中断更新明确失败', mgr.state()['stage'] == 'failed')
+        section('Docker 形态一键升级与镜像回退')
+
+        docker_install = tmp_root / "docker-install"
+        docker_install.mkdir()
+        tree(docker_install, "1.0.0")
+        (docker_install / "docker-compose.yml").write_text(
+            'services:\n  autodeploy:\n    image: ${AUTODEPLOY_IMAGE:-ghcr.io/j9kkk/auto-deploy}:${AUTODEPLOY_IMAGE_TAG:-latest}\n')
+        # 模拟 bootstrap.sh 装好的旧版本部署：.env 锁定在 v1.0.0 对应的镜像 tag。
+        (docker_install / ".env").write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=1.0.0\n')
+        docker_data = tmp_root / 'docker-update-data'
+        docker_calls = []
+        fake_store_docker = SimpleNamespace(runs=SimpleNamespace(count_active=lambda: 0))
+        compose_dir = str(docker_install)
+
+        def docker_command(args, **kwargs):
+            docker_calls.append(args)
+            if args[0] == "docker" and args[1] == "info":
+                return SimpleNamespace(ok=True, output="")
+            if args[:2] == ["docker", "inspect"]:
+                # 镜像引用跟随 .env 当前 tag：容器重建后 inspect 反映的是新版本，
+                # 静态 mock 会让「回退时 from_image」的断言失真。
+                current_tag = 'latest'
+                env_file = docker_install / '.env'
+                if env_file.exists():
+                    for line in env_file.read_text().splitlines():
+                        if line.startswith('AUTODEPLOY_IMAGE_TAG='):
+                            current_tag = line.split('=', 1)[1].strip() or 'latest'
+                return SimpleNamespace(ok=True, output=(
+                    '{"com.docker.compose.project.working_dir":"' + compose_dir + '",'
+                    '"com.docker.compose.project":"auto-deploy"}'
+                    "\tghcr.io/j9kkk/auto-deploy:" + current_tag +
+                    "\t" + compose_dir + "\tauto-deploy"))
+            if args[:2] == ["docker", "pull"]:
+                return SimpleNamespace(ok=True, output="")
+            if args[:3] == ["docker", "compose", "up"]:
+                # 重建容器即终止本进程：模拟为直接退出（真实环境由 compose 拉起新容器）。
+                raise SystemExit(0)
+            raise AssertionError("Docker 更新测试禁止真实外部命令：" + str(args))
+
+        def fake_docker_check():
+            return True
+
+        with patch.object(config, 'ROOT_DIR', docker_install), \
+                patch.object(config, 'DATA_DIR', docker_data), \
+                patch.object(su, 'in_container', return_value=True), \
+                patch.object(su, 'docker_available', side_effect=fake_docker_check), \
+                patch.object(su.SelfUpdateManager, '_self_container_id', return_value='abc123def456'), \
+                patch.object(su, 'run_command', side_effect=docker_command):
+            dmgr = su.SelfUpdateManager(fake_store_docker)
+            check('容器内 socket 可用判为 docker 形态', su.docker_run_mode() == 'docker')
+            check('形态检测读取自身容器信息', dmgr._docker_self_info()['image'] == 'ghcr.io/j9kkk/auto-deploy:1.0.0')
+            env_file = dmgr._compose_env_file(dmgr._docker_self_info())
+            check('compose 启动目录定位到安装目录', env_file is not None and env_file.parent == docker_install)
+            latest_d = su.UpdateCheck('1.0.0', 'v2.0.0', True, '')
+            with patch.object(dmgr, 'check', return_value=latest_d):
+                state = dmgr.start('v2.0.0')
+                dmgr._thread.join(10)
+            docker_state = dmgr.state()
+            check('Docker 升级走到重建容器并落盘重启期限',
+                  docker_state['stage'] == 'restarting' and docker_state.get('restart') == 'docker-recreate'
+                  and docker_state.get('restart_deadline', 0) > 0)
+            check('升级历史记录镜像前后引用',
+                  docker_state.get('from_image') == 'ghcr.io/j9kkk/auto-deploy:1.0.0'
+                  and docker_state.get('to_image') == 'ghcr.io/j9kkk/auto-deploy:2.0.0')
+            env_text = (docker_install / '.env').read_text()
+            check('镜像 tag 已写入 .env', 'AUTODEPLOY_IMAGE_TAG=2.0.0' in env_text
+                  and 'AUTODEPLOY_IMAGE=ghcr.io/j9kkk/auto-deploy' in env_text)
+            check('拉取命令带正确镜像引用',
+                  any(a[:3] == ["docker", "pull", "ghcr.io/j9kkk/auto-deploy:2.0.0"] for a in docker_calls))
+            # 新容器进程确认：与裸机同一套 boot_id 协议。
+            with patch.object(su, 'PROCESS_BOOT_ID', 'docker-new-boot'), \
+                    patch.object(su.os, 'getpid', return_value=os.getpid() + 200), \
+                    patch.object(su, '__version__', '2.0.0'):
+                dmgr.reconcile_on_startup()
+            check('新容器确认目标版本后完成', dmgr.state()['stage'] == 'done')
+            check('完成态历史含镜像引用', any(item.get('to_image') == 'ghcr.io/j9kkk/auto-deploy:2.0.0'
+                                              for item in dmgr.history()))
+
+            # 镜像 tag 回退：切回 1.0.0（引用与镜像仓库一致，不带 v 前缀）。
+            docker_calls.clear()
+            with patch.object(su, '__version__', '2.0.0'):
+                dmgr.rollback(target_image='ghcr.io/j9kkk/auto-deploy:1.0.0')
+                dmgr._thread.join(10)
+            rb_state = dmgr.state()
+            check('镜像回退切回 .env 旧 tag', 'AUTODEPLOY_IMAGE_TAG=1.0.0' in (docker_install / '.env').read_text())
+            check('镜像回退记录 from/to 镜像',
+                  rb_state.get('from_image') == 'ghcr.io/j9kkk/auto-deploy:2.0.0'
+                  and rb_state.get('to_image') == 'ghcr.io/j9kkk/auto-deploy:1.0.0')
+            check('镜像回退进入等待重启确认', rb_state['stage'] == 'restarting')
+
+            # 回退目标必须来自升级历史：凭空构造的镜像引用拒绝。
+            with patch.object(su, '__version__', '2.0.0'):
+                expect_raises('凭空镜像引用拒绝回退',
+                              lambda: dmgr.rollback(target_image='ghcr.io/evil/auto-deploy:v9.9.9'), RuntimeError)
+                expect_raises('非法镜像引用拒绝回退',
+                              lambda: dmgr.rollback(target_image='bad ref with space'), RuntimeError)
+
+            # 拉取失败：中止且不动 .env 与旧容器（独立的 DATA_DIR，不受前面状态影响）。
+            def pull_fail(args, **kwargs):
+                if args[:2] == ["docker", "pull"]:
+                    return SimpleNamespace(ok=False, output="manifest unknown", error="")
+                return docker_command(args)
+            fresh_mgr = su.SelfUpdateManager(fake_store_docker)
+            (docker_install / '.env').write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=1.0.0\n')
+            with patch.object(config, 'DATA_DIR', tmp_root / 'docker-update-data-2'), \
+                    patch.object(fresh_mgr, 'check', return_value=latest_d), \
+                    patch.object(su, 'run_command', side_effect=pull_fail):
+                fresh_mgr.start('v2.0.0')
+                fresh_mgr._thread.join(10)
+                pf_state = fresh_mgr.state()
+            check('拉取失败中止且未改 .env',
+                  pf_state['stage'] == 'failed'
+                  and 'AUTODEPLOY_IMAGE_TAG=1.0.0' in (docker_install / '.env').read_text()
+                  and '2.0.0' not in (docker_install / '.env').read_text()
+                  and '拉取失败' in pf_state['error'])
+
+            # 无 socket 的容器形态：直接拒绝并给出引导。
+            with patch.object(su, 'docker_available', return_value=False), \
+                    patch.object(su, 'run_command', side_effect=docker_command):
+                no_sock = su.SelfUpdateManager(fake_store_docker)
+                check('无 socket 判为 docker_no_socket', su.docker_run_mode() == 'docker_no_socket')
+                expect_raises('无 socket 升级拒绝并引导', lambda: no_sock.start('v2.0.0'), RuntimeError)
+                check('无 socket 拒绝时未动任何文件',
+                      no_sock.state().get('stage') in ('idle', 'failed', 'unverified', 'done', 'restarting')
+                      and '2.0.0' not in (docker_install / '.env').read_text())
+
         section('旧版更新状态与备份兼容')
         with patch.object(config, 'DATA_DIR', tmp_root / 'legacy-update-data'):
             legacy_mgr = su.SelfUpdateManager(fake_store)

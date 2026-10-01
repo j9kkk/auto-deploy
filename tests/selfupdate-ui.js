@@ -147,7 +147,8 @@ async function scenario(responses) {
   panel.querySelector = selector => body.querySelector(selector)
     || (selector === '#upd-body' ? body : null);
 
-  const AD = { state: {}, escapeHtml, attr: escapeHtml, setBusy(button, busy) { button.disabled = Boolean(busy); } };
+  const AD = { state: { user: { is_admin: true } }, escapeHtml, attr: escapeHtml,
+    setBusy(button, busy) { button.disabled = Boolean(busy); } };
   AD.ICONS = { upgrade: '<svg id="upgrade-icon"></svg>' };
   const confirms = [];
   AD.confirm = async (options) => { confirms.push(options); return true; };
@@ -238,12 +239,12 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   const icon = test.at('#upd-upgrade');
   assert.ok(icon, '有新版本时必须有升级图标');
   assert.equal(icon.disabled, false);
-  assert.equal(icon.attributes.title, '升级到 v1.5.0');
+  assert.equal(icon.attributes.title, '一键升级到 v1.5.0');
 
   // --- 升级：二次确认展示更新源与代理，确认后才发起，并进入轮询。
   await test.click('#upd-upgrade');
   assert.equal(test.confirms.length, 1, '点击升级图标必须弹二次确认');
-  assert.match(test.confirms[0].title, /更新到 v1\.5\.0/);
+  assert.match(test.confirms[0].title, /一键升级到 v1\.5\.0/);
   assert.match(test.confirms[0].detail, /更新源：https:\/\/github\.com\/j9kkk\/auto-deploy\.git/);
   assert.match(test.confirms[0].detail, /网络代理：未启用/);
   const start = test.requests.find(r => r.url === '/api/system/self-update');
@@ -439,9 +440,9 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.match(test.root.innerHTML, /最新版本 v1\.5\.0/);
   assert.match(test.at('#upd-row').innerHTML, /最新版本 <strong class="mono">v1\.5\.0/);
 
-  // --- 重连预算：网络错误在 40 次后停止，且期间不做整页重绘。
+  // --- 重连预算：网络错误在 60 次后停止，且期间不做整页重绘。
   test = await scenario([settings, { stage: 'restarting', active: true, operation_id: 'op-2', log: ['保留日志'] }]);
-  for (let i = 0; i < 45; i++) {
+  for (let i = 0; i < 65; i++) {
     if (!test.timers.size) break;
     await test.tick();
   }

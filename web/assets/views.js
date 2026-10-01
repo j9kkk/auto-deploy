@@ -2857,9 +2857,15 @@ AD.views = {};
   const bareVersion = (v) => String(v || '').replace(/^[vV]+/, '');
   const UPD_STAGE_LABELS = {
     queued: '排队中', checking: '检查中', downloading: '下载中', backing_up: '备份代码',
-    applying: '替换代码', dependencies: '更新依赖', restarting: '等待重启确认',
+    applying: '替换代码', dependencies: '更新依赖', pulling_image: '拉取镜像',
+    recreating: '重建容器', restarting: '等待重启确认',
     done: '已确认完成', failed: '失败', error: '失败', idle: '尚未更新',
     unverified: '历史操作未确认',
+  };
+  // 步骤条：Docker 与裸机各自的阶段序列，drawUpdateProgress 用来画进度。
+  const UPD_STAGE_STEPS = {
+    docker: ['pulling_image', 'recreating', 'restarting'],
+    bare: ['downloading', 'backing_up', 'applying', 'dependencies', 'restarting'],
   };
 
   AD.stopUpdatePanel = function () {
@@ -2877,11 +2883,14 @@ AD.views = {};
     if (!panel) return;
     const ctx = {
       panel, stopped: false, timer: null, failures: 0, polls: 0,
-      deadline: Date.now() + 15 * 60 * 1000,
+      deadline: Date.now() + 30 * 60 * 1000,
       state: previous?.state || null,
       check: previous?.check || null,
       checking: false,
       settings: previous?.settings || null,
+      // 部署形态与升级能力（由状态接口带出）；不可自升级时行内只显示引导。
+      runMode: previous?.runMode || null,
+      rollbackOpen: false,
       // 正在预览的滚动位置；重绘日志时要还原，不能把读者拽回底部。
       logView: previous?.logView || { top: 0, left: 0, follow: true },
       rowSig: null, progSig: null,
@@ -2896,6 +2905,8 @@ AD.views = {};
     drawUpdateRow(ctx);
     drawUpdateProgress(ctx);
     pollUpdateStatus(ctx);    // 先恢复持久化状态，不用 health 推断成功。
+    // 进页面自动静默检查一次：有缓存时后端直接返回缓存，不打扰用户。
+    // 是否执行由首轮状态轮询决定（进行中的操作不并发检查），见 pollUpdateStatus。
   };
   const updateAlive = (ctx) => !ctx.stopped && ctx.panel.isConnected;
 
@@ -2943,12 +2954,19 @@ AD.views = {};
   }
 
   // ----------------------------------------------------------- 单行展示区
+  function canSelfUpgrade(ctx) {
+    // 形态未知时按可升级渲染，点确认时后端会给出准确原因；
+    // docker_no_socket 明确不可升级，提前分流。
+    return ctx.runMode !== 'docker_no_socket';
+  }
+
   function drawUpdateRow(ctx) {
     const row = ctx.panel.querySelector('#upd-row');
     if (!row) return;
     const state = ctx.state || {};
     const current = state.current_version || (ctx.check && ctx.check.current) || '';
     const active = Boolean(state.active);
+    const isAdmin = Boolean(AD.state.user && AD.state.user.is_admin);
     let latest;
     if (ctx.checking) {
       latest = '<span class="upd-latest dim">正在检查最新版本…</span>';
@@ -2959,27 +2977,94 @@ AD.views = {};
         + e(ctx.check.error) + '</span><button class="ghost sm" id="upd-recheck">重试</button>';
     } else if (ctx.check.update_available) {
       const target = versionText(ctx.check.latest);
-      latest = '<span class="upd-latest">最新版本 <strong class="mono">' + e(target) + '</strong></span>'
-        + '<button class="icon-btn run" id="upd-upgrade" title="升级到 ' + a(target) + '"'
-        + (active ? ' disabled' : '') + ' aria-label="升级到 ' + a(target) + '">' + ICONS.upgrade + '</button>';
+      if (!isAdmin) {
+        latest = '<span class="upd-latest">最新版本 <strong class="mono">' + e(target) + '</strong></span>'
+          + '<span class="dim">升级需要管理员登录</span>';
+      } else if (!canSelfUpgrade(ctx)) {
+        latest = '<span class="upd-latest">最新版本 <strong class="mono">' + e(target) + '</strong></span>'
+          + '<span class="upd-hint-block danger" id="upd-hint">' + e(state.upgrade_hint || '当前环境不支持面板内升级，请使用服务器上的一键脚本升级。') + '</span>';
+      } else {
+        latest = '<span class="upd-latest">最新版本 <strong class="mono">' + e(target) + '</strong></span>'
+          + '<button class="icon-btn run" id="upd-upgrade" title="一键升级到 ' + a(target) + '"'
+          + (active ? ' disabled' : '') + ' aria-label="升级到 ' + a(target) + '">' + ICONS.upgrade + '</button>';
+      }
     } else {
       latest = '<span class="upd-latest dim">当前已是最新版本</span>';
     }
     // 轮询每 1.5s 触发一次；只有内容真的变了才重建节点，避免打断悬停与焦点。
-    const signature = [current, active, ctx.checking, latest].join('|');
+    const signature = [current, active, ctx.checking, latest, ctx.rollbackOpen, isAdmin].join('|');
     if (signature === ctx.rowSig) return;
     ctx.rowSig = signature;
     row.innerHTML = '<span class="upd-item">当前版本 <strong class="mono">'
       + e(current ? versionText(current) : '未知') + '</strong></span>'
       + '<span class="upd-item" id="upd-latest">' + latest + '</span>'
       + '<div class="spacer"></div>'
+      + (isAdmin ? '<div class="upd-rollback-wrap" id="upd-rollback-wrap"></div>' : '')
       + '<button class="sm" id="upd-history">升级日志</button>'
-      + '<button class="sm" id="upd-config">配置</button>';
+      + (isAdmin ? '<button class="sm" id="upd-config">配置</button>' : '');
     row.querySelector('#upd-recheck')?.addEventListener('click', () => runUpdateCheck(ctx, true));
     row.querySelector('#upd-upgrade')?.addEventListener('click',
       () => startUpdateOperation(ctx, 'update', ctx.check.latest));
     row.querySelector('#upd-history')?.addEventListener('click', () => openUpdateHistory(ctx));
     row.querySelector('#upd-config')?.addEventListener('click', () => openUpdateConfig(ctx));
+    if (isAdmin) drawRollbackMenu(ctx, row.querySelector('#upd-rollback-wrap'), active);
+  }
+
+  /** 主行「回退 ▾」：有可回退目标时才渲染；菜单内容来自升级历史。 */
+  function drawRollbackMenu(ctx, wrap, active) {
+    if (!wrap) return;
+    const targets = rollbackTargets(ctx);
+    if (!targets.length) { wrap.innerHTML = ''; return; }
+    wrap.innerHTML = '<button class="sm" id="upd-rollback" aria-haspopup="true"'
+      + (active || ctx.rollbackOpen ? ' disabled' : '') + '>回退 ▾</button>'
+      + (ctx.rollbackOpen ? '<div class="upd-rollback-menu" id="upd-rollback-menu">'
+        + '<div class="hint">回退到：</div>'
+        + targets.map((item) => '<button class="sm menu-item" data-upd-rollback="'
+          + a(item.value) + '" data-upd-rollback-kind="' + a(item.kind) + '">'
+          + e(item.label) + '</button>').join('')
+        + '</div>' : '');
+    wrap.querySelector('#upd-rollback')?.addEventListener('click', () => {
+      if (ctx.rollbackOpen) { ctx.rollbackOpen = false; drawUpdateRow(ctx); return; }
+      // 菜单内容来自升级历史，展开时才拉取（幂等且轻量）。
+      updateRequest(ctx, '/api/system/self-update/history', 'GET', undefined, 20000)
+        .then((data) => { if (updateAlive(ctx)) { ctx.historyData = data; ctx.rollbackOpen = true; drawUpdateRow(ctx); } })
+        .catch(() => { if (updateAlive(ctx)) updateError(ctx, '读取可回退版本失败'); });
+    });
+    wrap.querySelectorAll('[data-upd-rollback]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const kind = button.dataset.updRollbackKind;
+        const value = button.dataset.updRollback;
+        ctx.rollbackOpen = false;
+        drawUpdateRow(ctx);
+        startUpdateOperation(ctx, 'rollback', value, kind === 'image' ? { target_image: value } : {});
+      });
+    });
+  }
+
+  /** 可回退目标清单：Docker=升级历史里的旧镜像引用，裸机=通过校验的备份。 */
+  function rollbackTargets(ctx) {
+    const data = ctx.historyData;
+    if (!data) return [];
+    const mode = ctx.runMode || data.run_mode || '';
+    const current = data.current_version || (ctx.state && ctx.state.current_version) || '';
+    const targets = [];
+    if (mode === 'docker') {
+      const seen = new Set();
+      (data.entries || []).forEach((entry) => {
+        const ref = String(entry.from_image || '');
+        if (!ref || seen.has(ref)) return;
+        seen.add(ref);
+        const tag = ref.split(':').pop() || ref;
+        if (tag && bareVersion(current) && tag === bareVersion(current)) return;
+        targets.push({ kind: 'image', value: ref, label: versionText(tag) });
+      });
+    } else {
+      (data.backups || []).forEach((item) => {
+        if (bareVersion(item.version) === bareVersion(current)) return;
+        targets.push({ kind: 'version', value: item.version, label: versionText(item.version) });
+      });
+    }
+    return targets.slice(0, 5);
   }
 
   // ------------------------------------------------------------- 进度区域
@@ -3007,6 +3092,8 @@ AD.views = {};
     const tone = failed ? 'error' : unverified ? 'warning' : confirmed ? 'success' : state.active ? 'info' : 'neutral';
     const label = unverified ? '历史操作未确认' : UPD_STAGE_LABELS[state.stage] || state.stage || '状态未知';
     const logs = state.log || [];
+    const steps = (state.restart === 'docker-recreate' || ctx.runMode === 'docker'
+      ? UPD_STAGE_STEPS.docker : UPD_STAGE_STEPS.bare);
     const signature = [state.stage, state.active, tone, label, confirmed, unverified,
       state.target_version, state.version, state.error, state.notice, logs.length, logs[logs.length - 1]]
       .join('|');
@@ -3016,6 +3103,14 @@ AD.views = {};
       + (state.active ? '当前操作状态：' : '上次操作状态：') + e(label)
       + (state.target_version ? ' · 目标版本 ' + e(versionText(state.target_version)) : '')
       + (state.error ? '<div class="upd-operation-error">' + e(state.error) + '</div>' : '') + '</div>';
+    if (state.active && steps.includes(state.stage)) {
+      const index = steps.indexOf(state.stage);
+      html += '<div class="upd-steps" id="upd-steps">' + steps.map((stage, i) => {
+        const tone2 = i < index ? 'done' : i === index ? 'current' : 'todo';
+        return '<span class="upd-step ' + tone2 + '"><span class="upd-step-dot"></span>'
+          + e(UPD_STAGE_LABELS[stage] || stage) + '</span>';
+      }).join('<span class="upd-step-line"></span>') + '</div>';
+    }
     if (state.notice) {
       html += '<div class="alert warning">' + e(state.notice) + '</div>';
     } else if (unverified) {
@@ -3025,6 +3120,9 @@ AD.views = {};
       html += '<div class="alert success" id="upd-done">版本已更新为 <strong class="mono">'
         + e(versionText(state.version || state.target_version)) + '</strong>，请刷新页面以加载新界面。'
         + '<div><button class="primary sm" id="upd-reload">刷新页面</button></div></div>';
+    }
+    if (failed && state.operation_id && state.operation === 'update') {
+      html += '<div><button class="sm" id="upd-failed-rollback">回退到升级前版本</button></div>';
     }
     if (state.active || logs.length) {
       html += '<div class="upd-log-wrap"><div class="upd-log-head">升级过程日志'
@@ -3048,11 +3146,17 @@ AD.views = {};
       AD.stopUpdatePanel();
       location.reload();
     });
+    box.querySelector('#upd-failed-rollback')?.addEventListener('click', () => {
+      // 升级失败后的快捷回退：优先按镜像引用回退（Docker），否则回退最近备份。
+      const ref = ctx.state && ctx.state.from_image;
+      if (ref) startUpdateOperation(ctx, 'rollback', ref.split(':').pop() || ref, { target_image: ref });
+      else startUpdateOperation(ctx, 'rollback', '');
+    });
   }
 
   async function pollUpdateStatus(ctx) {
     if (!updateAlive(ctx)) return;
-    if (++ctx.polls > 600 || Date.now() > ctx.deadline) {
+    if (++ctx.polls > 1200 || Date.now() > ctx.deadline) {
       updateError(ctx, '等待确认超时，未确认更新成功；请检查服务或重新读取状态'); return;
     }
     try {
@@ -3061,6 +3165,7 @@ AD.views = {};
       if (ctx.operationId && ctx.operationId !== state.operation_id) {
         updateError(ctx, '操作标识已变化，停止自动刷新，请重新读取状态'); return;
       }
+      if (state.run_mode) ctx.runMode = state.run_mode;
       ctx.state = state;
       drawUpdateRow(ctx);
       drawUpdateProgress(ctx);
@@ -3073,14 +3178,25 @@ AD.views = {};
         runUpdateCheck(ctx, true);
         return;
       }
-      if (!state.active) { runUpdateCheck(ctx, false); return; }
+      if (!state.active) {
+        // 非活跃状态：静默检查一次（进页面即知有无新版本；有缓存时后端直接返回缓存）。
+        runUpdateCheck(ctx, false);
+        return;
+      }
     } catch (err) {
       if (!updateAlive(ctx)) return;
-      // HTTP 错误不代表重启成功；网络错误的总预算不因一次连通而重置。
-      if (err.status) { updateError(ctx, err.message || '状态查询失败'); return; }
-      if (++ctx.failures >= 40) { updateError(ctx, '重连预算耗尽，请重新读取状态'); return; }
+      // 升级中的重启窗口（容器重建/服务重启）期间状态接口必然短暂失联，
+      // 这不是失败：继续轮询直到恢复，只有 HTTP 层的明确拒绝才终止。
+      if (err.status && err.status !== 502 && err.status !== 503) { updateError(ctx, err.message || '状态查询失败'); return; }
+      if (++ctx.failures >= 60) { updateError(ctx, '重连预算耗尽，请重新读取状态'); return; }
       const progress = ctx.panel.querySelector('#upd-progress');
-      if (!ctx.state && progress && !progress.innerHTML) progress.textContent = '暂时失联，正在有限重连…';
+      if (!ctx.state && progress && !progress.innerHTML) progress.textContent = '暂时失联，正在自动重连…';
+      if (ctx.state && ctx.state.active && progress && !progress.querySelector('#upd-reconnect')) {
+        // 复用进度区原有的追加式渲染：直接 innerHTML 重建会打断日志阅读位置，
+        // 这里在进度区尾部插入一条轻提示，恢复后由下一次成功轮询的重绘移除。
+        progress.insertAdjacentHTML('beforeend',
+          '<div class="alert info" id="upd-reconnect">服务正在重启，等待恢复…（若长时间未恢复请检查容器或服务状态）</div>');
+      }
     }
     if (updateAlive(ctx)) ctx.timer = setTimeout(() => pollUpdateStatus(ctx), 1500);
   }
@@ -3106,27 +3222,47 @@ AD.views = {};
 
   // -------------------------------------------------------- 升级 / 回滚
   /** 返回是否已被后端受理；调用方可据此决定要不要关闭当前弹窗。 */
-  async function startUpdateOperation(ctx, operation, target) {
+  async function startUpdateOperation(ctx, operation, target, extraPayload) {
     if (ctx.submitting) return false;
     ctx.submitting = true;
     try {
       const settings = (ctx.settings && ctx.settings.settings) || {};
       const repo = settings.update_repo || '默认更新源（github.com/j9kkk/auto-deploy）';
       const proxy = (ctx.settings && ctx.settings.proxy_description) || '未启用';
+      const isImage = extraPayload && extraPayload.target_image;
+      let message;
+      let detail;
+      if (operation === 'update' && ctx.runMode === 'docker') {
+        message = '将拉取新镜像 ' + e(versionText(target)) + ' 并重建容器（约 10 秒，期间面板短暂不可用）。';
+        detail = '任务数据、配置与历史记录均保留（数据在独立卷中）；拉取失败或启动异常时旧容器不受影响，可一键回退。'
+          + '更新源：' + e(repo) + '；网络代理：' + e(proxy) + '。';
+      } else if (isImage) {
+        message = '将把镜像切回 ' + e(target) + ' 并重建容器（期间面板短暂不可用）。';
+        detail = '数据卷不受影响，仅程序版本回退；回退后请确认任务运行正常。';
+      } else if (operation === 'rollback') {
+        message = target ? '将回滚到 ' + e(versionText(target)) + ' 并重启服务。'
+          : '将回滚到最近一份可用备份并重启服务。';
+        detail = '备份仅含代码，不回滚数据库或 Python 依赖，降级可能不兼容；'
+          + '只有重启后确认目标版本运行才算成功。';
+      } else {
+        message = '将替换程序代码并重启服务；只有重启后确认目标版本运行才算成功。';
+        detail = '更新源：' + e(repo) + '；网络代理：' + e(proxy)
+          + '；备份仅含代码，不回滚数据库或 Python 依赖，降级可能不兼容。';
+      }
       const confirmed = await AD.confirm({
-        title: operation === 'update' ? '更新到 ' + versionText(target) : '回滚到 ' + versionText(target),
-        message: '将替换程序代码并重启服务；只有重启后确认目标版本运行才算成功。',
-        detail: '更新源：' + repo + '；网络代理：' + proxy
-          + '；备份仅含代码，不回滚数据库或 Python 依赖，降级可能不兼容。',
-        confirmText: '确认执行',
+        title: operation === 'update' ? '一键升级到 ' + versionText(target) : '版本回退',
+        message,
+        detail,
+        confirmText: operation === 'update' ? '开始升级' : '确认回退',
         danger: operation === 'rollback',
       });
       if (!confirmed || !updateAlive(ctx)) return false;
       const path = '/api/system/self-update' + (operation === 'rollback' ? '/rollback' : '');
-      const result = await updateRequest(ctx, path, 'POST', { target_version: target }, 30000);
+      const payload = { target_version: target, ...(extraPayload || {}) };
+      const result = await updateRequest(ctx, path, 'POST', payload, 30000);
       if (!updateAlive(ctx)) return false;
       ctx.operationId = result.state.operation_id;
-      ctx.deadline = Date.now() + 15 * 60 * 1000;
+      ctx.deadline = Date.now() + 30 * 60 * 1000;
       ctx.polls = 0;
       ctx.failures = 0;
       ctx.state = { ...(ctx.state || {}), ...result.state, active: true };

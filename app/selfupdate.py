@@ -36,7 +36,63 @@ PROCESS_BOOT_ID = uuid.uuid4().hex
 # 与部署脚本同一套产物：这些路径构成一次完整的程序更新。
 UPDATE_ITEMS = ("app", "web", "requirements.txt", "run.sh")
 
-ACTIVE_STAGES = ("queued", "checking", "downloading", "backing_up", "applying", "dependencies", "restarting")
+ACTIVE_STAGES = ("queued", "checking", "downloading", "backing_up", "applying", "dependencies",
+                 "pulling_image", "recreating", "restarting")
+
+# Docker 镜像引用：仓库（可含 / 与 .）+ 可选 tag。用于 .env 的镜像切换与回退目标，
+# 防止任意字符串注入 compose 命令。
+IMAGE_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}(:[A-Za-z0-9][A-Za-z0-9._-]{0,127})?")
+
+# Docker 形态的环境变量名（与 bootstrap.sh / docker-compose.yml 约定一致）。
+IMAGE_TAG_ENV_KEY = "AUTODEPLOY_IMAGE_TAG"
+IMAGE_ENV_KEY = "AUTODEPLOY_IMAGE"
+DEFAULT_IMAGE = "ghcr.io/j9kkk/auto-deploy"
+DEFAULT_IMAGE_TAG = "latest"
+
+DOCKER_CHECK_CACHE_SECONDS = 30
+_docker_check_cache: tuple[float, bool] | None = None
+
+
+def in_container() -> bool:
+    """是否运行在容器里（Docker/K8s 等）。
+
+    标准探测：/.dockerenv 存在，或 cgroup 内容出现容器运行时标识。
+    这是事实判断；「能不能操作 docker」另由 docker_available() 判定。
+    """
+    try:
+        if Path("/.dockerenv").exists():
+            return True
+        cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8", errors="replace")
+        return any(k in cgroup for k in ("docker", "containerd", "kubepods", "podman"))
+    except OSError:
+        return False
+
+
+def docker_available() -> bool:
+    """能否操作宿主 docker：判据是实际能跑通 `docker info`，而不是在不在容器里。
+
+    容器挂了 socket 就完全能做（与宿主等价）；宿主没装 docker 反而不能。
+    结果缓存 30 秒：状态接口被前端轮询，每次都探测会拖慢响应。
+    """
+    global _docker_check_cache
+    now = time.monotonic()
+    if _docker_check_cache is not None and now - _docker_check_cache[0] < DOCKER_CHECK_CACHE_SECONDS:
+        return _docker_check_cache[1]
+    ok = run_command(["docker", "info"], timeout=15).ok
+    _docker_check_cache = (now, ok)
+    return ok
+
+
+def docker_run_mode() -> str:
+    """部署形态：docker（容器内且能操作 docker）、docker_no_socket、systemd、unknown。
+
+    systemd 判定复用 _restart_plan（要求真实单元主进程 + Restart=always），
+    与裸机升级的准入条件一致。
+    """
+    if in_container():
+        return "docker" if docker_available() else "docker_no_socket"
+    strategy, _ = SelfUpdateManager._restart_plan_static()
+    return "systemd" if strategy == "self-exit" else "unknown"
 
 
 def compare_versions(a: str, b: str) -> int:
@@ -264,6 +320,9 @@ class SelfUpdateManager:
             "previous_version": normalize_tag(str(state.get("previous_version") or "")),
             "current_version": normalize_tag(str(state.get("version") or __version__)),
             "backup_version": normalize_tag(str(state.get("backup_version") or state.get("previous_version") or "")),
+            # Docker 形态：升级前后的完整镜像引用（含 tag），供界面按 tag 回退。
+            "from_image": str(state.get("from_image") or ""),
+            "to_image": str(state.get("to_image") or ""),
             "started_at": state.get("started_at") or 0,
             "finished_at": time.time(),
             "error": str(state.get("error") or ""),
@@ -518,15 +577,33 @@ class SelfUpdateManager:
                     log=[], error="", backup="")
 
     def start(self, target_version: str | None = None) -> dict[str, Any]:
+        if not isinstance(target_version, str) or not re.fullmatch(r"[vV]?\d+(?:\.\d+){1,3}(?:-[A-Za-z0-9.-]+)?", target_version):
+            raise RuntimeError("请先检查更新并确认有效目标版本")
+        # 环境准入（无网络）先行：环境不支持时给出准确原因，而不是耗 45 秒查网络
+        # 后报一句「目标已变化」。版本与网络的强校验在准入通过后、全局锁外完成，
+        # 慢网络不会阻塞部署/调度准入（调度器与本管理器共用同一把锁）。
+        in_docker = in_container()
+        if in_docker:
+            self._docker_preflight(lambda m: None)
+        else:
+            self._preflight()
         with self._lock:
             if self.deployment_blocked():
                 raise RuntimeError("已有更新或回滚正在进行")
+        checked = self.check(force=True)
+        if checked.error or checked.latest != target_version or not checked.update_available:
+            raise RuntimeError("更新目标已变化或不可用，请重新检查并确认")
+        with self._lock:
+            if self.deployment_blocked():
+                raise RuntimeError("已有更新或回滚正在进行")
+            if in_docker:
+                state = self._new_state("update", target_version, "")
+                state["restart"] = "docker-recreate"
+                self._save_state(state)
+                self._thread = threading.Thread(target=self._run_docker, args=(state, target_version), daemon=True)
+                self._thread.start()
+                return dict(state)
             service = self._preflight()
-            if not isinstance(target_version, str) or not re.fullmatch(r"[vV]?\d+(?:\.\d+){1,3}(?:-[A-Za-z0-9.-]+)?", target_version):
-                raise RuntimeError("请先检查更新并确认有效目标版本")
-            checked = self.check(force=True)
-            if checked.error or checked.latest != target_version or not checked.update_available:
-                raise RuntimeError("更新目标已变化或不可用，请重新检查并确认")
             state = self._new_state("update", target_version, service)
             self._save_state(state)
             self._thread = threading.Thread(target=self._run, args=(state,), daemon=True)
@@ -679,6 +756,11 @@ class SelfUpdateManager:
             pass
         return ""
 
+    @staticmethod
+    def _restart_plan_static() -> tuple[str, str]:
+        """无实例形态检测：供 docker_run_mode 在未建 manager 时复用同一套判定。"""
+        return SelfUpdateManager(None)._restart_plan()
+
     def _restart_plan(self) -> tuple[str, str]:
         path = self._cgroup_path()
         service = path.rsplit("/", 1)[-1]
@@ -694,6 +776,201 @@ class SelfUpdateManager:
             return "self-exit", service
         return "unsupported", service
 
+    # ------------------------------------------------------------- Docker 形态
+    @staticmethod
+    def _self_container_id() -> str:
+        """当前容器 ID（hostname 即短 ID 的惯例写法）；非容器返回空。"""
+        if not in_container():
+            return ""
+        try:
+            cid = Path("/etc/hostname").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+        return cid if re.fullmatch(r"[0-9a-f]{12,64}", cid) else ""
+
+    def _docker_self_info(self) -> dict[str, str]:
+        """读取自身容器的 compose 标签与镜像引用。
+
+        依赖 docker CLI 查询（inspect 输出 JSON），不引入任何非标准库依赖。
+        失败返回空字典，由调用方给出明确报错。
+        """
+        cid = self._self_container_id()
+        if not cid:
+            return {}
+        result = run_command(
+            ["docker", "inspect", cid, "--format",
+             '{{json .Config.Labels}}\t{{.Config.Image}}\t{{index .Config.Labels "com.docker.compose.project.working_dir"}}\t{{index .Config.Labels "com.docker.compose.project"}}'],
+            timeout=15,
+        )
+        if not result.ok:
+            return {}
+        parts = result.output.strip().split("\t")
+        info: dict[str, str] = {}
+        try:
+            labels = json.loads(parts[0]) if parts and parts[0] else {}
+        except json.JSONDecodeError:
+            labels = {}
+        if isinstance(labels, dict):
+            info["project_working_dir"] = str(labels.get("com.docker.compose.project.working_dir") or "")
+            info["project"] = str(labels.get("com.docker.compose.project") or "")
+        info["image"] = parts[1].strip() if len(parts) > 1 else ""
+        info["working_dir"] = parts[2].strip() if len(parts) > 2 else ""
+        info["project"] = info.get("project") or (parts[3].strip() if len(parts) > 3 else "")
+        return info
+
+    def _compose_env_file(self, info: dict[str, str]) -> Path | None:
+        """安装目录的 .env（compose 启动目录下的 AUTODEPLOY_IMAGE_TAG 所在文件）。"""
+        workdir = info.get("working_dir") or info.get("project_working_dir") or ""
+        if not workdir:
+            return None
+        path = Path(workdir) / ".env"
+        try:
+            resolved = path.resolve()
+            # 越界防护：工作目录标签理论上可被伪造，确认其父目录真实存在。
+            if not resolved.parent.is_dir():
+                return None
+        except OSError:
+            return None
+        return path
+
+    def _current_image_ref(self, info: dict[str, str]) -> str:
+        """当前镜像引用（如 ghcr.io/j9kkk/auto-deploy:v0.3.0）。"""
+        image = (info.get("image") or "").strip()
+        return image if image and IMAGE_REF_RE.fullmatch(image) else ""
+
+    def _write_env_tag(self, env_path: Path, image: str, tag: str, log) -> None:
+        """原子改写 .env 的镜像与 tag；原文件不存在则创建。
+
+        compose 文件通过 ${AUTODEPLOY_IMAGE:-ghcr.io/...}:${AUTODEPLOY_IMAGE_TAG:-latest}
+        引用镜像，因此只需改这两个变量即可切换版本，不动 compose 本体。
+        """
+        lines: list[str] = []
+        if env_path.is_file():
+            try:
+                lines = env_path.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                raise RuntimeError(f"无法读取 {env_path}：{exc}") from exc
+        wanted = {IMAGE_ENV_KEY: image, IMAGE_TAG_ENV_KEY: tag}
+        seen: set[str] = set()
+        out: list[str] = []
+        for line in lines:
+            key = line.split("=", 1)[0].strip() if "=" in line else ""
+            if key in wanted:
+                out.append(f"{key}={wanted[key]}")
+                seen.add(key)
+            else:
+                out.append(line)
+        for key, value in wanted.items():
+            if key not in seen:
+                out.append(f"{key}={value}")
+        tmp = env_path.with_suffix(".env.tmp-selfupdate")
+        try:
+            tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+            os.replace(tmp, env_path)
+        except OSError as exc:
+            raise RuntimeError(f"无法写入 {env_path}：{exc}") from exc
+        log(f"已更新 {env_path.name}：镜像 {image}:{tag}")
+
+    def _docker_preflight(self, log) -> dict[str, str]:
+        """Docker 升级前置检查：能力、compose 定位、镜像引用。全部通过才动镜像。"""
+        if not docker_available():
+            raise RuntimeError(
+                "当前环境无法操作 docker（未安装 docker，或容器未挂载 /var/run/docker.sock），"
+                "面板无法自升级。请在服务器执行一键脚本，或手动：docker compose pull && docker compose up -d"
+            )
+        info = self._docker_self_info()
+        if not info.get("image"):
+            raise RuntimeError(
+                "无法确定当前容器信息（缺少 docker inspect 或 compose 标签），已中止升级；"
+                "请使用一键脚本或手动 docker compose pull && docker compose up -d"
+            )
+        env_file = self._compose_env_file(info)
+        if env_file is None:
+            raise RuntimeError(
+                "未找到 compose 启动目录中的 .env（宿主机安装目录），无法切换镜像版本；"
+                "已中止升级，请使用一键脚本升级"
+            )
+        log(f"已定位安装目录：{env_file.parent}")
+        return info
+
+    def _docker_pull(self, image: str, tag: str, log) -> None:
+        """拉取目标镜像。失败即中止：此时未改任何文件，旧容器不受影响。"""
+        ref = f"{image}:{tag}"
+        log(f"拉取镜像 {ref}（可能需要几分钟）…")
+        settings = config.load_settings()
+        result = run_command(["docker", "pull", ref], timeout=1800, log=log,
+                             env=config.proxy_env(settings, for_scripts=True))
+        if not result.ok:
+            raise RuntimeError(f"镜像拉取失败（{ref}）；旧容器未受影响，请检查网络或该版本是否存在")
+        log(f"镜像已就绪：{ref}")
+
+    def _finish_docker(self, state, info, log):
+        """落盘重启终态后重建容器（重建即终止本进程，由新容器完成版本确认）。"""
+        state.update(restart="docker-recreate", restart_deadline=time.time() + RESTART_TIMEOUT)
+        self._set_stage(state, "restarting")
+        log("即将重建容器，等待新容器确认版本")
+        env_file = self._compose_env_file(info)
+        assert env_file is not None
+        workdir = str(env_file.parent)
+        run_command(["docker", "compose", "up", "-d", "--no-build"], cwd=workdir, timeout=600, log=log)
+
+    def _run_docker(self, state, target_tag: str):
+        """Docker 形态的升级执行体：pull → 切 .env → 重建 →（新进程）确认。"""
+        def log(message):
+            self._log(state, message)
+            self._save_state(state)
+        changed_env = False
+        try:
+            info = self._docker_preflight(log)
+            from_image = self._current_image_ref(info)
+            image = from_image.rsplit(":", 1)[0] if ":" in from_image else (from_image or DEFAULT_IMAGE)
+            state["from_image"] = from_image
+            state["to_image"] = f"{image}:{state['expected_version']}"
+            self._save_state(state)
+            self._set_stage(state, "pulling_image")
+            self._docker_pull(image, state["expected_version"], log)
+            self._set_stage(state, "recreating")
+            env_file = self._compose_env_file(info)
+            assert env_file is not None
+            self._write_env_tag(env_file, image, state["expected_version"], log)
+            changed_env = True
+            self._finish_docker(state, info, log)
+        except Exception as exc:
+            error = str(exc)
+            if changed_env:
+                # .env 已切到新 tag 但未能重建/确认：如实告知，回退入口可切回。
+                error += "；镜像 tag 已写入 .env，若服务异常可在界面回退或手动还原"
+            state.update(stage="failed", error=error)
+            self._log(state, error)
+            self._save_state(state)
+            self._append_history(state)
+
+    def _run_docker_rollback(self, state, target_ref: str):
+        """Docker 形态的回退执行体：把镜像切回目标 tag 并重建。"""
+        def log(message):
+            self._log(state, message)
+            self._save_state(state)
+        try:
+            info = self._docker_preflight(log)
+            image = target_ref.rsplit(":", 1)[0] if ":" in target_ref else target_ref
+            # GHCR 镜像 tag 无 v 前缀（type=semver {{version}}），历史里引用的
+            # 版本可能带 v，回退时归一化，保证 pull 的 tag 与镜像仓库一致。
+            tag = normalize_tag(target_ref.rsplit(":", 1)[1]) if ":" in target_ref else DEFAULT_IMAGE_TAG
+            state["to_image"] = f"{image}:{tag}"
+            self._save_state(state)
+            self._set_stage(state, "pulling_image")
+            self._docker_pull(image, tag, log)
+            self._set_stage(state, "recreating")
+            env_file = self._compose_env_file(info)
+            assert env_file is not None
+            self._write_env_tag(env_file, image, tag, log)
+            self._finish_docker(state, info, log)
+        except Exception as exc:
+            state.update(stage="failed", error=str(exc))
+            self._log(state, str(exc))
+            self._save_state(state)
+            self._append_history(state)
+
     def _finish(self, state, log):
         if self._restart_plan() != ("self-exit", state["service"]):
             raise RuntimeError("重启能力已变化，已中止更新")
@@ -708,16 +985,42 @@ class SelfUpdateManager:
             os._exit(0)
         threading.Thread(target=exit_later, daemon=True).start()
 
-    def rollback(self, target_version: str | None = None):
-        """回滚到指定版本的备份；不指定则回滚最近一份可用备份。
+    def rollback(self, target_version: str | None = None, target_image: str | None = None):
+        """回退。
 
-        指定版本时只在**通过校验的备份**里按版本号查找（清单来自
-        ``_valid_backups``，不接受任何路径），因此界面传入的值无法越界或
-        指向备份目录之外的代码。
+        Docker 形态（``target_image`` 提供镜像引用，如 ``ghcr.io/j9kkk/auto-deploy:v0.3.0``）：
+        把 .env 切回目标镜像并重建容器。引用必须来自升级历史（界面只展示历史里
+        出现过的 from_image），且经 IMAGE_REF_RE 校验，无法注入任意字符串。
+
+        裸机形态：回滚到指定版本的代码备份；不指定则回滚最近一份可用备份。
+        只在**通过校验的备份**里按版本号查找（清单来自 ``_valid_backups``，
+        不接受任何路径），因此界面传入的值无法越界或指向备份目录之外的代码。
         """
+        docker_ref = ""
+        if target_image:
+            docker_ref = str(target_image).strip()
+            if not IMAGE_REF_RE.fullmatch(docker_ref):
+                raise RuntimeError("回退目标镜像引用无效")
         with self._lock:
             if self.deployment_blocked():
                 raise RuntimeError("更新或回滚正在进行，无法重复操作")
+            if docker_ref:
+                # Docker 回退：目标必须出现在升级历史里（防止凭空构造引用）。
+                known = {str(item.get("from_image") or "") for item in self.history()}
+                known |= {str(item.get("to_image") or "") for item in self.history()}
+                known.discard("")
+                if docker_ref not in known:
+                    raise RuntimeError("回退目标不在升级历史中，已拒绝")
+                # preflight 失败（无 socket/定位不到 compose）直接抛错，尚未动任何文件。
+                self._docker_preflight(lambda m: None)
+                state = self._new_state("rollback", docker_ref.rsplit(":", 1)[-1], "")
+                state["restart"] = "docker-recreate"
+                state["target_image"] = docker_ref
+                state["from_image"] = self._current_image_ref(self._docker_self_info())
+                self._save_state(state)
+                self._thread = threading.Thread(target=self._run_docker_rollback, args=(state, docker_ref), daemon=True)
+                self._thread.start()
+                return {"ok": True, "state": dict(state)}
             service = self._preflight()
             if target_version:
                 wanted = str(target_version).strip()
