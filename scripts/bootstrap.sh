@@ -129,7 +129,16 @@ if [ "${READY}" -ne 1 ]; then
 fi
 
 # ---- 初始密码（仅首次启动打印一次）----
-if ${DOCKER} compose logs autodeploy 2>&1 | grep -q "首次启动"; then
+# 健康检查通过时横幅可能尚未写入 docker 日志，短暂重试避免误报「未拿到密码」。
+BANNER_FOUND=0
+for _ in $(seq 1 10); do
+  if ${DOCKER} compose logs autodeploy 2>&1 | grep -q "首次启动"; then
+    BANNER_FOUND=1
+    break
+  fi
+  sleep 1
+done
+if [ "${BANNER_FOUND}" -eq 1 ]; then
   echo
   log "管理员账号已创建，初始密码如下（仅显示这一次，请立即登录并修改）："
   ${DOCKER} compose logs autodeploy 2>&1 | grep -A 3 "首次启动" || true

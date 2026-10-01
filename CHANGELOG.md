@@ -15,7 +15,8 @@
 - 一键部署不再克隆仓库、无需本地构建：脚本自动创建 `/opt/auto-deploy`、在线下载
   `docker-compose.yml`（自动重试与内容校验）、检测系统环境并安装缺失的 Docker 组件，
   然后 `compose pull` 拉取官方镜像并以 `--no-build` 启动；支持 `AUTODEPLOY_VERSION`
-  锁定版本、`AUTODEPLOY_IMAGE` 更换镜像源、`AUTODEPLOY_COMPOSE_FILE` 离线安装
+  锁定版本、`AUTODEPLOY_IMAGE` 更换镜像源、`AUTODEPLOY_COMPOSE_FILE` 离线安装；
+  初始密码提取带短暂重试，避免健康检查先于日志落盘的竞态
 
 ### 新增
 

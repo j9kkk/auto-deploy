@@ -1557,7 +1557,8 @@ def run() -> int:
           "AUTODEPLOY_COMPOSE_FILE" in bootstrap_sh and "AUTODEPLOY_IMAGE" in bootstrap_sh)
     check("一键脚本等待 /api/health 就绪（无人值守安装也能确认服务可用）",
           "/api/health" in bootstrap_sh)
-    check("一键脚本从日志提取一次性初始密码", "初始密码" in bootstrap_sh)
+    check("一键脚本从日志提取一次性初始密码（重试避免与日志落盘竞态）",
+          "初始密码" in bootstrap_sh and "seq 1 10" in bootstrap_sh)
     check("一键脚本管道模式不读取自身文件（bash 增量读 stdin，落盘副本会截断）",
           "BASH_SOURCE" not in bootstrap_sh and "$0" not in bootstrap_sh)
     check("已移除 systemd 安装脚本（仅保留 Docker Compose 部署方式）",
