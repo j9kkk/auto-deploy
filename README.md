@@ -84,16 +84,21 @@ docker compose up --build -d
   （镜像仍需 `docker load` 预先导入）
 - **其他设置**：环境变量命名规则为 `AUTODEPLOY_` + 设置名大写（如
   `AUTODEPLOY_MAX_GLOBAL_WORKERS`），优先级高于界面设置
-- **部署 Docker 应用**：任务可选 Docker / Docker Compose 方式，需在 docker-compose.yml
-  中放开 socket 挂载，并加上宿主机 docker 组（写法如下）。注意 docker 组权限等价于 root，
-  请勿将控制台暴露到公网：
+- **部署 Docker 应用**：任务可选 Docker / Docker Compose 方式，需把宿主机 Docker socket
+  挂进容器。在安装目录创建 `docker-compose.override.yml`（一键脚本升级会重写主
+  compose 文件，**不会覆盖** override 文件）：
 
   ```yaml
+  services:
+    autodeploy:
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
       group_add:
         - "999"   # 宿主机 docker 组 GID：stat -c %g /var/run/docker.sock
   ```
+
+  然后 `docker compose up -d` 重建容器生效。注意 docker 组权限等价于 root，
+  请勿将控制台暴露到公网。
 
 - **反向代理**：参考 [deploy/nginx.conf.example](deploy/nginx.conf.example)；
   启用 HTTPS 后在「设置 → 安全」勾选「信任反向代理头」与「仅 HTTPS 发送会话 Cookie」

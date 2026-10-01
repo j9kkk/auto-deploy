@@ -23,6 +23,11 @@
 - CI 新增 Docker 工作流（`.github/workflows/docker.yml`）：push 到 main 自动构建
   amd64/arm64 双架构镜像推送 GHCR（`latest` 标签），push `v*` 标签追加语义化版本标签
 
+### 文档
+
+- 部署 Docker 应用的 socket 挂载改为 `docker-compose.override.yml` 方式：一键脚本
+  升级会重写主 compose 文件，直接改主文件的挂载会在下次升级时静默失效
+
 ## [0.2.0] - 2026-10-01
 
 ### 变更

@@ -16,8 +16,8 @@ services:
       - "${AUTODEPLOY_PORT:-8770}:8770"
     volumes:
       - autodeploy-data:/app/data
-      # 任务需要使用「Docker / Docker Compose」部署方式时，放开下行挂载宿主机
-      # Docker socket，并按 README 为服务追加宿主机 docker 组的 group_add：
+      # 任务需要使用「Docker / Docker Compose」部署方式时，在 docker-compose.override.yml
+      # 中挂载宿主机 Docker socket（一键脚本升级不会覆盖 override 文件，写法见 README）：
       # - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
