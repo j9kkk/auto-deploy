@@ -137,7 +137,7 @@ fi
 
 if [ "${MOUNT_SOCKET}" -eq 1 ] && [ -n "${SOCKET_GID}" ]; then
   if [ "${HAS_OVERRIDE}" -eq 1 ] && [ "${OURS_OVERRIDE}" -eq 0 ]; then
-    log "检测到自定义的 docker-compose.override.yml，未改动；如需脚本代管 socket 挂载请移除该文件后重跑"
+    log "检测到自定义的 docker-compose.override.yml，未改动；如需脚本代管挂载请移除该文件后重跑"
   else
     {
       echo "# AutoDeploy 自动生成（scripts/bootstrap.sh 管理，重新执行脚本会更新本文件）"
@@ -145,10 +145,13 @@ if [ "${MOUNT_SOCKET}" -eq 1 ] && [ -n "${SOCKET_GID}" ]; then
       echo "  autodeploy:"
       echo "    volumes:"
       echo "      - /var/run/docker.sock:/var/run/docker.sock"
+      # 安装目录同路径挂载：面板内一键升级要在容器里改写宿主机 .env 并以
+      # 该目录为工作目录执行 compose up，路径必须与 compose 标签一致。
+      echo "      - ${INSTALL_DIR}:${INSTALL_DIR}"
       echo "    group_add:"
       echo "      - \"${SOCKET_GID}\""
     } | ${SUDO} tee "${OVERRIDE_FILE}" >/dev/null
-    log "已挂载宿主机 Docker socket（docker 组 GID ${SOCKET_GID}），任务可直接使用 Docker / Docker Compose 部署方式"
+    log "已挂载宿主机 Docker socket 与安装目录 ${INSTALL_DIR}（docker 组 GID ${SOCKET_GID}），任务的 Docker 部署方式与面板内一键升级都依赖这两个挂载"
   fi
 elif [ "${MOUNT_SOCKET}" -eq 1 ]; then
   log "警告：未检测到 /var/run/docker.sock 的 docker 组 GID，本次不挂载 socket；Docker / Docker Compose 部署方式将不可用（其余部署方式不受影响）"

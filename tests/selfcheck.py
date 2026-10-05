@@ -2207,6 +2207,43 @@ def run() -> int:
                       no_sock.state().get('stage') in ('idle', 'failed', 'unverified', 'done', 'restarting')
                       and '2.0.0' not in (docker_install / '.env').read_text())
 
+            # 面板升级依赖「安装目录在容器内可见」：真实容器里宿主机路径不一定
+            # 挂载进来（0.3.2 及更早的一键脚本就没有挂载），前置检查必须区分
+            # 「目录不可见」与「.env 缺失」并给出可操作的指引，而不是笼统报错。
+            # 两个分支都必须在动镜像/改 .env 之前拦下（不发任何 docker 命令）。
+            phantom_dir = tmp_root / 'host-dir-not-mounted'   # 刻意不创建，模拟未挂载
+            missing_env_dir = tmp_root / 'host-dir-without-env'
+            missing_env_dir.mkdir()
+            phantom_info = {'image': 'ghcr.io/j9kkk/auto-deploy:2.0.0',
+                            'working_dir': str(phantom_dir), 'project_working_dir': str(phantom_dir),
+                            'project': 'auto-deploy'}
+            missing_info = {**phantom_info, 'working_dir': str(missing_env_dir),
+                            'project_working_dir': str(missing_env_dir)}
+            docker_calls_before = len(docker_calls)
+            with patch.object(dmgr, '_docker_self_info', return_value=phantom_info):
+                expect_raises('安装目录不可见时中止升级',
+                              lambda: dmgr._docker_preflight(lambda message: None), RuntimeError)
+                try:
+                    dmgr._docker_preflight(lambda message: None)
+                except RuntimeError as exc:
+                    check('安装目录不可见时指引重跑一键脚本',
+                          '在容器内不可见' in str(exc) and '一键脚本' in str(exc))
+            with patch.object(dmgr, '_docker_self_info', return_value=missing_info):
+                try:
+                    dmgr._docker_preflight(lambda message: None)
+                except RuntimeError as exc:
+                    check('.env 缺失时给出创建或手动升级指引',
+                          '没有 .env' in str(exc) and 'docker compose pull' in str(exc))
+            check('安装目录不可用时不产生任何 docker 命令',
+                  len(docker_calls) == docker_calls_before)
+
+            # 一键脚本生成的 override 必须把安装目录同路径挂载进容器：
+            # 面板升级要改写宿主机 .env 并以该目录为 compose 工作目录，
+            # 路径不一致时容器内永远找不到 .env（0.3.2 的真实事故）。
+            bootstrap_text = (ROOT / 'scripts/bootstrap.sh').read_text(encoding='utf-8')
+            check('一键脚本 override 同路径挂载安装目录',
+                  '${INSTALL_DIR}:${INSTALL_DIR}' in bootstrap_text)
+
         section('旧版更新状态与备份兼容')
         with patch.object(config, 'DATA_DIR', tmp_root / 'legacy-update-data'):
             legacy_mgr = su.SelfUpdateManager(fake_store)

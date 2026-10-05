@@ -818,19 +818,38 @@ class SelfUpdateManager:
         info["project"] = info.get("project") or (parts[3].strip() if len(parts) > 3 else "")
         return info
 
-    def _compose_env_file(self, info: dict[str, str]) -> Path | None:
-        """安装目录的 .env（compose 启动目录下的 AUTODEPLOY_IMAGE_TAG 所在文件）。"""
+    def _compose_env_paths(self, info: dict[str, str]) -> tuple[Path | None, str]:
+        """定位安装目录 .env，返回 (路径, 不可用原因)；路径可用时原因为空串。
+
+        路径来自容器的 compose 标签，是宿主机路径：只有在容器内同样可见
+        （一键脚本把它挂载进来）时才能读写。0.3.2 及更早的安装没有这个
+        挂载，必须在这里拦下并指引重跑一键脚本，而不是半路失败。
+        """
         workdir = info.get("working_dir") or info.get("project_working_dir") or ""
         if not workdir:
-            return None
+            return None, "无法从容器 compose 标签确定宿主机安装目录"
         path = Path(workdir) / ".env"
         try:
             resolved = path.resolve()
             # 越界防护：工作目录标签理论上可被伪造，确认其父目录真实存在。
             if not resolved.parent.is_dir():
-                return None
+                return None, (
+                    f"宿主机安装目录 {workdir} 在容器内不可见（0.3.2 及更早的一键脚本"
+                    f"没有把它挂载进容器），面板无法改写其中的 .env。请在服务器重新执行"
+                    "一键脚本完成本次升级，之后面板内升级即可正常使用"
+                )
         except OSError:
-            return None
+            return None, f"宿主机安装目录 {workdir} 无法访问"
+        if not path.exists():
+            return None, (
+                f"安装目录 {workdir} 下没有 .env，无法切换镜像版本。"
+                "请重新执行一键脚本，或手动执行：docker compose pull && docker compose up -d"
+            )
+        return path, ""
+
+    def _compose_env_file(self, info: dict[str, str]) -> Path | None:
+        """安装目录的 .env（compose 启动目录下的 AUTODEPLOY_IMAGE_TAG 所在文件）。"""
+        path, _ = self._compose_env_paths(info)
         return path
 
     def _current_image_ref(self, info: dict[str, str]) -> str:
@@ -884,12 +903,9 @@ class SelfUpdateManager:
                 "无法确定当前容器信息（缺少 docker inspect 或 compose 标签），已中止升级；"
                 "请使用一键脚本或手动 docker compose pull && docker compose up -d"
             )
-        env_file = self._compose_env_file(info)
+        env_file, env_problem = self._compose_env_paths(info)
         if env_file is None:
-            raise RuntimeError(
-                "未找到 compose 启动目录中的 .env（宿主机安装目录），无法切换镜像版本；"
-                "已中止升级，请使用一键脚本升级"
-            )
+            raise RuntimeError(f"{env_problem}；已中止升级，未做任何更改")
         log(f"已定位安装目录：{env_file.parent}")
         return info
 

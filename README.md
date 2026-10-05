@@ -96,6 +96,9 @@ docker compose up --build -d
     autodeploy:
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
+        # 面板内一键升级必需：安装目录必须同路径挂载进容器，
+        # 否则面板无法改写宿主机 .env 中的镜像版本
+        - /opt/auto-deploy:/opt/auto-deploy
       group_add:
         - "999"   # 宿主机 docker 组 GID：stat -c %g /var/run/docker.sock
   ```
@@ -110,6 +113,11 @@ docker compose up --build -d
 或手动：`cd /opt/auto-deploy && docker compose pull && docker compose up -d`。
 回滚：`AUTODEPLOY_VERSION=v旧版本号` 重跑脚本，或改 `.env` 中的
 `AUTODEPLOY_IMAGE_TAG` 后 `docker compose up -d`。
+
+> 面板内的一键升级要求安装目录已同路径挂载进容器（0.3.3 起由一键脚本
+> 自动写入 override）。0.3.2 及更早安装的实例请先重跑一次一键脚本完成
+> 本次升级，之后即可在面板内直接升级；否则面板会提示“安装目录在容器内
+> 不可见”并中止升级。
 
 任务数据（数据库、工作副本、发布产物、日志）保存在 Docker 数据卷
 `auto-deploy_autodeploy-data` 中，备份示例：
