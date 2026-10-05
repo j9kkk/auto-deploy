@@ -213,6 +213,37 @@ def iso(moment: datetime | None) -> str | None:
     return moment.replace(microsecond=0).isoformat() + "Z"
 
 
+def local_tz() -> timezone:
+    """The host system timezone as a fixed-offset tzinfo."""
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def to_local(moment: datetime | None) -> datetime | None:
+    """Convert a (naive UTC) moment into the host system timezone."""
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(local_tz()).replace(tzinfo=None)
+
+
+def format_local(moment: datetime | None, *, with_seconds: bool = True) -> str:
+    """Render a (naive UTC) moment in the host system timezone, for logs."""
+    local = to_local(moment or utcnow())
+    if local is None:
+        return ""
+    text = local.strftime("%Y-%m-%d %H:%M:%S")
+    if not with_seconds:
+        text = text[:16]
+    return text
+
+
+def local_date(moment: datetime | None = None) -> str:
+    """The system-timezone calendar date (YYYY-MM-DD) of a naive-UTC moment."""
+    local = to_local(moment or utcnow())
+    return local.date().isoformat() if local else ""
+
+
 def from_iso(text: str | None) -> datetime | None:
     if not text:
         return None

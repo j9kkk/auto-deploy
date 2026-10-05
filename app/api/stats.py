@@ -6,6 +6,7 @@ import os
 import platform
 import shutil
 import sys
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -16,7 +17,7 @@ from .. import selfupdate
 from ..selfupdate import ACTIVE_STAGES
 from ..deployer import METHOD_LABELS, cleanup_path
 from ..runner import STATUS_LABELS
-from ..schedule import iso, utcnow
+from ..schedule import iso, local_tz, utcnow
 from ..service import Service
 from .deps import audit, client_ip, current_user, get_service, require_admin
 
@@ -31,6 +32,7 @@ def health(service: Service = Depends(get_service)) -> dict[str, Any]:
         "service": "autodeploy",
         "version": VERSION,
         "time": iso(utcnow()),
+        "timezone_offset_minutes": int(local_tz().utcoffset(datetime.now()).total_seconds() // 60),
         "scheduler_running": service.scheduler.running,
     }
 
@@ -76,6 +78,7 @@ def dashboard(
     return {
         "version": VERSION,
         "now": iso(now),
+        "timezone_offset_minutes": int(local_tz().utcoffset(datetime.now()).total_seconds() // 60),
         "overview": overview,
         "tasks": {
             "total": len(tasks),

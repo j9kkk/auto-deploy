@@ -37,7 +37,7 @@ from .deployer import (
     rollback_task,
 )
 from .executor import ProcessHandle, redact
-from .schedule import iso, utcnow
+from .schedule import format_local, iso, utcnow
 from .store import Store
 
 # Cap on how much of a log is kept in memory for the live tail view. This must
@@ -209,7 +209,7 @@ class DeployRunner:
         try:
             log("=" * 72)
             log(f"任务: {task_row.get('name', '')} (id={task_row['id']})  运行: #{run_id}")
-            log(f"触发方式: {run.get('trigger', 'manual')}   开始时间: {iso(utcnow())}")
+            log(f"触发方式: {run.get('trigger', 'manual')}   开始时间: {format_local(utcnow())}")
             log("=" * 72)
             result = self._pipeline(
                 task_row, run_id, active, log, trigger=str(run.get("trigger") or "manual")
@@ -486,7 +486,7 @@ class DeployRunner:
         try:
             log("=" * 72)
             log(f"任务: {task_row.get('name', '')} (id={task_row['id']})  运行: #{run_id}")
-            log("触发方式: rollback   开始时间: " + iso(utcnow()))
+            log("触发方式: rollback   开始时间: " + format_local(utcnow()))
             log("=" * 72)
             ok, message = rollback_task(
                 task_row,
