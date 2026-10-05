@@ -182,7 +182,7 @@ async function scenario(runs = [run(30), run(20)], taskExtra = {}, options = {})
       (url, body) => request(method === 'del' ? 'DELETE' : method.toUpperCase(), url, body)])),
     Modal: { open: options_ => { modalRoot.innerHTML = ''; modal = new Element(); modalRoot.append(modal);
       modal.innerHTML = options_.body + (options_.footerLeft || '') + options_.footer; return modal;
-    }, close: () => { modalRoot.innerHTML = ''; modal = null; } } };
+    }, close: () => { modalRoot.innerHTML = ''; modal = null; }, top: () => modal } };
   for (const key of ['statusLabel', 'formatTime', 'formatRelative', 'formatDuration', 'triggerLabel', 'shortCommit']) AD[key] = v => String(v ?? '');
   // 运行详情弹窗使用 setInterval 轮询与 MutationObserver 感知关闭；这里提供
   // 同契约的有限实现，让测试能驱动真实轮询与关闭清理逻辑。
@@ -626,6 +626,100 @@ async function formChecks() {
   }
 }
 
+async function taskFormUxChecks() {
+  // 切换部署方式保留输入：来回切换不清空已填内容（清空只发生在提交时，
+  // 且只清空与当前方式无关的字段）。
+  const switched = await scenario();
+  await switched.AD.openTaskForm(null); await flush();
+  switched.q('#f-deploy_script').value = 'echo keep';
+  switched.q('#f-deploy_method').value = 'docker_compose';
+  await switched.q('#f-deploy_method').fire('change');
+  assert.equal(switched.q('#f-deploy_script').closest('[data-method-field]').classList.contains('hidden'), true,
+    '非当前方式的字段应隐藏');
+  assert.equal(switched.q('#f-deploy_script').value, 'echo keep', '切换方式不得清空输入');
+  switched.q('#f-deploy_method').value = 'script';
+  await switched.q('#f-deploy_method').fire('change');
+  assert.equal(switched.q('#f-deploy_script').closest('[data-method-field]').classList.contains('hidden'), false);
+  assert.equal(switched.q('#f-deploy_script').value, 'echo keep', '切回后输入应恢复');
+  switched.finish();
+
+  // 存量互斥字段不再阻止普通编辑：与当前方式无关的值提交时就地清空，
+  // 不会触发后端互斥校验，也不会作为脏配置继续保存。
+  const legacy = await scenario([run(30)], { deploy_method: 'release', service_name: 'old.service', docker_image: 'legacy:1' });
+  await legacy.AD.openTaskForm(1); await flush();
+  legacy.enqueue('PUT', '/api/tasks/1', {});
+  await legacy.click('#form-save');
+  const legacyBody = legacy.requests.at(-1).body;
+  assert.equal(legacyBody.service_name, '', 'release 任务不得携带 systemd 字段');
+  assert.equal(legacyBody.docker_image, '', 'release 任务不得携带 docker 字段');
+  assert.equal(legacyBody.credential_id, null, '未选择凭据时显式提交空绑定');
+  legacy.finish();
+
+  // 勾选「清除已保存的令牌」只提交 clear_token 标志：后端已支持无
+  // git_token 键的清除，协议不能再依赖“同时提交新令牌”。
+  const tokened = await scenario([run(30)], { has_token: true });
+  await tokened.AD.openTaskForm(1); await flush();
+  assert.ok(tokened.q('#f-clear_token'), '已配置令牌时应显示清除选项');
+  assert.equal(tokened.q('#f-clear_token').closest('#auth-token-wrap').classList.contains('hidden'), false,
+    '有任务内令牌时认证方式应为「任务内令牌」');
+  tokened.q('#f-clear_token').checked = true;
+  tokened.enqueue('PUT', '/api/tasks/1', {});
+  await tokened.click('#form-save');
+  const tokenBody = tokened.requests.at(-1).body;
+  assert.equal(tokenBody.clear_token, true);
+  assert.equal('git_token' in tokenBody, false, '空令牌不得提交');
+  tokened.finish();
+
+  // 凭据列表加载失败时保留绑定：注入占位选项，而不是静默解除。
+  const bound = await scenario([run(30)], { credential_id: 7 });
+  bound.enqueue('GET', '/api/credentials', new Error('数据库不可用'));
+  await bound.AD.openTaskForm(1); await flush();
+  assert.equal(bound.q('#f-credential_id').value, '7', '绑定的凭据应通过占位选项保留');
+  bound.enqueue('PUT', '/api/tasks/1', {});
+  await bound.click('#form-save');
+  assert.equal(bound.requests.at(-1).body.credential_id, 7, '列表失败不得静默解绑');
+  bound.finish();
+
+  // 仅打包方式：打包路径始终可见（它是该方式的核心字段），发布位置隐藏。
+  const artifact = await scenario([run(30)], { deploy_method: 'artifact' });
+  await artifact.AD.openTaskForm(1); await flush();
+  assert.equal(artifact.q('#f-artifact_paths').closest('.field').classList.contains('hidden'), false,
+    '打包路径对仅打包方式必须可见');
+  for (const field of artifact.document.querySelectorAll('[data-release-field]')) {
+    assert.equal(field.classList.contains('hidden'), true, '仅打包不应显示发布位置字段');
+  }
+  artifact.finish();
+
+  // 默认配置拉取失败：兜底值与真实返回同构，新建表单不再抛错。
+  const fallback = await scenario();
+  fallback.AD.state.defaults = null;
+  fallback.enqueue('GET', '/api/settings/defaults', new Error('服务不可用'));
+  await fallback.AD.openTaskForm(null); await flush();
+  assert.equal(fallback.q('#f-schedule_expression').value, '1h');
+  assert.equal(fallback.q('#f-git_depth').value, '1');
+  fallback.finish();
+
+  // 配置摘要：以自然语言概括当前配置，帮助保存前确认。
+  const summarised = await scenario();
+  await summarised.AD.openTaskForm(null); await flush();
+  const summaryText = summarised.q('#config-summary').textContent;
+  assert.match(summaryText, /认证：无需认证/);
+  assert.match(summaryText, /部署：自定义脚本/);
+  assert.match(summaryText, /触发：固定间隔 1h/);
+  summarised.finish();
+
+  // 「创建后立即运行」派发失败时后端返回 warning，必须提示而不是只报成功。
+  const warned = await scenario();
+  await warned.AD.openTaskForm(null); await flush();
+  warned.q('#f-name').value = 'New_task';
+  warned.q('#f-repo_url').value = 'https://example.test/repo.git';
+  warned.q('#f-deploy_script').value = 'echo hi';
+  warned.enqueue('POST', '/api/tasks', { warning: '任务已创建，但未开始部署：调度器已暂停' });
+  await warned.click('#form-save');
+  assert.ok(warned.errors.some(m => /未开始部署/.test(m)), '创建警告必须提示');
+  warned.finish();
+}
+
 function styleChecks() {
   const rule = selector => {
     const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -649,6 +743,6 @@ function styleChecks() {
 (async () => {
   await selectionChecks(); await raceChecks(); await pollingChecks(); await runFinishChecks();
   await runDetailIsolationChecks(); await rollbackChecks(); await deleteChecks();
-  await formChecks(); styleChecks();
-  console.log('任务页 Node 回归通过：真实详情/表单 handler、日志选择与下载、异步会话隔离、增量轮询及清理、运行结束就地收敛（取消按钮消失且不重绘）、查看日志不触发整体刷新、回滚确认与错误、名称原样校验、删除两步确认与后果说明及 CSS 契约（有限 DOM 模拟，未进行真实浏览器验收）');
+  await formChecks(); await taskFormUxChecks(); styleChecks();
+  console.log('任务页 Node 回归通过：真实详情/表单 handler、日志选择与下载、异步会话隔离、增量轮询及清理、运行结束就地收敛（取消按钮消失且不重绘）、查看日志不触发整体刷新、回滚确认与错误、名称原样校验、删除两步确认与后果说明、表单 UX（方式切换保留输入、无关字段提交清空、clear_token 协议、凭据绑定保留、仅打包显隐、默认值兜底、配置摘要、创建警告）及 CSS 契约（有限 DOM 模拟，未进行真实浏览器验收）');
 })().catch(error => { console.error(error); process.exitCode = 1; });

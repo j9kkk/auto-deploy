@@ -126,6 +126,10 @@
     const badge = document.getElementById('scheduler-status');
     try {
       const health = await AD.api.get('/api/health');
+      // 服务器系统时区偏移随心跳送达，所有时间展示都按服务器时区渲染。
+      if (typeof health.timezone_offset_minutes === 'number') {
+        AD.tzOffsetMinutes = health.timezone_offset_minutes;
+      }
       if (badge) {
         badge.className = 'badge ' + (health.scheduler_running ? 'success' : 'failed');
         badge.textContent = health.scheduler_running ? '调度运行中' : '调度已停止';
@@ -201,9 +205,10 @@
       AD.setBusy(button, false);
     });
 
-    // Escape closes any open modal.
+    // Escape 关闭最上层的弹窗：叠着确认框时先关确认框；
+    // 表单弹窗带未保存修改时会先经过“放弃修改？”确认。
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') AD.Modal.close();
+      if (event.key === 'Escape') AD.Modal.requestClose();
     });
   }
 

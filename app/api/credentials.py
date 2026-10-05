@@ -266,8 +266,9 @@ def update_credential(
         )
 
     service.store.credentials.update(credential_id, body)
-    # 凭据变更后旧的测试结论不再可信，清掉让用户重新测试。
-    if "secret" in body or "kind" in body:
+    # 凭据变更后旧的测试结论不再可信，清掉让用户重新测试。口令参与私钥
+    # 解锁，同样会使结论失效；仅改名/改备注不影响连接行为，不算变更。
+    if "secret" in body or "kind" in body or "passphrase" in body:
         service.store.credentials.record_test(credential_id, ok=False, error="凭据已修改，请重新测试")
     audit(
         service, "credential_updated", actor=user["username"],

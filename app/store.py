@@ -197,6 +197,9 @@ def decode_credential(row: dict[str, Any] | None) -> dict[str, Any] | None:
     secret = item.pop("secret", "") or ""
     item["has_secret"] = bool(secret)
     item["secret_length"] = len(secret)
+    # 私钥口令同样是机密：只暴露“是否设置”，绝不回传明文。
+    passphrase = item.pop("passphrase", "") or ""
+    item["has_passphrase"] = bool(passphrase)
     # SSH 私钥的公开信息：指纹用于辨认是哪把钥匙，公钥供用户重新配置
     # GitHub Deploy Key 时复制。两者都不属于机密，可以安全返回前端。
     if item.get("kind") == "ssh_key" and secret:
@@ -750,25 +753,36 @@ class RunRepository:
         }
 
     def stats_daily(self, days: int = 14) -> list[dict[str, Any]]:
+        from datetime import datetime, timedelta
+
+        from .schedule import from_iso, local_date
+
+        # 按系统时区的日历日分桶（用户看到的日期），而非存储用的 UTC 日期。
+        today = datetime.fromisoformat(local_date(utcnow()))
+        buckets = {
+            (today - timedelta(days=offset)).date().isoformat()
+            for offset in range(days)
+        }
+        cutoff = iso((utcnow() - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0))
         rows = self.db.query(
-            """
-            SELECT substr(queued_at, 1, 10)              AS day,
-                   COUNT(*)                              AS total,
-                   COALESCE(SUM(status = 'success'), 0)  AS success,
-                   COALESCE(SUM(status = 'failed'), 0)   AS failed,
-                   COALESCE(SUM(status = 'skipped'), 0)  AS skipped
-            FROM runs
-            WHERE queued_at >= ?
-            GROUP BY day
-            ORDER BY day ASC
-            """,
-            # queued_at is an ISO string, so a date prefix compares correctly
-            # in lexicographic order.
-            (_days_ago_iso(days)[:10],)
+            "SELECT queued_at, status FROM runs WHERE queued_at >= ?",
+            (cutoff,),
         )
-        by_day = {row["day"]: row for row in rows}
-        return [by_day.get(day, {"day": day, "total": 0, "success": 0, "failed": 0, "skipped": 0})
-                for day in _recent_days(days)]
+        empty = {"total": 0, "success": 0, "failed": 0, "skipped": 0}
+        by_day: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            day = local_date(from_iso(row["queued_at"]))
+            if day not in buckets:
+                continue
+            stat = by_day.setdefault(day, {"day": day, **empty})
+            stat["total"] += 1
+            status = row["status"]
+            if status in ("success", "failed", "skipped"):
+                stat[status] += 1
+        return [
+            by_day.get(day, {"day": day, **empty})
+            for day in sorted(buckets)
+        ]
 
     def stats_by_task(self, limit: int = 20) -> list[dict[str, Any]]:
         return self.db.query(
@@ -870,23 +884,6 @@ class AuditRepository:
 # ---------------------------------------------------------------------------
 # Date helpers for the charts
 # ---------------------------------------------------------------------------
-
-def _days_ago_iso(days: int) -> str:
-    from datetime import timedelta
-
-    from .schedule import utcnow as _utcnow
-
-    moment = _utcnow() - timedelta(days=max(1, days))
-    return moment.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-
-
-def _recent_days(days: int) -> list[str]:
-    from datetime import timedelta
-
-    from .schedule import utcnow as _utcnow
-
-    today = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    return [(today - timedelta(days=offset)).date().isoformat() for offset in range(days - 1, -1, -1)]
 
 
 class Store:

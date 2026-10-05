@@ -120,6 +120,17 @@ def list_tasks(
     return {"tasks": tasks, "total": len(tasks)}
 
 
+def _ensure_credential_exists(service: Service, body: dict[str, Any]) -> None:
+    """所选集中凭据必须真实存在：外键错误落到通用 handler 会变成 500。"""
+    credential_id = body.get("credential_id")
+    if credential_id is not None and service.store.credentials.get(int(credential_id)) is None:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "参数校验失败",
+                    "errors": {"credential_id": "所选凭据不存在，可能已被删除"}},
+        )
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_task(
     payload: dict[str, Any],
@@ -131,6 +142,7 @@ def create_task(
         body = validate_task_payload(payload)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
+    _ensure_credential_exists(service, body)
 
     try:
         task_id = service.store.tasks.create(body)
@@ -206,6 +218,7 @@ def update_task(
             body = validate_task_payload(payload, partial=True, existing=existing)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
+        _ensure_credential_exists(service, body)
 
         if "name" in body and body["name"] != existing["name"]:
             if service.store.runs.has_active_for_task(task_id):

@@ -25,6 +25,38 @@ AD.views = {};
   }
   AD.methodLabel = methodLabel;
 
+  // 各部署方式用到的方式专属字段：collectForm 提交时就地清空与当前方式
+  // 无关的值——界面上来回切换保留输入，但不会把旧方式的值存成脏配置，
+  // 也不会触发后端的方式互斥校验。
+  const METHOD_FIELD_IDS = {
+    artifact: [],
+    script: ['deploy_script'],
+    release: ['deploy_script'],
+    systemd: ['service_name', 'deploy_script'],
+    docker: ['docker_image', 'docker_command'],
+    docker_compose: ['docker_compose_file'],
+    rsync: ['rsync_target', 'rsync_options'],
+  };
+  const METHOD_FIELD_ALL = ['deploy_script', 'service_name', 'docker_image',
+    'docker_compose_file', 'docker_command', 'rsync_target', 'rsync_options'];
+  // 方式专属必填项：与后端 _check_method_requirements 对应。
+  const METHOD_REQUIRED = {
+    script: ['deploy_script'],
+    systemd: ['service_name'],
+    docker: ['docker_image'],
+    rsync: ['rsync_target'],
+  };
+  // 方式说明：把“选了它到底会发生什么”写在选择框下面，而不是让用户猜。
+  const METHOD_DESCRIPTIONS = {
+    artifact: '拉取代码并按打包路径生成 .tar.gz 产物，不发布、不切换软链。',
+    script: '在源码目录执行你提供的部署脚本，发布过程完全由脚本控制。',
+    release: '打包到 releases/N 并把 current 软链切换到新版本，可在发布后执行脚本。',
+    systemd: '切换软链后重启指定的 systemd 服务并校验状态（在本机执行，不是远程服务器）。',
+    docker: '在发布目录构建镜像；只有填写启动命令才会创建或更新容器。',
+    docker_compose: '在发布目录执行 docker compose up -d --build 更新服务。',
+    rsync: '把发布目录同步到目标路径；只有配置了目标目录才会更新本地软链。',
+  };
+
   // ---------------------------------------------------------------- icons
   // 全部为内联 SVG（stroke 继承 currentColor），无外部资源依赖。
   const ICONS = {
@@ -204,6 +236,7 @@ AD.views = {};
       + '<th>任务</th><th>调度</th><th>下次执行</th></tr></thead><tbody>'
       + items.map((item) => {
         const when = new Date(String(item.next_run_at).endsWith('Z') ? item.next_run_at : item.next_run_at + 'Z');
+        // 倒计时基于真实时刻，不受展示时区影响。
         const seconds = Math.max(0, Math.round((when.getTime() - Date.now()) / 1000));
         return `<tr>
           <td class="truncate" style="max-width:200px">${e(item.name)}</td>
@@ -968,20 +1001,55 @@ AD.views = {};
     }
     if (!AD.state.defaults) {
       try { AD.state.defaults = await AD.api.get('/api/settings/defaults'); }
-      catch (err) { AD.state.defaults = { repo_branch: 'main', timeout_seconds: 1800, keep_releases: 5 }; }
+      catch (err) {
+        // 兜底必须与真实返回同构：此前缺 schedule_defaults，读取默认表达式
+        // 时会让新建表单直接抛错。
+        AD.state.defaults = {
+          repo_branch: 'main', timeout_seconds: 1800, keep_releases: 5,
+          schedule_defaults: { interval: '1h', cron: '0 * * * *' },
+        };
+      }
     }
-    // 凭据下拉需要最新列表：在别处刚创建/删除后应立刻反映出来。
-    try { AD.state.credentials = (await AD.api.get('/api/credentials')).credentials || []; }
-    catch (err) { AD.state.credentials = AD.state.credentials || []; }
+    // 凭据下拉需要最新列表：在别处刚创建/删除后应立刻反映出来。拉取失败
+    // 不能伪装成“没有凭据”：保留旧缓存并提示，否则保存会把已有绑定静默解除。
+    try {
+      AD.state.credentials = (await AD.api.get('/api/credentials')).credentials || [];
+      AD.state.credentialsError = false;
+    } catch (err) {
+      AD.state.credentials = AD.state.credentials || [];
+      AD.state.credentialsError = true;
+    }
     const defaults = AD.state.defaults;
     const t = task || {};
     const isEdit = Boolean(taskId);
+    const scheduleDefaults = defaults.schedule_defaults || {};
+    const boundCredentialId = t.credential_id != null ? String(t.credential_id) : '';
+    const boundInList = (AD.state.credentials || []).some((c) => String(c.id) === boundCredentialId);
+    // 认证方式初始值：绑定了集中凭据→凭据；有任务内令牌→令牌；否则无需认证。
+    const initialAuth = boundCredentialId ? 'credential' : (t.has_token ? 'token' : 'none');
+    const initialMethod = t.deploy_method || 'script';
+    // 高级参数默认展开的条件：已有任务且任一高级项偏离默认值。
+    const hasAdvanced = isEdit && (
+      (t.git_depth !== undefined && t.git_depth !== 1)
+      || (t.timeout_seconds !== undefined && t.timeout_seconds !== (defaults.timeout_seconds || 1800))
+      || Boolean(t.env_vars && Object.keys(t.env_vars).length)
+    );
+
+    const credentialOptions = (AD.state.credentials || []).map((c) =>
+      `<option value="${c.id}"${boundCredentialId === String(c.id) ? ' selected' : ''}>${e(c.name)}（${e(c.kind_label || c.kind)}）</option>`).join('');
+    // 已绑定的凭据不在列表里（被删除或列表加载失败）时注入占位选项保留
+    // 绑定值：让用户看到并主动处理，而不是保存时静默解除。
+    const boundPlaceholder = boundCredentialId && !boundInList
+      ? `<option value="${a(boundCredentialId)}" selected>（ID ${a(boundCredentialId)}）当前绑定的凭据</option>` : '';
+    const credHint = AD.state.credentialsError
+      ? '凭据列表加载失败：已保留当前绑定，可稍后重试或直接新建。'
+      : (credentialOptions ? '凭据集中保存、可跨任务复用；可在此新建或测试仓库访问。' : '还没有凭据，点击「新建凭据」即可在此创建。');
 
     const body = `
       <div id="form-error" class="alert error hidden"></div>
 
       <div class="section-title">基础信息</div>
-      <div class="form-grid">
+      <div class="form-grid cols-2">
         <div class="field">
           <label for="f-name">任务名（唯一标识）<span class="req">*</span></label>
           <input type="text" id="f-name" value="${a(t.name || '')}" placeholder="例如：blog_frontend" aria-describedby="task-name-hint" spellcheck="false">
@@ -993,13 +1061,24 @@ AD.views = {};
         </div>
       </div>
 
-      <div class="section-title">代码仓库</div>
-      <div class="form-grid">
+      <div class="section-title">部署方式</div>
+      <div class="form-grid cols-2">
+        <div class="field span-2">
+          <select id="f-deploy_method">
+            ${STAGE_LABELS.map(([value, label, hint]) =>
+              `<option value="${a(value)}"${initialMethod === value ? ' selected' : ''}>${e(label)} — ${e(hint)}</option>`).join('')}
+          </select>
+          <div class="hint" id="method-desc"></div>
+        </div>
+      </div>
+
+      <div class="section-title">代码与认证</div>
+      <div class="form-grid cols-2">
         <div class="field span-2">
           <label>仓库地址<span class="req">*</span></label>
           <input type="text" id="f-repo_url" value="${a(t.repo_url || '')}"
                  placeholder="https://github.com/owner/repo.git">
-          <div class="hint">支持 https / ssh / git 协议；公开仓库无需凭证</div>
+          <div class="hint">支持 https / ssh / git 协议；公开仓库选择「无需认证」即可</div>
         </div>
         <div class="field">
           <label>分支<span class="req">*</span></label>
@@ -1010,101 +1089,55 @@ AD.views = {};
           <input type="text" id="f-repo_subdir" value="${a(t.repo_subdir || '')}" placeholder="例如 frontend/">
           <div class="hint">留空表示仓库根目录</div>
         </div>
-        <div class="field">
-          <label>拉取深度</label>
-          <input type="number" id="f-git_depth" min="0" max="10000" value="${a(t.git_depth !== undefined ? t.git_depth : 1)}">
-          <div class="hint">1 = 浅克隆（最快）；0 = 完整历史</div>
-        </div>
         <div class="field span-2">
-          <label>凭据</label>
-          <select id="f-credential_id">
-            <option value="">不使用（公开仓库或任务内令牌）</option>
-            ${(AD.state.credentials || []).map((c) =>
-              `<option value="${c.id}"${String(t.credential_id) === String(c.id) ? ' selected' : ''}>${e(c.name)}（${e(c.kind_label || c.kind)}）</option>`).join('')}
-          </select>
-          <div class="hint">
-            在「凭据」页面集中管理；选择后优先于下方任务内令牌
-            ${(AD.state.credentials || []).length ? '' : '（当前还没有凭据，可先到「凭据」页面创建）'}
+          <label>仓库认证</label>
+          <div class="auth-options">
+            <label><input type="radio" name="f-auth_mode" value="none"${initialAuth === 'none' ? ' checked' : ''}>无需认证（公开仓库）</label>
+            <label><input type="radio" name="f-auth_mode" value="credential"${initialAuth === 'credential' ? ' checked' : ''}>使用集中凭据</label>
+            <label><input type="radio" name="f-auth_mode" value="token"${initialAuth === 'token' ? ' checked' : ''}>任务内令牌</label>
           </div>
         </div>
-        <div class="field">
+        <div class="field span-2${initialAuth === 'credential' ? '' : ' hidden'}" id="auth-credential-wrap">
+          <label>凭据</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <select id="f-credential_id" style="flex:1">
+              <option value="">不使用（公开仓库）</option>
+              ${boundPlaceholder}
+              ${credentialOptions}
+            </select>
+            <button type="button" class="sm" id="cred-create">新建凭据</button>
+            <button type="button" class="sm" id="cred-test">测试仓库访问</button>
+          </div>
+          <div class="hint">${credHint}</div>
+        </div>
+        <div class="field span-2${initialAuth === 'token' ? '' : ' hidden'}" id="auth-token-wrap">
           <label>任务内访问令牌（可选）</label>
           <input type="password" id="f-git_token" autocomplete="new-password"
                  placeholder="${isEdit ? (t.has_token ? '已配置，留空表示不修改' : '未配置') : '私有仓库才需要'}">
           <div class="hint">仅该任务使用；以 GIT_ASKPASS 传递，不会写入命令行或日志</div>
-          <div class="hint hidden" id="token-override-hint" style="color:var(--warning, #b58900)">已选择集中凭据：拉取仓库时将使用该凭据，此处令牌不会生效</div>
+          <div class="hint">GitHub 令牌在 Settings → Developer settings → Personal access tokens 生成，
+            勾选目标仓库并把 Contents 设为 Read-only 即可</div>
           ${isEdit && t.has_token ? '<div class="checkbox-row" style="margin-top:6px"><input type="checkbox" id="f-clear_token"><label for="f-clear_token">清除已保存的令牌</label></div>' : ''}
         </div>
       </div>
 
-      <div class="section-title">调度</div>
-      <div class="form-grid">
-        <div class="field">
-          <label>调度类型</label>
-          <select id="f-schedule_type">
-            <option value="interval"${(t.schedule_type || 'interval') === 'interval' ? ' selected' : ''}>固定间隔</option>
-            <option value="cron"${t.schedule_type === 'cron' ? ' selected' : ''}>Cron 表达式</option>
-            <option value="manual"${t.schedule_type === 'manual' ? ' selected' : ''}>仅手动触发</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>表达式</label>
-          <input type="text" id="f-schedule_expression"
-                 value="${a(t.schedule_expression || defaults.schedule_defaults.interval)}"
-                 placeholder="1h 或 0 */6 * * *">
-          <div class="hint" id="schedule-hint">间隔格式：30s / 15m / 6h / 2d</div>
-        </div>
-        <div class="field span-2">
-          <div id="schedule-preview" class="faint" style="min-height:20px"></div>
-        </div>
-      </div>
-      <div class="checkbox-row">
-        <input type="checkbox" id="f-enabled"${(t.enabled === undefined ? true : t.enabled) ? ' checked' : ''}>
-        <label for="f-enabled">启用定时调度</label>
-      </div>
-
-      <div class="section-title">Webhook 触发</div>
-      ${isEdit && t.webhook_url ? `
-      <div class="form-grid">
-        <div class="field span-2">
-          <label>触发地址</label>
-          <div style="display:flex;gap:8px;align-items:center">
-            <input type="text" id="f-webhook_url" readonly value="${a(t.webhook_url)}" spellcheck="false" style="flex:1">
-            <button type="button" class="ghost" id="webhook-copy">复制</button>
-            <button type="button" class="ghost" id="webhook-reset">重新生成</button>
-          </div>
-          <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。</div>
-        </div>
-      </div>` : `
-      <div class="hint" style="margin:-6px 0 12px">任务创建后自动生成 Webhook 触发地址，可在编辑页复制使用。</div>`}
-
-      <div class="section-title">部署方式</div>
-      <div class="field">
-        <select id="f-deploy_method">
-          ${STAGE_LABELS.map(([value, label, hint]) =>
-            `<option value="${a(value)}"${(t.deploy_method || 'script') === value ? ' selected' : ''}>${e(label)} — ${e(hint)}</option>`).join('')}
-        </select>
-      </div>
-
-      <div class="form-grid" id="releases-fields">
+      <div class="section-title">构建与发布</div>
+      <div class="form-grid cols-2">
         <div class="field span-2">
           <label>打包路径</label>
           <textarea id="f-artifact_paths" rows="3" placeholder="dist&#10;package.json">${e(t.artifact_paths || '')}</textarea>
-          <div class="hint">每行一条，支持通配符（如 <code class="code-inline">dist/**</code>）。留空则打包整个仓库</div>
+          <div class="hint">每行一条，支持通配符（如 <code class="code-inline">dist/**</code>）。决定哪些文件进入发布包；留空则打包整个仓库</div>
         </div>
-        <div class="field" data-release-field>
+        <div class="field${initialMethod === 'artifact' ? ' hidden' : ''}" data-release-field>
           <label>目标目录</label>
           <input type="text" id="f-target_dir" value="${a(t.target_dir || '')}" placeholder="/var/www/myapp">
-          <div class="hint">发布目录与 current 软链会放在这里</div>
+          <div class="hint">发布目录与 current 软链会放在这里；留空使用数据目录</div>
         </div>
-        <div class="field" data-release-field>
+        <div class="field${initialMethod === 'artifact' ? ' hidden' : ''}" data-release-field>
           <label>保留版本数</label>
           <input type="number" id="f-keep_releases" min="0" max="1000" value="${a(t.keep_releases !== undefined ? t.keep_releases : 5)}">
           <div class="hint">超出后自动清理最旧的发布</div>
         </div>
-      </div>
-
-      <div class="form-grid">
         <div class="field span-2">
           <label>准备脚本</label>
           <textarea id="f-prepare_script" rows="4" placeholder="# 构建命令，例如&#10;npm ci&#10;npm run build">${e(t.prepare_script || '')}</textarea>
@@ -1120,9 +1153,6 @@ AD.views = {};
           <textarea id="f-rollback_script" rows="3" placeholder="# 可选，回滚时执行">${e(t.rollback_script || '')}</textarea>
           <div class="hint" id="rollback-hint">回滚时在目标发布目录执行</div>
         </div>
-      </div>
-
-      <div class="form-grid">
         <div class="field" data-method-field="systemd">
           <label>systemd 服务名<span class="req req-service_name hidden">*</span></label>
           <input type="text" id="f-service_name" value="${a(t.service_name || '')}" placeholder="myapp.service">
@@ -1149,21 +1179,50 @@ AD.views = {};
         </div>
       </div>
 
-      <div class="section-title">运行参数</div>
-      <div class="form-grid">
+      <div class="section-title">触发与通知</div>
+      <div class="form-grid cols-2">
         <div class="field">
-          <label>超时时间（秒）</label>
-          <input type="number" id="f-timeout_seconds" min="10" max="86400"
-                 value="${a(t.timeout_seconds !== undefined ? t.timeout_seconds : (defaults.timeout_seconds || 1800))}">
+          <label>调度类型</label>
+          <select id="f-schedule_type">
+            <option value="interval"${(t.schedule_type || 'interval') === 'interval' ? ' selected' : ''}>固定间隔</option>
+            <option value="cron"${t.schedule_type === 'cron' ? ' selected' : ''}>Cron 表达式</option>
+            <option value="manual"${t.schedule_type === 'manual' ? ' selected' : ''}>仅手动触发</option>
+          </select>
         </div>
         <div class="field">
-          <label>通知 Webhook</label>
-          <input type="text" id="f-notify_webhook" value="${a(t.notify_webhook || '')}" placeholder="https://...">
+          <label>表达式</label>
+          <input type="text" id="f-schedule_expression"
+                 value="${a(t.schedule_expression || scheduleDefaults.interval || '1h')}"
+                 placeholder="1h 或 0 */6 * * *">
+          <div class="hint" id="schedule-hint">间隔格式：30s / 15m / 6h / 2d</div>
         </div>
         <div class="field span-2">
-          <label>环境变量</label>
-          <textarea id="f-env_vars" rows="3" placeholder="NODE_ENV=production&#10;API_BASE=https://api.example.com">${e(envToText(t.env_vars))}</textarea>
-          <div class="hint">每行一条 <code class="code-inline">KEY=value</code>，会导出到所有脚本</div>
+          <div id="schedule-preview" class="faint" style="min-height:20px"></div>
+        </div>
+      </div>
+      <div class="checkbox-row">
+        <input type="checkbox" id="f-enabled"${(t.enabled === undefined ? true : t.enabled) ? ' checked' : ''}>
+        <label for="f-enabled">启用定时调度</label>
+      </div>
+
+      ${isEdit && t.webhook_url ? `
+      <div class="form-grid cols-2">
+        <div class="field span-2">
+          <label>触发地址</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="text" id="f-webhook_url" readonly value="${a(t.webhook_url)}" spellcheck="false" style="flex:1">
+            <button type="button" class="ghost" id="webhook-copy">复制</button>
+            <button type="button" class="ghost" id="webhook-reset">重新生成</button>
+          </div>
+          <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。</div>
+        </div>
+      </div>` : `
+      <div class="hint" style="margin:-6px 0 12px">任务创建后自动生成 Webhook 触发地址（向它发请求即触发部署），可在编辑页复制使用。</div>`}
+      <div class="form-grid cols-2">
+        <div class="field span-2">
+          <label>结果通知 Webhook</label>
+          <input type="text" id="f-notify_webhook" value="${a(t.notify_webhook || '')}" placeholder="https://...">
+          <div class="hint">部署结束后把结果发送到该地址，留空使用全局设置；与上面的触发地址无关</div>
         </div>
       </div>
       <div class="checkbox-row">
@@ -1174,6 +1233,31 @@ AD.views = {};
         <input type="checkbox" id="f-run_on_create">
         <label for="f-run_on_create">创建后立即运行一次</label>
       </div>`}
+
+      <details class="adv-details"${hasAdvanced ? ' open' : ''}>
+        <summary>高级参数（拉取深度、超时、环境变量）</summary>
+        <div class="form-grid cols-2">
+          <div class="field">
+            <label>拉取深度</label>
+            <input type="number" id="f-git_depth" min="0" max="10000" value="${a(t.git_depth !== undefined ? t.git_depth : 1)}">
+            <div class="hint">1 = 浅克隆（最快）；0 = 完整历史</div>
+          </div>
+          <div class="field">
+            <label>阶段超时（秒）</label>
+            <input type="number" id="f-timeout_seconds" min="10" max="86400"
+                   value="${a(t.timeout_seconds !== undefined ? t.timeout_seconds : (defaults.timeout_seconds || 1800))}">
+            <div class="hint">单个执行命令/阶段的超时，不是整条流水线的总时限</div>
+          </div>
+          <div class="field span-2">
+            <label>环境变量</label>
+            <textarea id="f-env_vars" rows="3" placeholder="NODE_ENV=production&#10;API_BASE=https://api.example.com">${e(envToText(t.env_vars))}</textarea>
+            <div class="hint">每行一条 <code class="code-inline">KEY=value</code>，会导出到准备与部署脚本（回滚脚本不注入这些变量）</div>
+          </div>
+        </div>
+      </details>
+
+      <div class="section-title">配置摘要</div>
+      <div id="config-summary" class="config-summary"></div>
     `;
 
     const backdrop = AD.Modal.open({
@@ -1183,80 +1267,163 @@ AD.views = {};
       footerLeft: isEdit ? `<button class="danger" id="form-delete">删除任务</button>` : '<div class="left"></div>',
       footer: '<button data-close>取消</button>'
         + `<button class="primary" id="form-save">${isEdit ? '保存修改' : '创建任务'}</button>`,
+      // 关闭关卡：有未保存修改时先确认，避免误触遮罩/Escape 丢配置。
+      beforeClose: async () => {
+        if (!formDirty) return true;
+        return await AD.confirm({
+          title: '放弃未保存的修改？',
+          message: '表单中还有未保存的修改，关闭后会丢失。',
+          confirmText: '放弃修改',
+          cancelText: '继续编辑',
+          danger: true,
+        });
+      },
     });
+
+    let formDirty = false;
+    const markDirty = () => { formDirty = true; };
+    backdrop.addEventListener('input', markDirty, true);
+    backdrop.addEventListener('change', markDirty, true);
 
     const methodSelect = backdrop.querySelector('#f-deploy_method');
-    // 方式专属必填项：对应后端 _check_method_requirements。
-    const METHOD_REQUIRED = {
-      script: ['deploy_script'],
-      systemd: ['service_name'],
-      docker: ['docker_image'],
-      rsync: ['rsync_target'],
+    const summaryNode = backdrop.querySelector('#config-summary');
+    const credSelect = backdrop.querySelector('#f-credential_id');
+    const typeSelect = backdrop.querySelector('#f-schedule_type');
+    const exprInput = backdrop.querySelector('#f-schedule_expression');
+    const value = (id) => {
+      const node = backdrop.querySelector(id);
+      return node ? node.value.trim() : '';
     };
-    // 每种方式用到的方法专属字段（data-method-field 标签已声明），此处仅
-    // 用于判断"哪些字段与当前方式无关需要清空"。
-    const METHOD_FIELDS = {};
-    backdrop.querySelectorAll('[data-method-field]').forEach((field) => {
-      field.dataset.methodField.split(' ').forEach((method) => {
-        (METHOD_FIELDS[method] = METHOD_FIELDS[method] || []).push(field);
-      });
-    });
-    const FIELD_IDS = ['deploy_script', 'service_name', 'docker_image',
-      'docker_compose_file', 'docker_command', 'rsync_target', 'rsync_options'];
-    // 是否为用户主动切换（编辑已有任务首次渲染时不清空存量脏数据）。
-    let methodTouched = false;
 
-    const applyMethodVisibility = () => {
-      const method = methodSelect.value;      backdrop.querySelectorAll('[data-method-field]').forEach((field) => {
-        const applies = field.dataset.methodField.split(' ').includes(method);
-        field.classList.toggle('hidden', !applies);
-        if (methodTouched && !applies) {
-          // 换方式后隐藏字段不再属于该任务：就地清空，避免看不见的旧值
-          // 被提交保存成脏配置。
-          FIELD_IDS.forEach((id) => {
-            const input = field.querySelector('#f-' + id);
-            if (input && input.value && input.value !== input.dataset.methodDefault) {
-              input.dataset.methodDefault = '';
-              input.value = '';
-            }
-          });
-        }
+    // 认证方式读取：不用 :checked 选择器，逐个读 radio 属性。
+    const scanAuthMode = () => {
+      const radios = backdrop.querySelectorAll('input[name="f-auth_mode"]');
+      for (const radio of radios) { if (radio.checked) return radio.value; }
+      return 'none';
+    };
+
+    // 配置摘要：用自然语言实时概括“这个任务到底会做什么”。
+    const renderSummary = () => {
+      if (!summaryNode) return;
+      const lines = [];
+      const repoUrl = value('#f-repo_url');
+      const branch = value('#f-repo_branch') || 'main';
+      const subdir = value('#f-repo_subdir');
+      lines.push('代码：' + (repoUrl || '（未填写仓库地址）') + ' @ ' + branch + (subdir ? '，子目录 ' + subdir : ''));
+      const authMode = scanAuthMode();
+      if (authMode === 'credential') {
+        let credName = '';
+        (credSelect ? credSelect.querySelectorAll('option') : []).forEach((option) => {
+          if (String(option.value) === String(credSelect.value)) credName = option.textContent;
+        });
+        lines.push('认证：使用集中凭据' + (credName ? '「' + credName + '」' : ''));
+      } else if (authMode === 'token') {
+        lines.push('认证：任务内令牌' + (t.has_token ? '（已配置）' : ''));
+      } else {
+        lines.push('认证：无需认证' + (isEdit && t.has_token ? '（保存后清除已存令牌）' : ''));
+      }
+      const method = methodSelect.value;
+      const fieldLabels = { deploy_script: '部署脚本', service_name: '服务', docker_image: '镜像',
+        docker_command: '启动命令', docker_compose_file: 'Compose 文件',
+        rsync_target: '目标', rsync_options: '参数' };
+      const bits = (METHOD_FIELD_IDS[method] || []).map((id) => {
+        const current = value('#f-' + id);
+        return current ? fieldLabels[id] + ' ' + current : '';
+      }).filter(Boolean);
+      lines.push('部署：' + methodLabel(method) + (bits.length ? ' — ' + bits.join('；') : ''));
+      const scheduleType = typeSelect.value;
+      const expression = value('#f-schedule_expression');
+      const enabledNode = backdrop.querySelector('#f-enabled');
+      if (enabledNode && !enabledNode.checked) lines.push('触发：定时已停用，仅手动运行');
+      else if (scheduleType === 'manual') lines.push('触发：仅手动触发');
+      else if (scheduleType === 'interval') lines.push('触发：固定间隔 ' + (expression || '（未填写）'));
+      else lines.push('触发：Cron ' + (expression || '（未填写）') + '（按 UTC 计算）');
+      summaryNode.innerHTML = lines.map((line) => '<div>' + e(line) + '</div>').join('');
+    };
+    const refreshSummary = AD.debounce(renderSummary, 200);
+    backdrop.addEventListener('input', refreshSummary, true);
+    backdrop.addEventListener('change', refreshSummary, true);
+
+    const applyMethodUI = () => {
+      const method = methodSelect.value;
+      backdrop.querySelectorAll('[data-method-field]').forEach((field) => {
+        field.classList.toggle('hidden', !field.dataset.methodField.split(' ').includes(method));
       });
-      // 必填星号 + 生效范围提示
+      // 打包路径对所有方式都生效（决定发布包内容）；发布位置对「仅打包」无意义。
+      backdrop.querySelectorAll('[data-release-field]').forEach((field) => {
+        field.classList.toggle('hidden', method === 'artifact');
+      });
       const required = METHOD_REQUIRED[method] || [];
-      FIELD_IDS.forEach((id) => {
+      METHOD_FIELD_ALL.forEach((id) => {
         const mark = backdrop.querySelector('.req-' + id);
         if (mark) mark.classList.toggle('hidden', !required.includes(id));
       });
+      const desc = backdrop.querySelector('#method-desc');
+      if (desc) desc.textContent = METHOD_DESCRIPTIONS[method] || '';
       const rollbackHint = backdrop.querySelector('#rollback-hint');
       if (rollbackHint) {
         rollbackHint.textContent = method === 'systemd'
-          ? '回滚时在目标发布目录执行，随后重启服务 ' + (backdrop.querySelector('#f-service_name').value.trim() || '(尚未填写服务名)')
+          ? '回滚时在目标发布目录执行，随后重启服务 ' + (value('#f-service_name') || '(尚未填写服务名)')
           : '回滚时在目标发布目录执行；该方式回滚只切换本地软链，不会重建容器或同步远端';
       }
-      const keepGroup = backdrop.querySelector('#releases-fields');
-      if (keepGroup) {
-        // 打包/发布三件套对仅打包、自定义脚本方式基本无效，直接隐藏。
-        const groupHidden = (method === 'artifact' || method === 'script') && methodTouched;
-        keepGroup.classList.toggle('hidden', groupHidden);
-      }
-      methodTouched = true;
+      renderSummary();
     };
-    methodSelect.addEventListener('change', applyMethodVisibility);
-    applyMethodVisibility();
+    methodSelect.addEventListener('change', applyMethodUI);
 
-    // 凭据 > 任务内令牌的互斥提示：选了集中凭据就地提醒令牌不生效。
-    const credSelect = backdrop.querySelector('#f-credential_id');
-    const tokenInput = backdrop.querySelector('#f-git_token');
-    const overrideHint = backdrop.querySelector('#token-override-hint');
-    const applyCredentialHint = () => {
-      if (overrideHint && tokenInput) {
-        overrideHint.classList.toggle('hidden', !(credSelect && credSelect.value));
-      }
+    const applyAuthMode = () => {
+      const mode = scanAuthMode();
+      const credWrap = backdrop.querySelector('#auth-credential-wrap');
+      const tokenWrap = backdrop.querySelector('#auth-token-wrap');
+      if (credWrap) credWrap.classList.toggle('hidden', mode !== 'credential');
+      if (tokenWrap) tokenWrap.classList.toggle('hidden', mode !== 'token');
+      renderSummary();
     };
-    if (credSelect) {
-      credSelect.addEventListener('change', applyCredentialHint);
-      applyCredentialHint();
+    backdrop.querySelectorAll('input[name="f-auth_mode"]').forEach((radio) => {
+      radio.addEventListener('change', applyAuthMode);
+    });
+
+    // 凭据区：内联新建（叠层表单，保存后回填选择）与就地测试当前仓库。
+    const createButton = backdrop.querySelector('#cred-create');
+    if (createButton) {
+      createButton.addEventListener('click', async () => {
+        await AD.openCredentialForm(null, {
+          stack: true,
+          onSaved: async (saved) => {
+            try {
+              AD.state.credentials = (await AD.api.get('/api/credentials')).credentials || [];
+              AD.state.credentialsError = false;
+            } catch (err) {
+              AD.state.credentialsError = true;
+            }
+            const select = backdrop.querySelector('#f-credential_id');
+            if (!select) return;
+            select.innerHTML = '<option value="">不使用（公开仓库）</option>'
+              + (AD.state.credentials || []).map((c) =>
+                `<option value="${c.id}"${saved && String(c.id) === String(saved.id) ? ' selected' : ''}>${e(c.name)}（${e(c.kind_label || c.kind)}）</option>`).join('');
+            const credentialRadio = Array.from(backdrop.querySelectorAll('input[name="f-auth_mode"]'))
+              .find((radio) => radio.value === 'credential');
+            if (credentialRadio) { credentialRadio.checked = true; applyAuthMode(); }
+          },
+        });
+      });
+    }
+    const testButton = backdrop.querySelector('#cred-test');
+    if (testButton) {
+      testButton.addEventListener('click', async () => {
+        const selectedId = backdrop.querySelector('#f-credential_id')?.value || '';
+        const repoUrl = value('#f-repo_url');
+        if (!selectedId) { AD.toastError('请先选择要测试的凭据'); return; }
+        if (!repoUrl) { AD.toastError('请先填写仓库地址'); return; }
+        AD.setBusy(testButton, true, '测试中…');
+        try {
+          const result = await AD.api.post(`/api/credentials/${selectedId}/test`, { repo_url: repoUrl });
+          if (result.ok) AD.toastSuccess('仓库访问测试通过：' + result.message);
+          else AD.toastError('测试失败：' + result.message);
+        } catch (err) {
+          AD.toastError(err.message);
+        }
+        AD.setBusy(testButton, false);
+      });
     }
 
     const webhookUrlInput = backdrop.querySelector('#f-webhook_url');
@@ -1266,6 +1433,14 @@ AD.views = {};
       });
       const resetButton = backdrop.querySelector('#webhook-reset');
       resetButton.addEventListener('click', async () => {
+        // 重新生成不经过「保存」就立即生效：必须先确认，不能当普通草稿修改。
+        const confirmed = await AD.confirm({
+          title: '重新生成触发地址',
+          message: '旧触发地址会立即失效，使用旧地址的外部 Webhook 将无法再触发本任务。',
+          confirmText: '重新生成',
+          danger: true,
+        });
+        if (!confirmed) return;
         AD.setBusy(resetButton, true, '生成中…');
         try {
           const result = await AD.api.post(`/api/tasks/${taskId}/webhook/reset`);
@@ -1279,8 +1454,6 @@ AD.views = {};
       });
     }
 
-    const typeSelect = backdrop.querySelector('#f-schedule_type');
-    const exprInput = backdrop.querySelector('#f-schedule_expression');
     const hint = backdrop.querySelector('#schedule-hint');
     const preview = backdrop.querySelector('#schedule-preview');
 
@@ -1296,8 +1469,13 @@ AD.views = {};
       }
       hint.textContent = typeSelect.value === 'interval'
         ? '间隔格式：30s / 15m / 6h / 2d（最小 30 秒）'
-        : 'Cron 格式：分 时 日 月 周，例如 0 */6 * * *';
+        : 'Cron 格式：分 时 日 月 周，例如 0 */6 * * *（按 UTC 时间计算）';
     };
+
+    // 两种表达式的草稿分开保存：interval 切 cron 不再沿用 1h 然后报错。
+    let lastInterval = typeSelect.value === 'interval' ? exprInput.value : (scheduleDefaults.interval || '1h');
+    let lastCron = typeSelect.value === 'cron' ? exprInput.value : (scheduleDefaults.cron || '0 * * * *');
+    let currentType = typeSelect.value;
 
     const refreshPreview = AD.debounce(async () => {
       const type = typeSelect.value;
@@ -1315,14 +1493,34 @@ AD.views = {};
       } catch (err) { preview.textContent = ''; }
     }, 320);
 
-    typeSelect.addEventListener('change', () => { applyScheduleVisibility(); refreshPreview(); });
-    exprInput.addEventListener('input', refreshPreview);
+    typeSelect.addEventListener('change', () => {
+      const next = typeSelect.value;
+      if (next !== currentType) {
+        if (currentType === 'interval') lastInterval = exprInput.value;
+        if (currentType === 'cron') lastCron = exprInput.value;
+        // 表达式格式在两种类型间不互通：切到对应类型时恢复该类型的草稿。
+        if (next === 'interval' && !/^\d+\s*[smhd]?$/i.test(exprInput.value.trim())) exprInput.value = lastInterval;
+        if (next === 'cron' && exprInput.value.trim().split(/\s+/).length !== 5) exprInput.value = lastCron;
+        currentType = next;
+      }
+      applyScheduleVisibility();
+      refreshPreview();
+      renderSummary();
+    });
+    exprInput.addEventListener('input', () => {
+      if (typeSelect.value === 'interval') lastInterval = exprInput.value;
+      if (typeSelect.value === 'cron') lastCron = exprInput.value;
+      refreshPreview();
+    });
+    applyMethodUI();
+    applyAuthMode();
     applyScheduleVisibility();
     refreshPreview();
+    renderSummary();
 
     backdrop.querySelector('#form-save').addEventListener('click', async (event) => {
       const button = event.currentTarget;
-      const payload = collectForm(backdrop, { isEdit });
+      const payload = collectForm(backdrop, { isEdit, hasToken: Boolean(t.has_token) });
       if ((!isEdit || payload.name !== t.name) && !/^[A-Za-z_]{1,80}$/.test(payload.name)) {
         showFormError(backdrop, '任务名只能包含 1–80 个英文字母或下划线，且必须全局唯一；中文说明请填写备注。');
         return;
@@ -1356,6 +1554,15 @@ AD.views = {};
         } else {
           result = await AD.api.post('/api/tasks', payload);
           AD.toastSuccess(result.run_id ? ('任务已创建并开始运行 #' + result.run_id) : '任务已创建');
+          // 「创建后立即运行」派发失败时后端返回 warning：不提示会让用户
+          // 以为第一次部署已经开始了。
+          if (result.warning) AD.toastError(result.warning);
+        }
+        // 保存期间用户可能已关闭本表单并打开了其它弹窗：此时只刷新数据，
+        // 不再代关当前弹窗（旧实现会误关新打开的弹窗）。
+        if (AD.Modal.top && AD.Modal.top() !== backdrop) {
+          AD.render('tasks');
+          return;
         }
         AD.Modal.close();
         AD.render('tasks');
@@ -1368,11 +1575,10 @@ AD.views = {};
     const deleteButton = backdrop.querySelector('#form-delete');
     if (deleteButton) {
       deleteButton.addEventListener('click', async () => {
-        // 表单是在模态里的：先关闭，避免删除确认叠在编辑表单之上。
-        AD.Modal.close();
+        // 删除确认（确认框 + 输入任务名）叠在表单之上：取消时表单与草稿
+        // 原样保留，不再像旧实现那样先关表单再重开、丢掉未保存的修改。
         const deleted = await AD.deleteTask(taskId, t);
-        // 取消删除时回到编辑表单，不丢失正在编辑的内容。
-        if (!deleted) AD.openTaskForm(taskId);
+        if (deleted) AD.Modal.close();
       });
     }
   };
@@ -1428,15 +1634,31 @@ AD.views = {};
       skip_if_no_changes: checked('#f-skip_if_no_changes'),
     };
 
-    const credentialNode = backdrop.querySelector('#f-credential_id');
-    if (credentialNode) {
-      payload.credential_id = credentialNode.value ? Number(credentialNode.value) : null;
+    // 方式无关的字段在提交时就地清空：界面上切换方式保留输入（可切回），
+    // 但不会把其它方式的旧值存成脏配置，也避免触发后端的方式互斥校验。
+    const relevant = new Set(METHOD_FIELD_IDS[payload.deploy_method] || []);
+    for (const id of METHOD_FIELD_ALL) {
+      if (!relevant.has(id)) payload[id] = '';
     }
 
+    // 认证方式三选一：选中的方式决定提交什么，其余认证字段不随表单漂移。
+    let authMode = 'none';
+    for (const radio of backdrop.querySelectorAll('input[name="f-auth_mode"]')) {
+      if (radio.checked) { authMode = radio.value; break; }
+    }
+    if (authMode === 'credential') {
+      const credentialNode = backdrop.querySelector('#f-credential_id');
+      payload.credential_id = credentialNode && credentialNode.value ? Number(credentialNode.value) : null;
+    } else {
+      // 切到其它认证方式即表示不再使用集中凭据：显式解绑。
+      payload.credential_id = null;
+    }
     const tokenNode = backdrop.querySelector('#f-git_token');
-    if (tokenNode && tokenNode.value) payload.git_token = tokenNode.value;
+    if (authMode === 'token' && tokenNode && tokenNode.value) payload.git_token = tokenNode.value;
     const clearNode = backdrop.querySelector('#f-clear_token');
-    if (clearNode && clearNode.checked) payload.clear_token = true;
+    if (authMode === 'token' && clearNode && clearNode.checked) payload.clear_token = true;
+    // 「无需认证」要名副其实：存量任务内令牌一并清除，否则仍会被用于拉取。
+    if (authMode === 'none' && options.isEdit && options.hasToken) payload.clear_token = true;
 
     const runOnCreate = backdrop.querySelector('#f-run_on_create');
     if (runOnCreate && !options.isEdit) payload.run_on_create = runOnCreate.checked;
@@ -1565,7 +1787,8 @@ AD.views = {};
         confirmText: '回滚',
         danger: true,
       });
-      if (!confirmed) { AD.openTaskDetail(taskId); return; }
+      // 确认框是叠层弹窗：取消时详情弹窗仍在，无需重开。
+      if (!confirmed) return;
       AD.setBusy(event.currentTarget, true, '回滚中…');
       try {
         // 回滚已改为后台运行：立即返回 run_id，进度在运行详情里轮询。
@@ -2600,13 +2823,23 @@ AD.views = {};
     } catch (err) { AD.toastError(err.message); }
   };
 
-  AD.openCredentialForm = async function (credentialId) {
+  // options.stack: 叠层打开（如从任务表单内联新建凭据，不关闭底层表单）；
+  // options.onSaved: 保存成功后的回调，传入保存后的凭据。缺省行为是刷新
+  // 凭据页（从凭据列表打开时保持原交互）。
+  AD.openCredentialForm = async function (credentialId, options) {
+    const formOptions = options || {};
     let item = null;
     if (credentialId) {
       const data = await AD.api.get(`/api/credentials/${credentialId}`);
       item = data.credential;
     }
     const kinds = await AD.api.get('/api/credentials/kinds');
+    // 令牌获取指引与凭据页共用同一后端来源；拉取失败只影响帮助折叠块。
+    let tokenGuide = null;
+    try {
+      tokenGuide = (await AD.api.get('/api/credentials/guide')).kinds
+        .find((k) => k.kind === 'https_token') || null;
+    } catch (err) { /* 指引仅是辅助，失败不阻塞表单 */ }
     const t = item || {};
     const isEdit = Boolean(credentialId);
 
@@ -2642,6 +2875,13 @@ AD.views = {};
         </div>
         <textarea id="c-secret" rows="5" placeholder=""></textarea>
         <div class="hint" id="c-secret-hint"></div>
+        <div id="c-token-help" class="hidden" style="margin-top:8px">
+          <details>
+            <summary class="hint" style="cursor:pointer">没有令牌？点开查看如何生成（GitHub）</summary>
+            <ol class="cred-steps" style="margin-top:8px" id="c-token-steps"></ol>
+            <div class="hint" id="c-token-notes" style="margin-top:8px"></div>
+          </details>
+        </div>
       </div>
       <div class="field hidden" id="c-pubkey-wrap">
         <div id="c-pubkey-body"></div>
@@ -2660,6 +2900,7 @@ AD.views = {};
     const backdrop = AD.Modal.open({
       title: isEdit ? '编辑凭据：' + t.name : '新建凭据',
       body,
+      stack: Boolean(formOptions.stack),
       footer: '<button data-close>取消</button>'
         + `<button class="primary" id="cred-save">${isEdit ? '保存' : '创建'}</button>`,
     });
@@ -2676,6 +2917,15 @@ AD.views = {};
       secretInput.rows = kind === 'ssh_key' ? 6 : 2;
       backdrop.querySelector('#c-username-hint').textContent = kind === 'ssh_key'
         ? 'SSH 地址通常使用 git，留空则默认 git' : 'GitHub 使用 x-access-token；留空则使用默认值';
+      // HTTPS 令牌的内联生成指引；SSH 有自己的「自动生成密钥对」，不需要它。
+      const tokenHelp = backdrop.querySelector('#c-token-help');
+      tokenHelp.classList.toggle('hidden', kind !== 'https_token' || !tokenGuide);
+      if (kind === 'https_token' && tokenGuide) {
+        backdrop.querySelector('#c-token-steps').innerHTML =
+          tokenGuide.steps.map((s) => `<li>${e(s)}</li>`).join('');
+        backdrop.querySelector('#c-token-notes').innerHTML =
+          tokenGuide.notes.map((n) => `<div>· ${e(n)}</div>`).join('');
+      }
       backdrop.querySelector('#c-username-wrap').classList.toggle('hidden', false);
       backdrop.querySelector('#c-passphrase-wrap').classList.toggle('hidden', kind !== 'ssh_key');
       // 只有新建 SSH 凭据才需要「自动生成」：已有凭据的私钥不回传，
@@ -2737,11 +2987,13 @@ AD.views = {};
 
       AD.setBusy(button, true, '保存中…');
       try {
-        if (isEdit) await AD.api.put(`/api/credentials/${credentialId}`, payload);
-        else await AD.api.post('/api/credentials', payload);
+        let result;
+        if (isEdit) result = await AD.api.put(`/api/credentials/${credentialId}`, payload);
+        else result = await AD.api.post('/api/credentials', payload);
         AD.toastSuccess(isEdit ? '凭据已保存' : '凭据已创建');
         AD.Modal.close();
-        AD.render('credentials');
+        if (formOptions.onSaved) await formOptions.onSaved(result.credential);
+        else AD.render('credentials');
       } catch (err) {
         credError(backdrop, err.message);
         AD.setBusy(button, false);
@@ -3324,8 +3576,11 @@ AD.views = {};
   function stamp(seconds) {
     const value = Number(seconds);
     if (!value) return '时间未知';
-    const date = new Date(value * 1000);
     const two = (n) => String(n).padStart(2, '0');
+    // epoch 秒按服务器时区渲染，与 AD.formatTime 保持一致。
+    const date = AD.tzOffsetMinutes === null
+      ? new Date(value * 1000)
+      : new Date(value * 1000 + (AD.tzOffsetMinutes - new Date(value * 1000).getTimezoneOffset()) * 60000);
     return date.getFullYear() + '-' + two(date.getMonth() + 1) + '-' + two(date.getDate())
       + ' ' + two(date.getHours()) + ':' + two(date.getMinutes());
   }

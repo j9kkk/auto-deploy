@@ -192,6 +192,10 @@ def validate_task_payload(
         # so clearing a token requires the separate clear_token flag.
         if token or _clean_bool(payload.get("clear_token"), False):
             out["git_token"] = token
+    elif _clean_bool(payload.get("clear_token"), False):
+        # 前端勾选「清除已保存的令牌」时只提交 clear_token 标志、不带
+        # git_token 键；此前会因缺少该键被忽略，保存成功但令牌仍在。
+        out["git_token"] = ""
     elif not partial:
         out["git_token"] = ""
 
@@ -395,7 +399,8 @@ def _normalise_env_vars(raw: Any) -> tuple[dict[str, str], str | None]:
             parsed = _parse_lines(text)
             if parsed is None:
                 return {}, "环境变量格式无法解析，请使用 KEY=value 每行一条"
-            return parsed, None
+        # 文本路径与 JSON 对象共用同一套键名校验：界面输入走文本路径，
+        # 此前会绕过变量名规则与数量上限。
         raw = parsed
     if not isinstance(raw, Mapping):
         return {}, "环境变量必须是键值对象或 KEY=value 文本"
@@ -469,13 +474,15 @@ def validate_credential_payload(
         out["description"] = _clean_str(
             payload.get("description", existing.get("description", "")), limit=1000
         )
+    # kind 仅在显式提交时进入输出：更新接口据其判断“类型是否变化”，
+    # 局部改名/改备注不应被误判成改了类型而清掉测试结论。
     if has("kind") or not partial:
         kind = _clean_str(payload.get("kind") or existing.get("kind") or "https_token", limit=32).lower()
         if kind not in CREDENTIAL_KINDS:
             errors["kind"] = f"凭据类型必须是 {sorted(CREDENTIAL_KINDS)} 之一"
         out["kind"] = kind
     else:
-        out["kind"] = _clean_str(existing.get("kind") or "https_token", limit=32).lower()
+        kind = _clean_str(existing.get("kind") or "https_token", limit=32).lower()
 
     if has("username") or not partial:
         out["username"] = _clean_str(
@@ -486,11 +493,11 @@ def validate_credential_payload(
     if has("secret"):
         raw_secret = str(payload.get("secret") or "")
         if raw_secret:
-            limit = PRIVATE_KEY_MAX if out.get("kind") == "ssh_key" else 4000
+            limit = PRIVATE_KEY_MAX if kind == "ssh_key" else 4000
             if len(raw_secret) > limit:
                 errors["secret"] = f"密钥内容过长（上限 {limit} 字符）"
             out["secret"] = raw_secret
-            if out.get("kind") == "ssh_key":
+            if kind == "ssh_key":
                 out["username"] = out.get("username") or "git"
     elif not partial:
         out["secret"] = ""
@@ -499,7 +506,6 @@ def validate_credential_payload(
         out["passphrase"] = str(payload.get("passphrase") or "")
 
     # 类型相关的必填校验：仅在有足够信息时判断。
-    kind = out.get("kind") or existing.get("kind") or "https_token"
     secret_present = bool(out.get("secret") or existing.get("secret"))
     if not errors:
         if kind == "ssh_key" and not secret_present:

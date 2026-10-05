@@ -121,6 +121,31 @@ def run() -> int:
     check("校验非法 interval 返回错误", validate_schedule("interval", "1s") is not None)
     check("校验非法 cron 返回错误", validate_schedule("cron", "bad") is not None)
 
+    # 系统时区展示辅助函数：UTC 时刻转本地渲染与日历日。
+    from datetime import timezone as _timezone
+
+    from app import schedule as sched
+
+    utc_moment = datetime(2026, 10, 3, 0, 30, tzinfo=_timezone.utc)
+    local_moment = sched.to_local(utc_moment)
+    check("to_local 返回 naive 时间", local_moment is not None and local_moment.tzinfo is None, str(local_moment))
+    offset_hours = round((local_moment - utc_moment.replace(tzinfo=None)).total_seconds() / 3600)
+    expected_hours = round(sched.local_tz().utcoffset(datetime.now()).total_seconds() / 3600)
+    check("to_local 偏移与 local_tz 一致", offset_hours == expected_hours, f"{offset_hours} vs {expected_hours}")
+    check(
+        "format_local 渲染为 YYYY-MM-DD HH:MM:SS",
+        sched.format_local(utc_moment) == local_moment.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    check(
+        "local_date 为系统时区日历日",
+        sched.local_date(utc_moment) == local_moment.date().isoformat(),
+    )
+    check("format_local 空值回退当前时间", sched.format_local(None) != "")
+    check(
+        "to_local 对 naive UTC 输入按 UTC 解释",
+        sched.to_local(datetime(2026, 10, 3, 0, 30)) == local_moment,
+    )
+
     # ------------------------------------------------------------------
     section("密码与会话安全")
     from app.security import (
@@ -194,6 +219,11 @@ def run() -> int:
             {"name": "x", "repo_url": "https://github.com/a/b.git", "env_vars": {"bad name": "1"}},
             "env_vars",
         ),
+        (
+            "环境变量文本路径同样校验变量名",
+            {"name": "x", "repo_url": "https://github.com/a/b.git", "env_vars": "BAD-NAME=1"},
+            "env_vars",
+        ),
     ]
     for label, payload, field in with_errors:
         try:
@@ -261,6 +291,16 @@ def run() -> int:
                    "docker_image": "stale:image"}
     result = validate_task_payload({"description": "改备注"}, partial=True, existing=legacy_task)
     check("存量脏字段局部编辑放行", "docker_image" not in result and result["description"] == "改备注")
+
+    # 令牌清除协议：界面勾选「清除已保存的令牌」时只提交 clear_token 标志，
+    # 不带 git_token 键；此前清除标志因缺少该键被忽略，保存成功但令牌仍在。
+    token_task = {**legacy_task, "git_token": "old-token"}
+    merged = validate_task_payload({"clear_token": True}, partial=True, existing=token_task)
+    check("clear_token 单独提交可清除令牌", merged.get("git_token") == "")
+    kept = validate_task_payload({"description": "改备注"}, partial=True, existing=token_task)
+    check("未提交 clear_token 不动令牌", "git_token" not in kept)
+    replaced = validate_task_payload({"git_token": "new-token"}, partial=True, existing=token_task)
+    check("提交新令牌直接替换", replaced.get("git_token") == "new-token")
     # manual 调度下表达式不参与校验，存任意文本也能通过。
     manual_task = validate_task_payload(
         {"name": "x", "repo_url": "https://github.com/a/b.git",
@@ -712,6 +752,14 @@ def run() -> int:
     check("统计成功数", overview["success"] == 1)
     check("统计成功率", overview["success_rate"] == 100.0)
     check("日统计返回正确天数", len(store.runs.stats_daily(7)) == 7)
+    # 日统计必须按系统时区的日历日分桶：刚结束的这次运行属于「今天」，
+    # 无论 UTC 日期还是本地日期，今天的桶里都要能找到它。
+    daily = store.runs.stats_daily(7)
+    from app.schedule import local_date
+
+    today_bucket = next((d for d in daily if d["day"] == local_date()), None)
+    check("日统计包含系统时区的今天", today_bucket is not None, str([d["day"] for d in daily]))
+    check("日统计今天的桶计入本次运行", today_bucket is not None and today_bucket["total"] >= 1, str(today_bucket))
     check("任务维度统计", store.runs.stats_by_task()[0]["run_count"] == 1)
 
     store.tasks.delete(task_id)
@@ -859,6 +907,17 @@ def run() -> int:
         )
         check("非法任务被拒绝", response.status_code == 422)
 
+        # 凭据选择必须真实存在：此前外键错误落到通用 handler 返回 500。
+        response = client.post(
+            "/api/tasks",
+            json={"name": "No_Cred", "repo_url": str(origin),
+                  "deploy_method": "script", "deploy_script": "true",
+                  "credential_id": 99999},
+        )
+        check("不存在的凭据被拒绝", response.status_code == 422, response.text[:150])
+        check("凭据错误指向 credential_id 字段",
+              "credential_id" in (response.json().get("detail", {}).get("errors") or {}))
+
         # 任务名唯一性：重名创建被拒绝，且大小写不敏感
         response = client.post(
             "/api/tasks",
@@ -898,6 +957,15 @@ def run() -> int:
             response = client.patch(f"/api/tasks/{second_id}", json={"name": invalid_name})
             check(f"API 编辑非法名称 {invalid_name!r}", response.status_code == 422 and "name" in response.json()["detail"]["errors"])
         check("无效编辑未修改原名称", service.store.tasks.get(second_id)["name"] == "Cancel_Alpha")
+
+        # 令牌清除协议端到端：只提交 clear_token 标志也能清除（配合前端
+        # 「清除已保存的令牌」勾选；此前会保存成功但令牌仍在）。
+        response = client.put(f"/api/tasks/{second_id}", json={"git_token": "tok-1"})
+        check("写入任务内令牌", response.status_code == 200, response.text[:150])
+        check("令牌写入后标记存在", response.json()["task"]["has_token"] is True)
+        response = client.put(f"/api/tasks/{second_id}", json={"clear_token": True})
+        check("clear_token 单独提交清除令牌", response.status_code == 200, response.text[:150])
+        check("清除后台任务不再持有令牌", response.json()["task"]["has_token"] is False)
         active_id = service.store.runs.create(service.store.tasks.get(second_id))
         original_active_check = service.store.runs.has_active_for_task
         scheduler_lock_checks = []
@@ -1689,6 +1757,23 @@ def run() -> int:
                                  "username": "u", "secret": "s3cr3t", "description": ""})
     check("解码后不含 secret 明文", "secret" not in decoded and decoded["has_secret"])
     check("解码后给出密钥长度", decoded["secret_length"] == 6)
+    # 私钥口令与 secret 同级机密：同样只暴露“是否设置”。
+    decoded_ssh = decode_credential({"id": 2, "name": "k", "kind": "ssh_key", "username": "git",
+                                     "secret": "KEY", "passphrase": "pp", "description": ""})
+    check("解码后不含私钥口令明文", "passphrase" not in decoded_ssh and decoded_ssh["has_passphrase"])
+    check("无口令凭据标记为未设置",
+          decode_credential({"id": 3, "name": "p", "kind": "ssh_key",
+                             "username": "git", "secret": "KEY", "description": ""})["has_passphrase"] is False)
+
+    # 凭据局部校验不再把已有 kind 塞进输出：更新接口据其判断“类型是否
+    # 变化”，此前仅改名/改备注也会把测试结论清成失败。
+    from app.validation import validate_credential_payload
+    renamed = validate_credential_payload({"name": "改名"}, partial=True,
+                                          existing={"kind": "ssh_key", "secret": "KEY", "name": "旧名"})
+    check("凭据局部改名不视为改类型", "kind" not in renamed)
+    retyped = validate_credential_payload({"kind": "https_token", "secret": "tok"}, partial=True,
+                                          existing={"kind": "ssh_key", "secret": "KEY", "name": "旧名"})
+    check("显式提交类型仍进入输出", retyped.get("kind") == "https_token")
     check("空私钥指纹为空", ssh_key_fingerprint("") == "")
     check("非法私钥不产生指纹", ssh_key_fingerprint("not a key") == "")
 

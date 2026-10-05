@@ -234,6 +234,30 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
 .checkbox-row label { margin: 0; color: var(--text); font-size: 13px; cursor: pointer; }
 .form-grid { display: grid; gap: 0 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .form-grid .span-2 { grid-column: 1 / -1; }
+/* 任务表单用固定两列：各区块列数一致，输入框宽度与起点对齐；
+   窄屏退化为单列。auto-fit 会让不同区块各自变成不同列数。 */
+.form-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+@media (max-width: 720px) { .form-grid.cols-2 { grid-template-columns: 1fr; } }
+/* 仓库认证三选一：单选按钮组，选中后才显示对应的认证字段。 */
+.auth-options { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.auth-options label {
+  display: flex; align-items: center; gap: 6px; margin: 0;
+  font-size: 13px; color: var(--text); cursor: pointer; font-weight: 400;
+}
+/* 高级参数折叠区：默认收起，避免低频配置挤占主要流程。 */
+.adv-details {
+  margin: 4px 0 14px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.adv-details summary {
+  cursor: pointer; font-size: 12.5px; color: var(--text-dim); user-select: none;
+}
+.adv-details[open] summary { margin-bottom: 12px; }
+/* 配置摘要：保存前用自然语言确认任务将要执行的行为。 */
+.config-summary {
+  padding: 10px 12px; font-size: 12px; color: var(--text-dim); line-height: 1.8;
+  border: 1px dashed var(--border-strong); border-radius: var(--radius-sm);
+}
 
 /* --------------------------------------------------------------- tables -- */
 table { width: 100%; border-collapse: collapse; font-size: 13px; }

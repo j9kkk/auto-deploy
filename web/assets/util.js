@@ -106,10 +106,20 @@ window.AD = window.AD || {};
   // ------------------------------------------------------------- formatting
   function pad(value) { return String(value).padStart(2, '0'); }
 
-  /** Render an ISO timestamp in the browser's local timezone. */
+  /** Render an ISO timestamp in the server's system timezone. The offset
+   * (minutes east of UTC) arrives via /api/health and /api/dashboard; until
+   * it is known we fall back to the browser's own timezone. */
+  AD.tzOffsetMinutes = null;
+
+  function applyOffset(date) {
+    if (AD.tzOffsetMinutes === null) return date;
+    const minutes = date.getTime() + date.getTimezoneOffset() * 60000 + AD.tzOffsetMinutes * 60000;
+    return new Date(minutes);
+  }
+
   AD.formatTime = function (isoString, withSeconds) {
     if (!isoString) return '—';
-    const date = new Date(String(isoString).endsWith('Z') ? isoString : isoString + 'Z');
+    const date = applyOffset(new Date(String(isoString).endsWith('Z') ? isoString : isoString + 'Z'));
     if (Number.isNaN(date.getTime())) return '—';
     const base = date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
       + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
@@ -207,9 +217,13 @@ window.AD = window.AD || {};
   AD.toastSuccess = (message) => AD.toast(message, 'success');
 
   // ------------------------------------------------------------------ modals
+  // 弹窗按栈管理：确认框、凭据表单可以叠在任务表单之上，关闭时只移除
+  // 自己那一层，不打断底层的编辑流程。open() 默认仍是“替换式”打开
+  // （先清空再挂载），传入 stack: true 才叠加。
   AD.Modal = {
+    stack: [],
     open(options) {
-      this.close();
+      if (!options.stack) this.closeAll();
       const backdrop = document.createElement('div');
       backdrop.className = 'modal-backdrop';
       backdrop.innerHTML =
@@ -226,41 +240,83 @@ window.AD = window.AD || {};
             + '</div>')
         + '</div>';
       document.getElementById('modal-root').appendChild(backdrop);
-      this.element = backdrop;
+      this.stack.push({
+        backdrop,
+        beforeClose: typeof options.beforeClose === 'function' ? options.beforeClose : null,
+      });
       backdrop.addEventListener('click', (event) => {
-        if (event.target === backdrop) this.close();
-        if (event.target.closest('[data-close]')) this.close();
+        if (event.target === backdrop) this.requestClose();
+        if (event.target.closest('[data-close]')) this.requestClose();
       });
       if (options.onMount) options.onMount(backdrop);
       return backdrop;
     },
+    top() {
+      return this.stack.length ? this.stack[this.stack.length - 1].backdrop : null;
+    },
+    // 用户发起的关闭（✕ / 遮罩 / Escape）：先过 beforeClose 关卡，
+    // 表单用它做“放弃未保存修改？”确认；确认期间重复触发只算一次。
+    async requestClose() {
+      const entry = this.stack[this.stack.length - 1];
+      if (!entry || entry.closing) return;
+      if (entry.beforeClose) {
+        entry.closing = true;
+        let allowed = false;
+        try { allowed = await entry.beforeClose(); } catch (err) { allowed = false; }
+        entry.closing = false;
+        if (!allowed) return;
+      }
+      if (this.stack[this.stack.length - 1] === entry) this.close();
+    },
     close() {
+      const entry = this.stack.pop();
+      if (entry) entry.backdrop.remove();
+      else {
+        const root = document.getElementById('modal-root');
+        if (root) root.innerHTML = '';
+      }
+    },
+    // 精确移除指定弹窗：确认框完成时不依赖“自己还在栈顶”的假设。
+    remove(backdrop) {
+      const index = this.stack.findIndex((entry) => entry.backdrop === backdrop);
+      if (index >= 0) this.stack.splice(index, 1);
+      backdrop.remove();
+    },
+    closeAll() {
+      this.stack = [];
       const root = document.getElementById('modal-root');
       if (root) root.innerHTML = '';
-      this.element = null;
     },
   };
 
   AD.confirm = function (options) {
     return new Promise((resolve) => {
       let settled = false;
-      const finish = (value) => { if (!settled) { settled = true; AD.Modal.close(); resolve(value); } };
-      AD.Modal.open({
+      let backdrop;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (backdrop) AD.Modal.remove(backdrop);
+        resolve(value);
+      };
+      backdrop = AD.Modal.open({
         title: options.title || '请确认',
         size: 'narrow',
+        // 确认框始终叠层：可能出现在任务表单等既有弹窗之上。
+        stack: true,
         body: '<p>' + AD.escapeHtml(options.message || '') + '</p>'
           + (options.detail ? '<p class="faint">' + AD.escapeHtml(options.detail) + '</p>' : ''),
         footer: '<button data-cancel>取消</button>'
           + '<button class="' + (options.danger ? 'danger' : 'primary') + '" data-ok>'
           + AD.escapeHtml(options.confirmText || '确认') + '</button>',
-        onMount(backdrop) {
-          backdrop.querySelector('[data-ok]').addEventListener('click', () => finish(true));
-          backdrop.querySelector('[data-cancel]').addEventListener('click', () => finish(false));
+        onMount(node) {
+          node.querySelector('[data-ok]').addEventListener('click', () => finish(true));
+          node.querySelector('[data-cancel]').addEventListener('click', () => finish(false));
         },
       });
-      // Closing via the backdrop or ✕ resolves as "cancelled".
+      // 底层弹窗被整体替换等情况下 backdrop 会离开文档：视为取消。
       const observer = new MutationObserver(() => {
-        if (!document.getElementById('modal-root').firstChild) { finish(false); observer.disconnect(); }
+        if (!backdrop.isConnected) { finish(false); observer.disconnect(); }
       });
       observer.observe(document.getElementById('modal-root'), { childList: true });
     });
@@ -270,29 +326,36 @@ window.AD = window.AD || {};
   AD.prompt = function (options) {
     return new Promise((resolve) => {
       let settled = false;
-      const finish = (value) => { if (!settled) { settled = true; AD.Modal.close(); resolve(value); } };
-      AD.Modal.open({
+      let backdrop;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (backdrop) AD.Modal.remove(backdrop);
+        resolve(value);
+      };
+      backdrop = AD.Modal.open({
         title: options.title || '请输入',
         size: 'narrow',
+        stack: true,
         body: '<div class="field"><label>' + AD.escapeHtml(options.label || '值') + '</label>'
           + '<input type="' + (options.type || 'text') + '" id="prompt-input" '
           + 'value="' + AD.attr(options.value || '') + '" '
           + 'placeholder="' + AD.attr(options.placeholder || '') + '"></div>'
           + (options.hint ? '<p class="faint">' + AD.escapeHtml(options.hint) + '</p>' : ''),
         footer: '<button data-cancel>取消</button><button class="primary" data-ok>确认</button>',
-        onMount(backdrop) {
-          const input = backdrop.querySelector('#prompt-input');
+        onMount(node) {
+          const input = node.querySelector('#prompt-input');
           input.focus();
           input.select();
           input.addEventListener('keydown', (event) => {
             if (event.key === 'Enter') { event.preventDefault(); finish(input.value); }
           });
-          backdrop.querySelector('[data-ok]').addEventListener('click', () => finish(input.value));
-          backdrop.querySelector('[data-cancel]').addEventListener('click', () => finish(null));
+          node.querySelector('[data-ok]').addEventListener('click', () => finish(input.value));
+          node.querySelector('[data-cancel]').addEventListener('click', () => finish(null));
         },
       });
       const observer = new MutationObserver(() => {
-        if (!document.getElementById('modal-root').firstChild) { finish(null); observer.disconnect(); }
+        if (!backdrop.isConnected) { finish(null); observer.disconnect(); }
       });
       observer.observe(document.getElementById('modal-root'), { childList: true });
     });
