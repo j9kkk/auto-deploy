@@ -864,6 +864,15 @@ def run() -> int:
         check("健康检查无需登录", response.status_code == 200)
         check("健康检查返回 ok", response.json().get("status") == "ok")
 
+        # 首页资产 URL 的 ?v= 必须跟随当前版本：曾写死 0.3.0，升级后浏览器
+        # 命中同名 URL 的旧缓存，用户看不到新前端。
+        from app import __version__ as ui_asset_version
+        response = client.get("/")
+        check("首页正常返回 HTML", response.status_code == 200
+              and "text/html" in response.headers.get("content-type", ""))
+        check("首页资产版本跟随当前版本",
+              f"?v={ui_asset_version}" in response.text and "__VERSION__" not in response.text)
+
         response = client.get("/api/tasks")
         check("未登录访问被拒绝", response.status_code == 401)
 

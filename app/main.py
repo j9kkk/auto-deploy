@@ -13,11 +13,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import config
+from . import __version__ as app_version
 from . import __version__ as VERSION
 from .api import auth as auth_routes
 from .api import credentials as credential_routes
@@ -122,7 +123,7 @@ def create_app(service: Service | None = None) -> FastAPI:
         app.mount("/assets", StaticFiles(directory=str(web_dir / "assets")), name="assets")
 
         @app.get("/", include_in_schema=False)
-        async def index() -> FileResponse:
+        async def index() -> Response:
             return _index_response()
 
         @app.get("/favicon.ico", include_in_schema=False)
@@ -160,11 +161,27 @@ def create_app(service: Service | None = None) -> FastAPI:
     return app
 
 
-def _index_response() -> FileResponse:
+# 渲染后的首页缓存：键为 index.html 的 (mtime_ns, size)，文件没变就不重读重替换。
+_index_cache: tuple[tuple[int, int], str] | None = None
+
+
+def _index_response() -> Response:
+    """首页 HTML；资产 URL 的 ?v= 占位符替换为当前版本。
+
+    版本号曾长期写死在 index.html（0.3.0），升级后 URL 不变，浏览器一直
+    命中旧缓存，用户看不到新前端。跟随 app.__version__ 后，每次发版资产
+    URL 自然变化，缓存随之失效。
+    """
+    global _index_cache
     index = config.WEB_DIR / "index.html"
     if not index.exists():  # pragma: no cover - guarded by create_app
         return JSONResponse(status_code=500, content={"ok": False, "detail": "缺少 index.html"})
-    return FileResponse(index, media_type="text/html; charset=utf-8")
+    stat = index.stat()
+    key = (stat.st_mtime_ns, stat.st_size)
+    if _index_cache is None or _index_cache[0] != key:
+        html = index.read_text(encoding="utf-8")
+        _index_cache = (key, html.replace("__VERSION__", app_version))
+    return Response(content=_index_cache[1], media_type="text/html; charset=utf-8")
 
 
 # ---------------------------------------------------------------------------
