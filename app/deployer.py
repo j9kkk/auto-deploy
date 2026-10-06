@@ -598,9 +598,10 @@ def _conflicting_stale_containers(output: str, project_name: str) -> list[str]:
         return []
     stale: list[str] = []
     # 旧命名：项目名 = 发布目录名 = <日期>-<时间>-<短commit>[_default]。
-    # 新命名：autodeploy-<任务slug>-<id>。识别旧项目即识别这两种形态。
+    # 现行命名：autodeploy-<任务slug>；历史命名：autodeploy-<任务slug>-<id>。
+    # 两种 autodeploy 形态都要识别（改名/升级前的存量容器靠它兜底清理）。
     legacy_re = _re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6,8}(_\w+)?$")
-    new_re = _re.compile(r"^autodeploy-[a-z0-9-]+-[0-9]+$")
+    new_re = _re.compile(r"^autodeploy-[a-z0-9-]+(-[0-9]+)?$")
     for line in listing.output.splitlines():
         name, _, label = line.partition("\t")
         labels = label or ""
@@ -627,7 +628,7 @@ def _remove_stale_containers(ctx: DeployContext, names: list[str]) -> bool:
     return ok_all
 
 
-def _safe_task_slug(name: str, task_id: Any) -> str:
+def _safe_task_slug(name: str) -> str:
     """任务名 → compose 项目名安全段：小写字母数字与短横线。"""
     import re as _re
     import unicodedata as _unicodedata
@@ -636,17 +637,19 @@ def _safe_task_slug(name: str, task_id: Any) -> str:
     # 直接把非 [a-z0-9-] 全替换为短横线并折叠，保证 compose 项目名合法。
     text = _unicodedata.normalize("NFKD", str(name or ""))
     slug = _re.sub(r"[^a-zA-Z0-9-]+", "-", text).strip("-").lower()
-    slug = _re.sub(r"-{2,}", "-", slug)[:40].strip("-") or "task"
-    return f"{slug}-{task_id}"
+    slug = _re.sub(r"-{2,}", "-", slug)[:40].strip("-")
+    return slug or "task"
 
 
 def compose_project_name(task: dict[str, Any]) -> str:
     """该任务的 compose 项目名。
 
-    部署时用它固定项目（避免每次发布新建网络），删除任务时用它精确停止
-    本项目容器——两者必须是同一个函数，否则删除会漏掉正在运行的容器。
+    任务名全局唯一（大小写不敏感校验），项目名不带 id 也唯一。
+    改名会使项目名跟着变：改名被禁止在运行中，旧项目名的残留容器由
+    _conflicting_stale_containers 的历史形态识别兜底，删除任务另有按
+    compose 标签的回退清理，两者都不依赖项目名精确匹配。
     """
-    return f"autodeploy-{_safe_task_slug(task.get('name') or '', task.get('id'))}"
+    return f"autodeploy-{_safe_task_slug(task.get('name') or '')}"
 
 
 def deploy_docker_compose(ctx: DeployContext) -> None:

@@ -1147,7 +1147,7 @@ def run() -> int:
         # 容器停止：只认本任务固定项目名标签，绝不触碰他人或手工容器。
         compose_task = {"id": 7100, "name": "Shop_Web", "deploy_method": "docker_compose"}
         listing = (
-            "shop-web-1\tcom.docker.compose.project=autodeploy-shop-web-7100\n"
+            "shop-web-1\tcom.docker.compose.project=autodeploy-shop-web\n"
             "foreign-1\tcom.docker.compose.project=someone-else\n"
             "manual-box\t\n"
         )
@@ -1163,7 +1163,7 @@ def run() -> int:
                 del_patch.object(deployer_mod, "run_command", side_effect=compose_run):
             stopped = deployer_mod.stop_task_containers(compose_task, log=lambda _m: None)
         check("compose 任务按固定项目名停止",
-              ["docker", "compose", "-p", "autodeploy-shop-web-7100", "down",
+              ["docker", "compose", "-p", "autodeploy-shop-web", "down",
                "--remove-orphans", "--timeout", "10"] in compose_calls)
         check("compose 停止返回本项目容器名", stopped == ["shop-web-1"])
         check("compose 停止不触碰他人或手工容器",
@@ -1967,20 +1967,26 @@ def run() -> int:
     section("Docker Compose 项目名")
     from app.deployer import _safe_task_slug
 
-    check("英文名直接使用", _safe_task_slug("tdcode-site", 1) == "tdcode-site-1")
-    check("中文名回退 task-<id>", _safe_task_slug("我的博客站点", 2) == "task-2")
-    check("混合字符被清洗", _safe_task_slug("a b  c--d!", 3) == "a-b-c-d-3")
-    check("空名回退 task-<id>", _safe_task_slug("", 4) == "task-4")
-    check("同 id 同名结果稳定", _safe_task_slug("x", 5) == _safe_task_slug("x", 5))
-    check("不同任务结果不同", _safe_task_slug("x", 5) != _safe_task_slug("x", 6))
+    check("英文名直接使用", _safe_task_slug("tdcode-site") == "tdcode-site")
+    check("中文名回退 task", _safe_task_slug("我的博客站点") == "task")
+    check("混合字符被清洗", _safe_task_slug("a b  c--d!") == "a-b-c-d")
+    check("空名回退 task", _safe_task_slug("") == "task")
+    check("同名结果稳定", _safe_task_slug("x") == _safe_task_slug("x"))
+    check("超长名截断到 40 字符", len(_safe_task_slug("a" * 80)) == 40)
     check("项目名不含非法字符",
-          all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in _safe_task_slug("A_b!C", 7)))
+          all(c in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in _safe_task_slug("A_b!C")))
+    from app.deployer import compose_project_name
+    check("项目名带 autodeploy 前缀且不含 id",
+          compose_project_name({"name": "calendar-backend", "id": 3})
+          == "autodeploy-calendar-backend")
 
     # 旧遗留容器识别：只清旧命名项目的冲突容器，不碰用户手工容器。
     import app.deployer as _deployer_mod
 
     conflict_out = ('Error response from daemon: Conflict. The container name "/web" '
-                    'is already in use by container "abc123"')
+                    'is already in use by container "abc123"; '
+                    'The container name "/other" is already in use; '
+                    'The container name "/renamed" is already in use')
     class _FakeRun:
         def __init__(self, listing):
             self.listing = listing
@@ -1994,15 +2000,18 @@ def run() -> int:
         "web\tcom.docker.compose.project=20260929-090855-6bf1c2f2_default\n"
         "mine\tcom.docker.compose.project=myproj\n"
         "manual\tno-labels\n"
-        "other\tcom.docker.compose.project=autodeploy-other-9\n")
+        "other\tcom.docker.compose.project=autodeploy-other-9\n"
+        "renamed\tcom.docker.compose.project=autodeploy-renamed-task\n")
     try:
         picked = _deployer_mod._conflicting_stale_containers(
-            conflict_out, "autodeploy-tdcode-site-1")
+            conflict_out, "autodeploy-tdcode-site")
     finally:
         _deployer_mod.run_command = original_run
-    check("识别旧命名项目的遗留容器", picked == ["web"], str(picked))
+    check("识别旧命名项目的遗留容器", "web" in picked, str(picked))
     check("不碰其他项目的容器", "mine" not in picked)
     check("不碰无标签的手工容器", "manual" not in picked)
+    check("识别历史带 id 项目与改名后旧项目的容器",
+          "other" in picked and "renamed" in picked, str(picked))
 
     # ------------------------------------------------------------------
     section("一键自我更新")
