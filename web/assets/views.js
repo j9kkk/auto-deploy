@@ -3107,6 +3107,18 @@ AD.views = {};
   let updateSession = null;
   const versionText = (v) => 'v' + String(v || '').replace(/^[vV]+/, '');
   const bareVersion = (v) => String(v || '').replace(/^[vV]+/, '');
+  // 本页面加载的 views.js 内容指纹：与 status.frontend_fingerprint 一致说明
+  // 运行的已是新前端，升级成功后不再要求刷新页面。
+  const pageViewsFingerprint = (() => {
+    try {
+      const scripts = document.querySelectorAll('script[src]');
+      for (const script of scripts) {
+        const match = /\/assets\/views\.js\?v=([0-9a-f]+)/.exec(script.getAttribute('src'));
+        if (match) return match[1];
+      }
+      return '';
+    } catch (err) { return ''; }
+  })();
   const UPD_STAGE_LABELS = {
     queued: '排队中', checking: '检查中', downloading: '下载中', backing_up: '备份代码',
     applying: '替换代码', dependencies: '更新依赖', pulling_image: '拉取镜像',
@@ -3411,7 +3423,11 @@ AD.views = {};
     } else if (unverified) {
       html += '<div class="alert warning">缺少目标版本及操作的完整确认，不能判定成功或自动刷新；可重新读取状态或检查更新。</div>';
     }
-    if (confirmed) {
+    // 页面已是新前端时刷新提示没有意义，只在「确认成功且页面仍是旧界面」时给出；
+    // 任一指纹缺失（旧后端 / 读取失败）都按旧行为提示刷新，宁可多刷不可漏刷。
+    const pageIsStale = !state.frontend_fingerprint || !pageViewsFingerprint
+      || pageViewsFingerprint !== state.frontend_fingerprint;
+    if (confirmed && pageIsStale) {
       html += '<div class="alert success" id="upd-done">版本已更新为 <strong class="mono">'
         + e(versionText(state.version || state.target_version)) + '</strong>，请刷新页面以加载新界面。'
         + '<div><button class="primary sm" id="upd-reload">刷新页面</button></div></div>';

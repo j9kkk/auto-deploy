@@ -1316,6 +1316,11 @@ def run() -> int:
         service.selfupdate._save_state({'stage': 'applying', 'log': ['测试日志'], 'operation_id': 'api-check'})
         response = client.get('/api/system/self-update/status')
         check('API 状态返回操作标识与日志', response.json()['active'] and response.json()['operation_id'] == 'api-check')
+        # 前端指纹：页面据此判断自己是否已是新界面，决定是否提示刷新。
+        from app.main import _asset_fingerprint as _fp
+        check('API 状态返回前端指纹且与 views.js 一致',
+              response.json().get('frontend_fingerprint') == _fp('views.js'),
+              str(response.json().get('frontend_fingerprint'))[:40])
         response = client.post(f'/api/tasks/{task_id}/run')
         check('API 更新期间拒绝新部署', response.status_code == 409)
         response = client.post(f'/api/tasks/{task_id}/rollback')

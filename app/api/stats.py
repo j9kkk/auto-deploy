@@ -311,6 +311,16 @@ def _upgrade_hint() -> str:
             "请使用一键脚本或 docker compose 拉取新镜像升级。")
 
 
+def _frontend_fingerprint() -> str:
+    """当前服务端 views.js 的内容指纹；与页面实际加载的指纹比对，
+    一致说明页面运行的就是新前端，升级成功提示不必再要求刷新。"""
+    try:
+        from ..main import _asset_fingerprint
+        return _asset_fingerprint("views.js")
+    except Exception:  # pragma: no cover - 导入失败时退化为要求刷新
+        return ""
+
+
 @router.get("/system/self-update/status")
 def self_update_status(
     service: Service = Depends(get_service),
@@ -328,6 +338,7 @@ def self_update_status(
         "run_mode": mode,
         "docker_available": mode == "docker",
         "upgrade_hint": _upgrade_hint(),
+        "frontend_fingerprint": _frontend_fingerprint(),
     }
 
 

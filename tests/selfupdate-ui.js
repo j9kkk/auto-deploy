@@ -41,6 +41,7 @@ function mockDom() {
       return out;
     }
     get isConnected() { return this.tag === 'document' || Boolean(this._parent); }
+    getAttribute(name) { return Object.hasOwn(this.attributes, name) ? this.attributes[name] : null; }
     get id_() { return undefined; }
     get clientHeight() { return this.attributes.id === 'upd-log' && this._visible() ? 120 : 0; }
     get scrollHeight() { return this.clientHeight ? Math.max(120, this.innerHTML.split('\n').length * 20) : 0; }
@@ -188,6 +189,8 @@ async function scenario(responses) {
       return { ok: !next.http, status: next.http || 200, json: async () => next };
     } };
   const flush = async () => { for (let n = 0; n < 30; n++) await Promise.resolve(); };
+  // 页面以带指纹的 script 标签加载 views.js：模拟真实 index.html 的指纹化 URL。
+  document.append(new Element('script', { src: '/assets/views.js?v=feedc0de1234' }));
   vm.runInNewContext(source, context);
   AD.renderUpdatePanel(panel);
   await flush();
@@ -314,6 +317,21 @@ const emptyHistory = { current_version: 'v1.4.0', run_mode: '', entries: [], bac
   assert.ok(reload, '确认完成后必须提供刷新入口');
   await reload.fire('click');
   assert.equal(test.reloads(), 1, '由用户点击刷新按钮才 reload');
+
+  // 页面已是新前端（指纹一致）：确认成功后不再显示刷新提示。
+  // 旧后端不带 frontend_fingerprint 字段，仍按旧行为提示刷新（见上方断言）。
+  test = await scenario([settings, emptyHistory,
+    { ...confirmed, frontend_fingerprint: 'feedc0de1234' }, nowLatest]);
+  assert.doesNotMatch(test.at('#upd-progress').innerHTML, /请刷新页面/,
+    '页面运行的已是新前端时不得再要求刷新');
+  assert.equal(test.at('#upd-reload'), null);
+  assert.match(test.at('#upd-progress').innerHTML, /已确认完成/, '成功状态本身仍要展示');
+
+  // 页面仍是旧前端（指纹不一致）：继续提示刷新。
+  test = await scenario([settings, emptyHistory,
+    { ...confirmed, frontend_fingerprint: 'deadbeef9999' }, nowLatest]);
+  assert.match(test.at('#upd-progress').innerHTML, /请刷新页面/);
+  assert.ok(test.at('#upd-reload'));
 
   // 旧记录 / 版本不符：不得伪装成功，也不得提供刷新按钮。
   // （跨容器重建后 PID 可能与旧进程相同，PID 一致不再作为失败证据，见下方正例。）
