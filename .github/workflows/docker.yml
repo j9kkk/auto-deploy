@@ -73,10 +73,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 解析上一发布版本 PREV：匿名 ls-remote 远端 v* 语义化 tag（剔除注解
-      # tag 的 ^{} 尾巴），去 v 前缀后按版本排序。本次是 v* tag 推送时取
-      # 小于当前 tag 的最大值，否则取最大值。解析失败（含远端无任何 v* tag、
-      # 当前 tag 之前没有历史版本）立即失败，不带病进入 E2E。
+      # 先登录 GHCR：下面的 PREV 解析要用 docker manifest inspect 探测镜像
+      # 是否存在，私有/受限仓库匿名查不到，必须带凭据。
+      - name: 登录 GHCR（拉取候选与历史镜像）
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 解析上一发布版本 PREV：取「镜像确实已发布到 GHCR」的最大 v* 语义化 tag。
+      # 只按 tag 取会踩坑：push main 与 push tag 并发时，最新 tag（如刚推的
+      # v0.3.6）的镜像要等 E2E 通过后才发布，此刻还不存在；若 PREV 选中它，
+      # 拉取必然失败。因此从高到低逐个 tag 验证镜像存在（docker manifest
+      # inspect），选第一个可用的；全部不可用才报错。
       - name: 解析上一发布版本（PREV）
         id: prev
         run: |
@@ -85,36 +95,29 @@ jobs:
             | awk '{print $2}' \
             | sed -e 's|^refs/tags/||' -e 's/\^{}$//' \
             | grep -E '^v[0-9]+(\.[0-9]+)*$' \
-            | sort -uV)" || true
+            | sort -uV -r)" || true
           if [ -z "${TAGS}" ]; then
             echo "::error::远端不存在任何 v* 语义化 tag，无法确定上一发布版本 PREV（首次发版请先手动发布一个版本标签）"
             exit 1
           fi
           CURRENT="${GITHUB_REF_NAME}"
           PREV=""
-          if [[ "${CURRENT}" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
-            while IFS= read -r t; do
-              if [ "$(printf '%s\n%s\n' "${t#v}" "${CURRENT#v}" | sort -V | head -n1)" = "${t#v}" ] \
-                 && [ "${t#v}" != "${CURRENT#v}" ]; then
-                PREV="${t}"
-              fi
-            done <<< "${TAGS}"
-            if [ -z "${PREV}" ]; then
-              echo "::error::不存在小于 ${CURRENT} 的历史版本 tag，无法确定上一发布版本 PREV"
-              exit 1
+          while IFS= read -r t; do
+            [ -n "${t}" ] || continue
+            # 排除当前正在发布的 tag：它的镜像此刻尚未发布。
+            [ "${t}" = "${CURRENT}" ] && continue
+            VER="${t#v}"
+            if docker manifest inspect "ghcr.io/j9kkk/auto-deploy:${VER}" >/dev/null 2>&1; then
+              PREV="${t}"
+              break
             fi
-          else
-            PREV="$(printf '%s\n' "${TAGS}" | tail -n1)"
+          done <<< "${TAGS}"
+          if [ -z "${PREV}" ]; then
+            echo "::error::没有任何 v* tag 的镜像已发布到 GHCR，无法确定上一发布版本 PREV"
+            exit 1
           fi
           echo "PREV_TAG=${PREV}"
           echo "prev=${PREV}" >> "${GITHUB_OUTPUT}"
-
-      - name: 登录 GHCR（拉取候选与历史镜像）
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 运行升级 E2E
         env:
