@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -864,14 +865,29 @@ def run() -> int:
         check("健康检查无需登录", response.status_code == 200)
         check("健康检查返回 ok", response.json().get("status") == "ok")
 
-        # 首页资产 URL 的 ?v= 必须跟随当前版本：曾写死 0.3.0，升级后浏览器
-        # 命中同名 URL 的旧缓存，用户看不到新前端。
-        from app import __version__ as ui_asset_version
+        # 首页资产 URL 的 ?v= 必须是各文件的内容指纹：曾写死 0.3.0，升级后
+        # 浏览器命中同名 URL 的旧缓存；只跟随版本号时，同一版本内迭代前端
+        # 同样看不到改动。内容指纹让任一资产变化其 URL 立即改变。
         response = client.get("/")
         check("首页正常返回 HTML", response.status_code == 200
               and "text/html" in response.headers.get("content-type", ""))
-        check("首页资产版本跟随当前版本",
-              f"?v={ui_asset_version}" in response.text and "__VERSION__" not in response.text)
+        html = response.text
+        check("首页资产占位符已全部替换", "__VERSION__" not in html)
+        versions = re.findall(r"/assets/[A-Za-z0-9._-]+\?v=([^\"']+)", html)
+        check("首页四个资产都带版本参数", len(versions) == 4, str(versions))
+        check("资产版本为内容指纹而非纯版本号",
+              all(re.fullmatch(r"[0-9a-f]{12}", v) for v in versions), str(versions))
+        check("不同资产指纹各自独立且非空", len(set(versions)) >= 1 and all(versions), str(versions))
+        # 指纹必须真的来自文件内容：与直接对文件求 sha256[:12] 一致。
+        import hashlib as _hashlib
+        from app import config as _asset_config
+        expected = {}
+        for rel in ("style.css", "util.js", "views.js", "app.js"):
+            blob = (_asset_config.WEB_DIR / "assets" / rel).read_bytes()
+            expected[rel] = _hashlib.sha256(blob).hexdigest()[:12]
+        paired = dict(re.findall(r"/assets/([A-Za-z0-9._-]+)\?v=([^\"']+)", html))
+        check("资产指纹与文件内容哈希一致",
+              paired == expected, f"{paired} != {expected}")
 
         response = client.get("/api/tasks")
         check("未登录访问被拒绝", response.status_code == 401)

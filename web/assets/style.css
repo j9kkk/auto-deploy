@@ -668,4 +668,32 @@ tr.row-disabled .row-actions { opacity: 1; }
   .table-wrap { margin: 0 -12px; padding: 0 12px; }
   .modal-backdrop { padding: 14px 10px; }
   .modal-body { max-height: 78vh; }
+
+  /* 任务列表在窄屏改为卡片式。原因：.task-table 是 table-layout:fixed +
+     width:100%（桌面端为避免展开/收起时重算列宽抖动而固定），7 列被硬压进
+     一屏，列头文字溢出压到相邻列、单元格内容被裁切，而 .table-wrap 的
+     overflow-x 因表格永不超宽而失效。卡片式每行一卡、标签内联，无需横向
+     滚动；桌面端表格布局完全不受影响。 */
+  .task-table { display: block; table-layout: auto; width: 100%; }
+  .task-table thead { display: none; }
+  .task-table tbody { display: block; }
+  .task-table tbody tr[data-task-row] {
+    display: block; padding: 12px 14px; margin-bottom: 10px;
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  }
+  .task-table tbody tr[data-task-row] > td {
+    display: block; width: auto; padding: 3px 0; border: none; overflow: visible;
+  }
+  /* 除任务名外的单元格：左标签、右值，标签文本取自 data-label。 */
+  .task-table td[data-label]:not(.task-name-cell) { display: flex; align-items: baseline; gap: 10px; }
+  .task-table td[data-label]:not(.task-name-cell)::before {
+    content: attr(data-label); flex: 0 0 72px; color: var(--text-dim); font-size: 12px;
+  }
+  .task-table td.task-name-cell { padding: 0 0 8px; }
+  /* 操作按钮横排靠左，避免固定列宽下的挤压。 */
+  .task-table .row-actions { justify-content: flex-start; }
+  /* 展开的日志行同样是块级，但不套卡片外观。 */
+  .task-table tbody tr.expand-row { display: block; margin: -6px 0 10px; }
+  .task-table tbody tr.expand-row > td { display: block; width: auto; }
+  .task-expand { padding: 12px 14px 14px; }
 }

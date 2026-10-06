@@ -738,6 +738,30 @@ function styleChecks() {
   const name = rule('.task-name-link'); assert.match(name, /font-size:\s*15px;/);
   assert.match(name, /font-weight:\s*700;/); assert.match(name, /color:\s*var\(--accent-hover\);/);
   assert.match(css, /--accent-hover:\s*#6ba1ff;/);
+
+  // 窄屏卡片化契约：桌面端固定表格布局必须保留，移动端改为块级卡片。
+  assert.match(rule('.task-table'), /table-layout:\s*fixed;/);
+  // 移动端规则位于 760px 媒体查询内：抽取该块后逐条断言。
+  const mobile = css.match(/@media\s*\(max-width:\s*760px\)\s*\{([\s\S]*?)\n\}/);
+  assert.ok(mobile, '缺少 760px 移动端媒体查询');
+  const mobileCss = mobile[1];
+  for (const [selector, pattern] of [
+    ['.task-table', /display:\s*block;/],
+    ['.task-table', /table-layout:\s*auto;/],
+    ['.task-table thead', /display:\s*none;/],
+    ['.task-table tbody tr[data-task-row]', /display:\s*block;/],
+    ['.task-table td[data-label]:not(.task-name-cell)::before', /content:\s*attr\(data-label\);/],
+  ]) {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const found = mobileCss.match(new RegExp('(?:^|\\n)\\s*' + escaped + '\\s*\\{([^}]+)\\}'));
+    assert.ok(found, '移动端缺少样式规则：' + selector);
+    assert.match(found[1], pattern, '移动端 ' + selector + ' 缺少：' + pattern);
+  }
+  // 每个任务单元格都必须带 data-label，否则卡片模式下标签缺失。
+  const labels = source.match(/data-label="([^"]+)"/g) || [];
+  for (const label of ['任务', '状态', '调度', '部署方式', '最近运行', '下次执行', '操作']) {
+    assert.ok(labels.includes('data-label="' + label + '"'), '任务行缺少 data-label="' + label + '"');
+  }
 }
 
 (async () => {

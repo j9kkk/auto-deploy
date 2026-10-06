@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
+import re
 import sys
 import threading
 import webbrowser
@@ -161,26 +163,79 @@ def create_app(service: Service | None = None) -> FastAPI:
     return app
 
 
-# 渲染后的首页缓存：键为 index.html 的 (mtime_ns, size)，文件没变就不重读重替换。
-_index_cache: tuple[tuple[int, int], str] | None = None
+# 渲染后的首页缓存：键为 index.html 与各资产的修改状态；都没变就直接复用。
+_index_cache: tuple[tuple[object, ...], str] | None = None
+
+# 资产内容指纹缓存：{相对路径: (mtime_ns, size, 短哈希)}。同一发布版本内改动
+# 前端文件时，仅靠版本号无法让浏览器失效缓存（URL 不变）；按内容取指纹后每个
+# 文件独立命名，改哪个哪个 URL 就变。
+_asset_fingerprints: dict[str, tuple[int, int, str]] = {}
+
+
+def _asset_fingerprint(name: str) -> str:
+    """资产内容的短哈希（前 12 位）；按 (mtime_ns, size) 缓存，避免重复读文件。"""
+    path = config.WEB_DIR / "assets" / name
+    try:
+        stat = path.stat()
+    except OSError:
+        return app_version
+    cached = _asset_fingerprints.get(name)
+    if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2]
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    except OSError:
+        return app_version
+    _asset_fingerprints[name] = (stat.st_mtime_ns, stat.st_size, digest)
+    return digest
+
+
+def _render_index(html: str) -> str:
+    """把 index.html 的 __VERSION__ 占位符替换为各资产的内容指纹。
+
+    占位符位于资产路径（``/assets/x.js?v=__VERSION__``）：逐个资产取内容哈希，
+    文件缺失时回退版本号，保证占位符永远有值。
+    """
+    def replace(match: re.Match[str]) -> str:
+        return match.group(1) + _asset_fingerprint(match.group(2))
+
+    return re.sub(r"(/assets/([A-Za-z0-9._-]+)\?v=)__VERSION__", replace, html)
+
+
+def _asset_state_key() -> tuple[object, ...]:
+    """assets 目录下所有文件的 (名字, mtime_ns, size)，作为渲染缓存的判据。"""
+    assets = config.WEB_DIR / "assets"
+    try:
+        entries = sorted(assets.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return ()
+    state: list[object] = []
+    for entry in entries:
+        try:
+            if entry.is_file():
+                stat = entry.stat()
+                state.append((entry.name, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            continue
+    return tuple(state)
 
 
 def _index_response() -> Response:
-    """首页 HTML；资产 URL 的 ?v= 占位符替换为当前版本。
+    """首页 HTML；资产 URL 的 ?v= 占位符替换为各文件的内容指纹。
 
-    版本号曾长期写死在 index.html（0.3.0），升级后 URL 不变，浏览器一直
-    命中旧缓存，用户看不到新前端。跟随 app.__version__ 后，每次发版资产
-    URL 自然变化，缓存随之失效。
+    版本号曾长期写死在 index.html（0.3.0），升级后 URL 不变，浏览器一直命中
+    旧缓存，用户看不到新前端；只跟随版本号时，同一版本内迭代前端的改动同样
+    看不到。改为内容指纹后，任何资产内容变化其 URL 都随之改变；文件缺失时
+    回退版本号，占位符始终有值。
     """
     global _index_cache
     index = config.WEB_DIR / "index.html"
     if not index.exists():  # pragma: no cover - guarded by create_app
         return JSONResponse(status_code=500, content={"ok": False, "detail": "缺少 index.html"})
     stat = index.stat()
-    key = (stat.st_mtime_ns, stat.st_size)
+    key = (stat.st_mtime_ns, stat.st_size, _asset_state_key())
     if _index_cache is None or _index_cache[0] != key:
-        html = index.read_text(encoding="utf-8")
-        _index_cache = (key, html.replace("__VERSION__", app_version))
+        _index_cache = (key, _render_index(index.read_text(encoding="utf-8")))
     return Response(content=_index_cache[1], media_type="text/html; charset=utf-8")
 
 

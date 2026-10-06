@@ -26,3 +26,4 @@ Thumbs.db
 .local-run/
 docker-compose.override.yml
 .zcode/
+.zcodeignore

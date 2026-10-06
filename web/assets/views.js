@@ -431,7 +431,7 @@ AD.views = {};
                  title="启用调度" aria-label="启用调度">${ICONS.enable}</button>`;
 
     return `<tr data-task-row="${task.id}" class="${task.enabled ? '' : 'row-disabled'}">
-      <td class="task-name-cell">
+      <td class="task-name-cell" data-label="任务">
         <button type="button" class="task-name-link" data-task-edit="${task.id}"
                 title="点击编辑任务">${e(task.name)}</button>
         ${task.description ? `<div class="faint truncate" title="${a(task.description)}">${e(task.description)}</div>` : ''}
@@ -439,12 +439,12 @@ AD.views = {};
           ${e(task.repo_url)}<span class="dim"> @${e(task.repo_branch)}</span>
         </div>
       </td>
-      <td>${statusBadge}<div class="faint" style="margin-top:3px">${stats}</div></td>
-      <td class="mono" style="font-size:11.5px">${e(task.schedule_expression || '—')}</td>
-      <td><span class="badge neutral">${e(methodLabel(task.deploy_method))}</span></td>
-      <td class="nowrap">${lastRun}</td>
-      <td class="nowrap">${nextRun}</td>
-      <td>
+      <td data-label="状态">${statusBadge}<div class="faint" style="margin-top:3px">${stats}</div></td>
+      <td class="mono" data-label="调度" style="font-size:11.5px">${e(task.schedule_expression || '—')}</td>
+      <td data-label="部署方式"><span class="badge neutral">${e(methodLabel(task.deploy_method))}</span></td>
+      <td class="nowrap" data-label="最近运行">${lastRun}</td>
+      <td class="nowrap" data-label="下次执行">${nextRun}</td>
+      <td data-label="操作">
         <div class="table-actions row-actions">
           <button class="icon-btn scroll-btn${expanded ? ' active' : ''}" data-task-log="${task.id}"
                   title="${expanded ? '收起日志' : '展开最近日志'}"
