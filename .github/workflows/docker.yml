@@ -1,5 +1,5 @@
 # AutoDeploy 镜像发布三段流水线：候选构建 → 真实升级 E2E → 正式发布。
-# 1) build-candidate：构建 linux/amd64 候选镜像，推送到 GHCR 的 e2e-<sha> 候选标签；
+# 1) build-candidate：构建 linux/amd64 候选镜像，推送到 GHCR 的 e2e-<run_id> 候选标签；
 # 2) e2e：用上一发布版本真实安装，经面板 API 升级到候选版本再回退，
 #    逐跳断言版本切换与配置数据保留（scripts/ci/e2e-upgrade.sh）；
 # 3) publish / release：E2E 全部通过后才发布正式镜像与 Release
@@ -54,13 +54,13 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ${{ env.REGISTRY_IMAGE }}:e2e-${{ github.sha }}
+          tags: ${{ env.REGISTRY_IMAGE }}:e2e-${{ github.run_id }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: 记录候选镜像标签
         id: candidate
-        run: echo "tag=${REGISTRY_IMAGE}:e2e-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=${REGISTRY_IMAGE}:e2e-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
 
   e2e:
     name: 真实升级 E2E（安装上一版本 → 面板升级 → 回退）
