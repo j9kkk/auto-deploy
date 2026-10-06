@@ -1607,6 +1607,51 @@ def run() -> int:
               client.post(f"/api/webhooks/999999/{webhook_secret}").status_code == 404)
         check("非数字任务号返回 404", client.post("/api/webhooks/abc/xyz").status_code == 404)
 
+        # --- 暂停任务的触发准入 ----------------------------------------
+        runs_before = client.get("/api/runs").json()["total"]
+        toggle_resp = client.post(f"/api/tasks/{webhook_id}/toggle")
+        check("暂停 Webhook 测试任务", toggle_resp.status_code == 200
+              and toggle_resp.json()["enabled"] is False, toggle_resp.text[:150])
+        paused_resp = client.post(webhook_path)
+        check("暂停任务 Webhook 返回 409", paused_resp.status_code == 409,
+              paused_resp.text[:150])
+        runs_after_pause = client.get("/api/runs").json()["total"]
+        check("暂停任务 Webhook 未产生运行", runs_after_pause == runs_before,
+              f"{runs_before} -> {runs_after_pause}")
+        manual_resp = client.post(f"/api/tasks/{webhook_id}/run")
+        check("暂停任务仍可手动触发",
+              manual_resp.status_code == 200 and manual_resp.json()["run_id"] > 0,
+              manual_resp.text[:150])
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            manual_status = client.get(f"/api/runs/{manual_resp.json()['run_id']}").json()["run"]["status"]
+            if manual_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        audit_entries = client.get("/api/audit").json().get("entries", [])
+        rejected = [e for e in audit_entries
+                    if e["action"] == "webhook_rejected" and e["target"] == f"task:{webhook_id}"]
+        check("暂停 Webhook 调用已写入操作日志", bool(rejected),
+              str(audit_entries[:3])[:200])
+        check("被拒记录不含触发令牌",
+              rejected and webhook_secret not in (rejected[0].get("detail") or ""))
+        auth_failed = [e for e in audit_entries if e["action"] == "webhook_auth_failed"]
+        check("鉴权失败调用已写入操作日志", bool(auth_failed))
+        client.post(webhook_path + "x")  # 再触发一次鉴权失败，保证上方记录存在
+
+        toggle_resp = client.post(f"/api/tasks/{webhook_id}/toggle")
+        check("恢复启用 Webhook 测试任务", toggle_resp.status_code == 200
+              and toggle_resp.json()["enabled"] is True, toggle_resp.text[:150])
+        resumed_resp = client.post(webhook_path)
+        check("恢复启用后 Webhook 立即可触发", resumed_resp.status_code == 200,
+              resumed_resp.text[:150])
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            resumed_status = client.get(f"/api/runs/{resumed_resp.json()['run_id']}").json()["run"]["status"]
+            if resumed_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+
         service.selfupdate._save_state({"stage": "applying", "log": [], "operation_id": "wh-check"})
         response = client.post(webhook_path)
         check("自更新期间 Webhook 拒绝触发", response.status_code == 409)

@@ -1214,7 +1214,7 @@ AD.views = {};
             <button type="button" class="ghost" id="webhook-copy">复制</button>
             <button type="button" class="ghost" id="webhook-reset">重新生成</button>
           </div>
-          <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。</div>
+          <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。任务暂停期间该地址不可用，调用会被拒绝并记录在操作日志中。</div>
         </div>
       </div>` : `
       <div class="hint" style="margin:-6px 0 12px">任务创建后自动生成 Webhook 触发地址（向它发请求即触发部署），可在编辑页复制使用。</div>`}
@@ -2668,6 +2668,8 @@ AD.views = {};
       admin_bootstrapped: '初始化管理员', task_created: '创建任务', task_updated: '更新任务',
       task_deleted: '删除任务', task_toggled: '启停任务', task_files_cleaned: '清理任务文件',
       run_triggered: '触发运行', run_dispatched: '调度运行', run_cancelled: '取消运行',
+      webhook_rejected: 'Webhook 调用被拒（任务已暂停）', webhook_auth_failed: 'Webhook 鉴权失败',
+      webhook_rate_limited: 'Webhook 触发被限流（并发已满）',
       run_deleted: '删除记录', run_interrupted: '运行中断', rollback: '回滚',
       settings_updated: '更新设置', maintenance_run: '执行清理', sessions_revoked: '撤销会话',
     };

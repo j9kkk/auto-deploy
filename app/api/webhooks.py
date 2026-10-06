@@ -3,7 +3,8 @@
 安全模型与登录接口完全不同：没有会话，只有每个任务一个 32 字节随机令牌，
 拼在路径里（``/api/webhooks/{task_id}/{secret}``）。因此所有失败——任务不
 存在、令牌为空、令牌不匹配——都必须返回同一个 404，避免向探测者泄露任何
-任务存在性信息；比对用常量时间函数，防止逐字节猜测令牌。
+任务存在性信息；比对用常量时间函数，防止逐字节猜测令牌。鉴权通过后的失败
+不再隐藏原因：任务已暂停返回 409（本次调用写入审计），并发满返回 429。
 
 端点只做鉴权、准入检查与派发编排，部署逻辑一律走 ``scheduler.run_now``，
 与手动触发共享同一条链路（并发上限、自更新封锁、运行记录都由此保证）。
@@ -49,9 +50,28 @@ def trigger_webhook(
     if row is None or not stored or not hmac.compare_digest(
         stored.encode("utf-8"), secret.encode("utf-8")
     ):
+        audit(
+            service, "webhook_auth_failed", actor="webhook", target=f"task:{task_id_num}",
+            ip=client_ip(request),
+        )
         raise _not_found()
 
+    # 鉴权已通过，可放心暴露具体原因；暂停任务拒绝一切自动触发。
+    if not (row or {}).get("enabled"):
+        audit(
+            service, "webhook_rejected", actor="webhook", target=f"task:{task_id_num}",
+            detail="reason:task_paused", ip=client_ip(request),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="任务已暂停，Webhook 触发被拒绝",
+        )
+
     if service.store.runs.count_active() >= service.settings.max_global_workers:
+        audit(
+            service, "webhook_rate_limited", actor="webhook", target=f"task:{task_id_num}",
+            ip=client_ip(request),
+        )
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"并发运行数已达上限（{service.settings.max_global_workers}），请稍后再试",
