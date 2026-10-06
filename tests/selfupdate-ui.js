@@ -210,14 +210,17 @@ const idle = { stage: 'idle', active: false, can_rollback: false, current_versio
 const settings = { settings: { update_repo: 'https://github.com/j9kkk/auto-deploy.git' }, proxy_description: '未启用' };
 const noUpdate = { current: 'v1.4.0', latest: 'v1.4.0', update_available: false, error: '' };
 const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true, error: '' };
+// 预载历史响应：打开卡片即请求一次升级历史（供「回退 ▾」菜单使用），默认空历史。
+const emptyHistory = { current_version: 'v1.4.0', run_mode: '', entries: [], backups: [] };
 
 (async () => {
   // --- 打开即检查：读设置（确认弹窗的更新源说明用）、读状态（判断是否已有操作在进行）、
   //     再自动检查一次。
-  let test = await scenario([settings, idle, noUpdate]);
+  let test = await scenario([settings, emptyHistory, idle, noUpdate]);
   assert.deepEqual(test.requests.map(r => r.url),
-    ['/api/settings', '/api/system/self-update/status', '/api/system/update/check'],
-    '打开卡片应先读设置与状态，并自动检查一次（不带 force）');
+    ['/api/settings', '/api/system/self-update/history', '/api/system/self-update/status',
+      '/api/system/update/check'],
+    '打开卡片应先读设置与预载历史，再读状态并自动检查一次（不带 force）');
   const rowHtml = test.at('#upd-row').innerHTML;
   assert.match(rowHtml, /当前版本 <strong class="mono">v1\.4\.0/);
   assert.match(rowHtml, /当前已是最新版本/, '已是最新时给出明确提示');
@@ -229,7 +232,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.ok(test.at('#upd-history') && test.at('#upd-config'), '升级日志与配置始终可见');
 
   // --- 有更新：显示最新版本号 + 升级图标，且不显示「已是最新」。
-  test = await scenario([settings, idle, hasUpdate]);
+  test = await scenario([settings, emptyHistory, idle, hasUpdate]);
   assert.match(test.at('#upd-row').innerHTML, /最新版本 <strong class="mono">v1\.5\.0/);
   assert.doesNotMatch(test.at('#upd-row').innerHTML, /当前已是最新版本/);
   // 后端一次检查最坏 = Releases API(15s) + git ls-remote(30s)，前端的 abort 预算
@@ -252,15 +255,24 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.equal(start.options.method, 'POST');
   assert.equal(JSON.parse(start.options.body).target_version, 'v1.5.0');
 
+  // Docker 形态的升级确认：只承诺可验证的行为（备份 .env、记录旧镜像、异常自动恢复），
+  // 不再承诺不可靠的「旧容器不受影响，可一键回退」。
+  test = await scenario([settings, emptyHistory, { ...idle, run_mode: 'docker' }, hasUpdate]);
+  await test.click('#upd-upgrade');
+  assert.match(test.confirms[0].detail, /切换前会备份 \.env 并记录旧镜像/);
+  assert.match(test.confirms[0].detail, /启动异常时自动恢复旧版本；恢复失败时界面会给出人工处理指引/);
+  assert.doesNotMatch(test.confirms[0].detail, /旧容器不受影响/, '不得承诺不可靠的「旧容器不受影响」');
+
   // 确认后进入进度视图：进度日志原地重建，页面不重绘。
   // 日志要有足够行数，否则「离底部 40px」在模拟尺寸里会被判成「贴着底部」。
   const baseLog = Array.from({ length: 20 }, (_, i) => '[10:00:0' + (i % 10) + '] 步骤 ' + i);
   const progress = { stage: 'downloading', active: true, operation: 'update', operation_id: 'op-1',
     target_version: 'v1.5.0', current_version: 'v1.4.0', log: baseLog };
   test.requests.length = 0;
-  test = await scenario([settings, progress]);
+  test = await scenario([settings, emptyHistory, progress]);
   assert.equal(test.requests[0].url, '/api/settings');
-  assert.equal(test.requests[1].url, '/api/system/self-update/status');
+  assert.equal(test.requests[1].url, '/api/system/self-update/history');
+  assert.equal(test.requests[2].url, '/api/system/self-update/status');
   assert.match(test.at('#upd-progress').innerHTML, /当前操作状态：下载中/);
   assert.match(test.at('#upd-progress').innerHTML, /目标版本 v1\.5\.0/);
   assert.match(test.at("#upd-progress").innerHTML, /步骤 0/);
@@ -290,7 +302,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
     target_version: 'v1.5.0', log: ['[10:00:05] 启动后已确认操作及目标版本运行'] };
   // 重查时服务已运行新版本，所以「已是最新」；沿用重启前的旧结果会显示可升级到已装版本。
   const nowLatest = { current: 'v1.5.0', latest: 'v1.5.0', update_available: false, error: '' };
-  test = await scenario([settings, confirmed, nowLatest]);
+  test = await scenario([settings, emptyHistory, confirmed, nowLatest]);
   assert.equal(test.reloads(), 0, '确认完成不得自动整页刷新');
   assert.match(test.at('#upd-progress').innerHTML, /版本已更新为 <strong class="mono">v1\.5\.0/);
   assert.match(test.at('#upd-progress').innerHTML, /请刷新页面/);
@@ -304,24 +316,31 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.equal(test.reloads(), 1, '由用户点击刷新按钮才 reload');
 
   // 旧记录 / 版本不符：不得伪装成功，也不得提供刷新按钮。
+  // （跨容器重建后 PID 可能与旧进程相同，PID 一致不再作为失败证据，见下方正例。）
   for (const mismatch of [
     { ...confirmed, current_version: 'v1.4.0' },
     { ...confirmed, boot_id: 'old' },
-    { ...confirmed, pid: 1 },
     { ...confirmed, confirmed_operation_id: undefined },
     { stage: 'unverified', active: false, notice: '历史记录缺少完整身份证据', log: [] },
   ]) {
-    test = await scenario([settings, mismatch, noUpdate]);
+    test = await scenario([settings, emptyHistory, mismatch, noUpdate]);
     assert.equal(test.reloads(), 0);
     assert.equal(test.at('#upd-reload'), null, '未确认成功不得给刷新入口');
     assert.doesNotMatch(test.at('#upd-progress').innerHTML, /已确认完成/);
   }
-  test = await scenario([settings, { stage: 'unverified', active: false, notice: '历史记录缺少完整身份证据', log: [] }, noUpdate]);
+  test = await scenario([settings, emptyHistory, { stage: 'unverified', active: false, notice: '历史记录缺少完整身份证据', log: [] }, noUpdate]);
   assert.match(test.at('#upd-progress').innerHTML, /历史操作未确认/);
+
+  // PID 相同也确认成功：跨容器重建后新旧进程 PID 可能重复，不再阻断确认。
+  test = await scenario([settings, emptyHistory, { ...confirmed, pid: 1 }, nowLatest]);
+  assert.match(test.at('#upd-progress').innerHTML, /版本已更新为 <strong class="mono">v1\.5\.0/);
+  // 后端未给出 expected_version 时不做版本一致性校验，不阻断确认。
+  test = await scenario([settings, emptyHistory, { ...confirmed, expected_version: '' }, nowLatest]);
+  assert.match(test.at('#upd-progress').innerHTML, /版本已更新为/);
 
   // --- 检查失败：可见原因、提供重试，且不显示升级入口。
   for (const failure of [{ error: '更新源不可达', current: 'v1.4.0', latest: '', update_available: false }, { http: 500 }]) {
-    test = await scenario([settings, idle, failure]);
+    test = await scenario([settings, emptyHistory, idle, failure]);
     assert.match(test.at('#upd-row').innerHTML, /检查失败/);
     assert.equal(test.at('#upd-upgrade'), null, '检查失败不得沿用上次的升级入口');
     assert.ok(test.at('#upd-recheck'), '检查失败必须能重试');
@@ -329,18 +348,113 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   }
 
   // --- 重试走 force，且成功后升级入口出现（覆盖旧的失败结果）。
-  test = await scenario([settings, idle, { error: '更新源不可达', latest: '' }]);
+  test = await scenario([settings, emptyHistory, idle, { error: '更新源不可达', latest: '' }]);
   test.requests.length = 0;
   await test.click('#upd-recheck');
   assert.equal(test.requests[0].url, '/api/system/update/check?force=true');
 
   // --- 升级失败：明确失败状态，并保留日志。
-  test = await scenario([settings, { stage: 'failed', active: false, operation: 'update', operation_id: 'op-9',
+  test = await scenario([settings, emptyHistory, { stage: 'failed', active: false, operation: 'update', operation_id: 'op-9',
     error: '依赖安装失败', target_version: 'v1.5.0', current_version: 'v1.4.0', log: ['[10:00:01] 失败日志'] }, noUpdate]);
   assert.equal(test.at('#upd-operation').attributes.class, 'alert error');
   assert.match(test.at('#upd-progress').innerHTML, /依赖安装失败/);
   assert.match(test.at('#upd-progress').innerHTML, /失败日志/);
   test.timers.clear();
+
+  // --- 委托执行器新模型：步骤条为 拉取 → 执行器运行 → 验证；
+  //     preparing/prepared/switching 折叠到「升级执行器运行中」一步。
+  const executorLog = Array.from({ length: 20 }, (_, i) => '[11:00:0' + (i % 10) + '] 执行器 ' + i);
+  const dockerSteps = { run_mode: 'docker', target_version: 'v1.5.0', current_version: 'v1.4.0', log: executorLog };
+  test = await scenario([settings, emptyHistory,
+    { stage: 'executing', active: true, operation: 'update', operation_id: 'op-e1',
+      restart: 'docker-executor', ...dockerSteps }]);
+  const stepsHtml = test.at('#upd-steps').innerHTML;
+  assert.match(stepsHtml, /拉取镜像/);
+  assert.match(stepsHtml, /升级执行器运行中/);
+  assert.match(stepsHtml, /验证新版本/);
+  assert.doesNotMatch(stepsHtml, /重建容器/, '新模型步骤条不再包含重建容器');
+
+  test = await scenario([settings, emptyHistory,
+    { stage: 'preparing', active: true, operation: 'update', operation_id: 'op-e2', ...dockerSteps }]);
+  assert.match(test.at('#upd-steps').innerHTML,
+    /upd-step current"><span class="upd-step-dot"><\/span>升级执行器运行中/,
+    'preparing 应折叠到「升级执行器运行中」一步');
+
+  // 旧版本写入的 docker-recreate 记录仍用旧步骤序列（拉取 → 重建 → 重启）。
+  test = await scenario([settings, emptyHistory,
+    { stage: 'recreating', active: true, operation: 'update', operation_id: 'op-old', restart: 'docker-recreate',
+      target_version: 'v1.5.0', current_version: 'v1.4.0', log: executorLog }]);
+  assert.match(test.at('#upd-steps').innerHTML, /重建容器/);
+  assert.doesNotMatch(test.at('#upd-steps').innerHTML, /升级执行器运行中/);
+
+  // --- attention：警示 tone + 三个出口；继续等待后就地合并新状态，不另起轮询
+  //     （attention 阶段 active=true，原有轮询循环本就持续 setTimeout）。
+  const attentionState = { stage: 'attention', active: true, delegated: true, operation: 'update',
+    operation_id: 'op-e3', from_image_ref: 'ghcr.io/j9kkk/auto-deploy:v1.4.0',
+    to_image_ref: 'ghcr.io/j9kkk/auto-deploy:v1.5.0', ...dockerSteps };
+  test = await scenario([settings, emptyHistory, attentionState]);
+  assert.equal(test.at('#upd-operation').attributes.class, 'alert warning', 'attention 主提示为警示 tone');
+  assert.ok(test.at('#upd-attention-restore'), 'attention 必须提供恢复旧版本按钮');
+  assert.ok(test.at('#upd-attention-wait'), 'attention 必须提供继续等待按钮');
+  assert.ok(test.at('#upd-attention-resolve'), 'attention 必须提供我已手动处理按钮');
+  const timersBeforeWait = test.timers.size;
+  test.push({ ok: true, state: { stage: 'executing', active: true, operation: 'update', operation_id: 'op-e3',
+    ...dockerSteps } });
+  await test.click('#upd-attention-wait');
+  const waitCall = test.requests.find(r => r.url === '/api/system/self-update/attention');
+  assert.ok(waitCall, '继续等待必须请求 attention 端点');
+  assert.equal(waitCall.options.method, 'POST');
+  assert.deepEqual(JSON.parse(waitCall.options.body), { action: 'wait' });
+  assert.match(test.at('#upd-operation').innerHTML, /升级执行器运行中/, '等待后就地合并新状态');
+  assert.equal(test.timers.size, timersBeforeWait, 'attention 交互不得另起一路轮询');
+  test.AD.stopUpdatePanel();
+
+  // attention 的恢复入口：确认后按升级前镜像引用回退（target_image）。
+  test = await scenario([settings, emptyHistory, attentionState]);
+  test.push({ state: { stage: 'switching', active: true, operation: 'rollback', operation_id: 'op-r1',
+    run_mode: 'docker', from_image_ref: 'ghcr.io/j9kkk/auto-deploy:v1.4.0',
+    target_version: 'v1.4.0', current_version: 'v1.4.0', log: [] } });
+  await test.click('#upd-attention-restore');
+  assert.equal(test.confirms.length, 1, '恢复旧版本必须弹二次确认');
+  const attentionRestore = test.requests.find(r => r.url === '/api/system/self-update/rollback');
+  assert.ok(attentionRestore, '确认后按旧镜像引用发起 rollback');
+  assert.equal(JSON.parse(attentionRestore.options.body).target_image, 'ghcr.io/j9kkk/auto-deploy:v1.4.0');
+  assert.equal(JSON.parse(attentionRestore.options.body).target_version, 'v1.4.0');
+  test.AD.stopUpdatePanel();
+
+  // --- recovery_required：错误 tone + 恢复/人工处理两个按钮（无继续等待）。
+  test = await scenario([settings, emptyHistory,
+    { stage: 'recovery_required', active: true, delegated: true, operation: 'update', operation_id: 'op-e4',
+      from_image_ref: 'ghcr.io/j9kkk/auto-deploy:v1.4.0', error: '执行器异常退出且自动恢复失败', ...dockerSteps }]);
+  assert.equal(test.at('#upd-operation').attributes.class, 'alert error', 'recovery_required 主提示为错误 tone');
+  assert.ok(test.at('#upd-recovery-restore'), 'recovery_required 必须提供恢复旧版本按钮');
+  assert.ok(test.at('#upd-recovery-resolve'), 'recovery_required 必须提供我已手动处理按钮');
+  assert.equal(test.at('#upd-attention-wait'), null, 'recovery_required 不提供继续等待');
+  assert.equal(test.at('#upd-failed-rollback'), null, '协同阶段不重复渲染通用失败回退按钮');
+  test.push({ ok: true, state: { stage: 'failed', active: false, operation: 'update', operation_id: 'op-e4',
+    error: '已确认人工处理完成', target_version: 'v1.5.0', current_version: 'v1.4.0', log: [] } });
+  await test.click('#upd-recovery-resolve');
+  const resolveCall = test.requests.find(r => r.url === '/api/system/self-update/attention');
+  assert.deepEqual(JSON.parse(resolveCall.options.body), { action: 'resolve' });
+  assert.match(test.at('#upd-operation').innerHTML, /失败/, 'resolve 后状态转为失败并就地重绘');
+  test.AD.stopUpdatePanel();
+
+  // --- rolled_back：说明已自动恢复旧版本，无额外按钮。
+  test = await scenario([settings, emptyHistory,
+    { stage: 'rolled_back', active: false, delegated: true, operation: 'update', operation_id: 'op-e5',
+      from_image_ref: 'ghcr.io/j9kkk/auto-deploy:v1.4.0', error: '新版本验证未通过', ...dockerSteps }]);
+  assert.equal(test.at('#upd-operation').attributes.class, 'alert warning', 'rolled_back 主提示为警示 tone');
+  assert.match(test.at('#upd-progress').innerHTML, /升级失败，已自动恢复到升级前版本；旧容器继续提供服务/);
+  assert.equal(test.at('#upd-attention-restore'), null);
+  assert.equal(test.at('#upd-recovery-resolve'), null);
+  assert.equal(test.at('#upd-failed-rollback'), null, '已自动恢复，不再提供重复回退按钮');
+
+  // --- 升级历史预载：打开卡片即出现「回退 ▾」，无需先点开菜单。
+  test = await scenario([settings,
+    { run_mode: 'docker', current_version: 'v1.5.0', backups: [],
+      entries: [{ from_image: 'ghcr.io/j9kkk/auto-deploy:v1.4.0' }] },
+    { stage: 'idle', active: false, current_version: 'v1.5.0', log: [] }, noUpdate]);
+  assert.ok(test.at('#upd-rollback'), '预载历史后首次渲染即出现回退菜单按钮');
 
   // --- 升级日志弹窗：每条记录含该次日志，按备份版本给出「回滚到这个版本」。
   const history = { current_version: 'v1.5.0', backups: [{ version: '1.4.0', created_at: 1, size: 10 }],
@@ -355,7 +469,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
         previous_version: '1.3.7', backup_version: '', started_at: 0, finished_at: 1700000200,
         error: '', log: ['[09:20:00] 更新日志三'] },
     ] };
-  test = await scenario([settings, idle, noUpdate, history]);
+  test = await scenario([settings, emptyHistory, idle, noUpdate, history]);
   test.timers.clear();
   await test.click('#upd-history');
   assert.equal(test.modalOptions.length, 1);
@@ -390,7 +504,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.equal(JSON.parse(rollback.options.body).target_version, '1.4.0');
 
   // --- 后端拒绝回滚（如本机无 systemd）：错误要可见，且不能谎称「请求可能已送达」。
-  test = await scenario([settings, idle, noUpdate, history,
+  test = await scenario([settings, emptyHistory, idle, noUpdate, history,
     { http: 409, detail: '不支持自动重启：必须在真实 systemd 单元主进程中运行' }]);
   test.timers.clear();
   await test.click('#upd-history');
@@ -404,7 +518,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.match(test.root.innerHTML, /回滚到 v1\.4\.0/, '被拒绝后回滚入口应恢复可再试');
 
   // 网络中断（无 HTTP 状态）才提示核对状态。
-  test = await scenario([settings, idle, noUpdate, history]);
+  test = await scenario([settings, emptyHistory, idle, noUpdate, history]);
   test.timers.clear();
   await test.click('#upd-history');
   await test.root.querySelectorAll('[data-upd-restore]')[0].fire('click');
@@ -413,7 +527,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.match(test.at('#upd-error').innerHTML, /可能已送达/, '连接中断需提醒核对状态');
 
   // --- 无可用备份时不出现任何回滚入口。
-  test = await scenario([settings, idle, noUpdate, { current_version: 'v1.4.0', backups: [],
+  test = await scenario([settings, emptyHistory, idle, noUpdate, { current_version: 'v1.4.0', backups: [],
     entries: [{ operation_id: 'h1', operation: 'update', stage: 'done', target_version: '1.4.0',
       previous_version: '1.3.7', backup_version: '1.3.7', started_at: 1, finished_at: 2, error: '', log: [] }] }]);
   test.timers.clear();
@@ -424,7 +538,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.match(test.root.innerHTML, /暂无通过校验的代码备份/);
 
   // --- 配置弹窗：保存更新源并强制检查，结果回写到单行展示区。
-  test = await scenario([settings, idle, noUpdate, { settings: { update_repo: 'https://example.com/mirror' } }, hasUpdate]);
+  test = await scenario([settings, emptyHistory, idle, noUpdate, { settings: { update_repo: 'https://example.com/mirror' } }, hasUpdate]);
   test.timers.clear();
   await test.click('#upd-config');
   const input = test.root.querySelector('#upd-repo');
@@ -441,7 +555,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.match(test.at('#upd-row').innerHTML, /最新版本 <strong class="mono">v1\.5\.0/);
 
   // --- 重连预算：网络错误在 60 次后停止，且期间不做整页重绘。
-  test = await scenario([settings, { stage: 'restarting', active: true, operation_id: 'op-2', log: ['保留日志'] }]);
+  test = await scenario([settings, emptyHistory, { stage: 'restarting', active: true, operation_id: 'op-2', log: ['保留日志'] }]);
   for (let i = 0; i < 65; i++) {
     if (!test.timers.size) break;
     await test.tick();
@@ -451,11 +565,11 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.match(test.at('#upd-progress').innerHTML, /保留日志/, '重绘日志时会话日志不丢失');
 
   // --- HTML 注入：日志与说明文案必须转义。
-  test = await scenario([settings, { stage: 'unverified', active: false, notice: '<img src=x>',
+  test = await scenario([settings, emptyHistory, { stage: 'unverified', active: false, notice: '<img src=x>',
     log: ['<script>日志</script>'] }, settings, noUpdate]);
   assert.doesNotMatch(test.at('#upd-progress').innerHTML, /<script>|<img/);
   assert.match(test.at('#upd-progress').innerHTML, /&lt;script&gt;日志/);
-  test = await scenario([settings, idle, noUpdate, { current_version: 'v1', backups: [],
+  test = await scenario([settings, emptyHistory, idle, noUpdate, { current_version: 'v1', backups: [],
     entries: [{ operation_id: 'x', operation: 'update', stage: 'failed', target_version: '<b>1</b>',
       previous_version: 'v1', backup_version: 'v1', started_at: 1, finished_at: 2,
       error: '<script>失败</script>', log: ['<img src=x>'] }] }]);
@@ -464,7 +578,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.doesNotMatch(test.root.innerHTML, /<script>|<img/);
 
   // --- 离开卡片必须停掉定时器（轮询与控制器都不得残留）。
-  test = await scenario([settings, { stage: 'restarting', active: true, operation_id: 'op-3' }]);
+  test = await scenario([settings, emptyHistory, { stage: 'restarting', active: true, operation_id: 'op-3' }]);
   test.AD.stopUpdatePanel();
   assert.equal(test.timers.size, 0);
 
@@ -480,6 +594,7 @@ const hasUpdate = { current: 'v1.4.0', latest: 'v1.5.0', update_available: true,
   assert.match(css, /\.alert\.error\s*\{[^}]*background:\s*var\(--danger-soft\)/);
 
   console.log('前端回归通过：单行展示与自动检查、升级二次确认含更新源、原地进度日志与手动刷新、'
-    + '未确认不伪装成功、升级日志逐条回滚、失败重试与重连预算、注入转义、单行布局 CSS 契约'
+    + '未确认不伪装成功（PID 一致亦可确认）、执行器模型步骤与 attention/recovery/rolled_back 协同、'
+    + '历史预载回退菜单、升级日志逐条回滚、失败重试与重连预算、注入转义、单行布局 CSS 契约'
     + '（未进行真实浏览器验证）');
 })().catch(error => { console.error(error); process.exitCode = 1; });

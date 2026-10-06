@@ -2056,10 +2056,12 @@ def run() -> int:
             mgr._save_state(saved)
             with patch.object(su, 'PROCESS_BOOT_ID', 'new-boot'), patch.object(su, '__version__', '9.0.0'):
                 mgr.reconcile_on_startup()
-            check('版本不符明确失败', mgr.state()['stage'] == 'failed')
+            check('版本不符明确失败', mgr.state()['stage'] == 'failed',
+                  'stage=%s err=%s' % (mgr.state().get('stage'), mgr.state().get('error')))
             expired = dict(saved, restart_deadline=time.time()-1)
             mgr._save_state(expired)
-            check('重启确认超时失败', mgr.state()['stage'] == 'failed')
+            check('重启确认超时失败', mgr.state()['stage'] == 'failed',
+                  'stage=%s err=%s' % (mgr.state().get('stage'), mgr.state().get('error')))
             mgr.rollback()
             mgr._thread.join(10)
             check('回滚恢复旧代码仍等待确认', '1.0.0' in (install / 'app/__init__.py').read_text() and mgr.state()['stage'] == 'restarting')
@@ -2090,168 +2092,619 @@ def run() -> int:
             mgr._save_state(dict(saved, stage='applying'))
             mgr.reconcile_on_startup()
             check('中断更新明确失败', mgr.state()['stage'] == 'failed')
-        section('Docker 形态一键升级与镜像回退')
+        section('Docker 形态一键升级（独立执行器）与镜像回退')
+
+        from app import upgrade_exec as ue
 
         docker_install = tmp_root / "docker-install"
         docker_install.mkdir()
         tree(docker_install, "1.0.0")
         (docker_install / "docker-compose.yml").write_text(
             'services:\n  autodeploy:\n    image: ${AUTODEPLOY_IMAGE:-ghcr.io/j9kkk/auto-deploy}:${AUTODEPLOY_IMAGE_TAG:-latest}\n')
-        # 模拟 bootstrap.sh 装好的旧版本部署：.env 锁定在 v1.0.0 对应的镜像 tag。
+        (docker_install / "docker-compose.override.yml").write_text(
+            'services:\n  autodeploy:\n    ports:\n      - "18770:8770"\n')
+        # 模拟 bootstrap.sh 装好的旧版本部署：.env 锁定在 1.0.0 对应的镜像 tag。
         (docker_install / ".env").write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=1.0.0\n')
         docker_data = tmp_root / 'docker-update-data'
-        docker_calls = []
+        REPO = 'ghcr.io/j9kkk/auto-deploy'
         fake_store_docker = SimpleNamespace(runs=SimpleNamespace(count_active=lambda: 0))
-        compose_dir = str(docker_install)
 
-        def docker_command(args, **kwargs):
-            docker_calls.append(args)
-            if args[0] == "docker" and args[1] == "info":
-                return SimpleNamespace(ok=True, output="")
-            if args[:2] == ["docker", "inspect"]:
-                # 镜像引用跟随 .env 当前 tag：容器重建后 inspect 反映的是新版本，
-                # 静态 mock 会让「回退时 from_image」的断言失真。
-                current_tag = 'latest'
-                env_file = docker_install / '.env'
-                if env_file.exists():
-                    for line in env_file.read_text().splitlines():
-                        if line.startswith('AUTODEPLOY_IMAGE_TAG='):
-                            current_tag = line.split('=', 1)[1].strip() or 'latest'
-                return SimpleNamespace(ok=True, output=(
-                    '{"com.docker.compose.project.working_dir":"' + compose_dir + '",'
-                    '"com.docker.compose.project":"auto-deploy"}'
-                    "\tghcr.io/j9kkk/auto-deploy:" + current_tag +
-                    "\t" + compose_dir + "\tauto-deploy"))
-            if args[:2] == ["docker", "pull"]:
-                return SimpleNamespace(ok=True, output="")
-            if args[:3] == ["docker", "compose", "up"]:
-                # 重建容器即终止本进程：模拟为直接退出（真实环境由 compose 拉起新容器）。
-                raise SystemExit(0)
-            raise AssertionError("Docker 更新测试禁止真实外部命令：" + str(args))
+        class FakeDocker:
+            """docker CLI 替身：执行器在进程内真实运行，.env 等文件操作走真实文件系统。
 
-        def fake_docker_check():
-            return True
+            compose up 模拟会跟随当前 .env 的 tag 更新「容器」镜像身份并写入新
+            进程启动标记（真实环境由重建后的新容器完成），从而端到端驱动新链路；
+            故障注入通过 up_fail_once / tamper_on_config / executor_noop / pull_ok。
+            """
 
-        with patch.object(config, 'ROOT_DIR', docker_install), \
-                patch.object(config, 'DATA_DIR', docker_data), \
-                patch.object(su, 'in_container', return_value=True), \
-                patch.object(su, 'docker_available', side_effect=fake_docker_check), \
-                patch.object(su.SelfUpdateManager, '_self_container_id', return_value='abc123def456'), \
-                patch.object(su, 'run_command', side_effect=docker_command):
-            dmgr = su.SelfUpdateManager(fake_store_docker)
-            check('容器内 socket 可用判为 docker 形态', su.docker_run_mode() == 'docker')
-            check('形态检测读取自身容器信息', dmgr._docker_self_info()['image'] == 'ghcr.io/j9kkk/auto-deploy:1.0.0')
-            env_file = dmgr._compose_env_file(dmgr._docker_self_info())
-            check('compose 启动目录定位到安装目录', env_file is not None and env_file.parent == docker_install)
-            latest_d = su.UpdateCheck('1.0.0', 'v2.0.0', True, '')
-            with patch.object(dmgr, 'check', return_value=latest_d):
-                state = dmgr.start('v2.0.0')
-                dmgr._thread.join(10)
-            docker_state = dmgr.state()
-            check('Docker 升级走到重建容器并落盘重启期限',
-                  docker_state['stage'] == 'restarting' and docker_state.get('restart') == 'docker-recreate'
-                  and docker_state.get('restart_deadline', 0) > 0)
-            check('升级历史记录镜像前后引用',
-                  docker_state.get('from_image') == 'ghcr.io/j9kkk/auto-deploy:1.0.0'
-                  and docker_state.get('to_image') == 'ghcr.io/j9kkk/auto-deploy:2.0.0')
-            env_text = (docker_install / '.env').read_text()
-            check('镜像 tag 已写入 .env', 'AUTODEPLOY_IMAGE_TAG=2.0.0' in env_text
-                  and 'AUTODEPLOY_IMAGE=ghcr.io/j9kkk/auto-deploy' in env_text)
-            check('拉取命令带正确镜像引用',
-                  any(a[:3] == ["docker", "pull", "ghcr.io/j9kkk/auto-deploy:2.0.0"] for a in docker_calls))
-            # 新容器进程确认：与裸机同一套 boot_id 协议。
-            with patch.object(su, 'PROCESS_BOOT_ID', 'docker-new-boot'), \
-                    patch.object(su.os, 'getpid', return_value=os.getpid() + 200), \
-                    patch.object(su, '__version__', '2.0.0'):
-                dmgr.reconcile_on_startup()
-            check('新容器确认目标版本后完成', dmgr.state()['stage'] == 'done')
-            check('完成态历史含镜像引用', any(item.get('to_image') == 'ghcr.io/j9kkk/auto-deploy:2.0.0'
-                                              for item in dmgr.history()))
+            def __init__(self):
+                self.image_ids = {REPO + ':1.0.0': 'sha256:' + 'a' * 64,
+                                  REPO + ':2.0.0': 'sha256:' + 'b' * 64}
+                self.local = {REPO + ':1.0.0'}
+                self.container_ref = REPO + ':1.0.0'
+                self.container_id = 'oldc1d2345678'
+                self.pull_ok = True
+                self.up_fail_once = False
+                self.executor_noop = False      # docker run 只返回 ID，不执行升级
+                self.tamper_on_config = False   # compose config 时模拟人工篡改 .env
+                self.marker_version = None      # 覆盖启动标记版本（注入版本不符）
+                self.calls = []
+                self.run_cmds = []
+                self.tag_cmds = []
+                self.compose_envs = []
 
-            # 镜像 tag 回退：切回 1.0.0（引用与镜像仓库一致，不带 v 前缀）。
-            docker_calls.clear()
-            with patch.object(su, '__version__', '2.0.0'):
-                dmgr.rollback(target_image='ghcr.io/j9kkk/auto-deploy:1.0.0')
-                dmgr._thread.join(10)
-            rb_state = dmgr.state()
-            check('镜像回退切回 .env 旧 tag', 'AUTODEPLOY_IMAGE_TAG=1.0.0' in (docker_install / '.env').read_text())
-            check('镜像回退记录 from/to 镜像',
-                  rb_state.get('from_image') == 'ghcr.io/j9kkk/auto-deploy:2.0.0'
-                  and rb_state.get('to_image') == 'ghcr.io/j9kkk/auto-deploy:1.0.0')
-            check('镜像回退进入等待重启确认', rb_state['stage'] == 'restarting')
+            def env_tag(self):
+                for line in (docker_install / '.env').read_text().splitlines():
+                    if line.startswith('AUTODEPLOY_IMAGE_TAG='):
+                        return line.split('=', 1)[1].strip() or 'latest'
+                return 'latest'
 
-            # 回退目标必须来自升级历史：凭空构造的镜像引用拒绝。
-            with patch.object(su, '__version__', '2.0.0'):
-                expect_raises('凭空镜像引用拒绝回退',
-                              lambda: dmgr.rollback(target_image='ghcr.io/evil/auto-deploy:v9.9.9'), RuntimeError)
-                expect_raises('非法镜像引用拒绝回退',
-                              lambda: dmgr.rollback(target_image='bad ref with space'), RuntimeError)
+            def ref_id(self, ref):
+                if ref not in self.image_ids:
+                    self.image_ids[ref] = 'sha256:' + ref.encode().hex().ljust(64, '0')[:64]
+                return self.image_ids[ref]
 
-            # 拉取失败：中止且不动 .env 与旧容器（独立的 DATA_DIR，不受前面状态影响）。
-            def pull_fail(args, **kwargs):
+            def self_info_line(self):
+                labels = {"com.docker.compose.project": "auto-deploy",
+                          "com.docker.compose.project.working_dir": str(docker_install),
+                          "com.docker.compose.project.config_files":
+                              str(docker_install / 'docker-compose.yml') + ","
+                              + str(docker_install / 'docker-compose.override.yml'),
+                          "com.docker.compose.service": "autodeploy"}
+                mounts = [{"Type": "bind", "Source": "/var/run/docker.sock",
+                           "Destination": "/var/run/docker.sock", "RW": True},
+                          {"Type": "bind", "Source": str(docker_install),
+                           "Destination": str(docker_install), "RW": True},
+                          {"Type": "volume", "Name": "auto-deploy-data",
+                           "Destination": "/app/data", "RW": True}]
+                return "\t".join([json.dumps(labels), self.container_ref,
+                                  self.image_ids.get(self.container_ref, ''),
+                                  json.dumps(mounts), str(docker_install), "auto-deploy",
+                                  str(docker_install / 'docker-compose.yml') + ","
+                                  + str(docker_install / 'docker-compose.override.yml'),
+                                  "autodeploy"])
+
+            def __call__(self, args, **kwargs):
+                self.calls.append(args)
+                if args[:2] == ["docker", "compose"]:
+                    self.compose_envs.append(kwargs.get('base_env'))
+                # 新链路的 compose 命令带 -p/-f 前缀（docker compose -p X -f Y config|up|ps），
+                # 子命令出现在尾部，按成员匹配而不是固定下标。
+                compose_sub = next((a for a in args[2:] if a in ('config', 'up', 'ps')), '')
+                if compose_sub == 'config':
+                    if self.tamper_on_config:
+                        with open(docker_install / '.env', 'a', encoding='utf-8') as handle:
+                            handle.write('EXTRA=manual\n')
+                        self.tamper_on_config = False
+                    payload = {"services": {"autodeploy": {"image": REPO + ":" + self.env_tag()}}}
+                    return SimpleNamespace(ok=True, output=json.dumps(payload))
+                if compose_sub == 'up':
+                    if self.up_fail_once:
+                        self.up_fail_once = False
+                        return SimpleNamespace(ok=False, output="模拟重建失败", error="模拟重建失败")
+                    self.container_ref = REPO + ":" + self.env_tag()
+                    self.container_id = 'newc1d2345678'
+                    plan = json.loads((docker_data / su.PLAN_FILE_NAME).read_text())
+                    version = self.marker_version if self.marker_version is not None else plan['expected_version']
+                    marker = {"operation_id": plan['operation_id'], "version": version,
+                              "boot_id": "fake-new-boot", "pid": 424242,
+                              "container_id": self.container_id, "time": time.time()}
+                    (docker_data / su.MARKER_FILE_NAME).write_text(json.dumps(marker))
+                    return SimpleNamespace(ok=True, output="")
+                if compose_sub == 'ps':
+                    return SimpleNamespace(ok=True, output=self.container_id + "\n")
+                if args[:3] == ["docker", "run", "-d"]:
+                    self.run_cmds.append(args)
+                    if self.executor_noop:
+                        return SimpleNamespace(ok=True, output="execdeadbeef1234\n")
+                    # 执行器在进程内真实运行（升级计划与状态文件均为真实读写）。
+                    ue.run(docker_data / su.PLAN_FILE_NAME)
+                    return SimpleNamespace(ok=True, output="execdeadbeef1234\n")
+                if args[:3] == ["docker", "image", "inspect"]:
+                    ref = args[-1]
+                    if ref in self.local:
+                        return SimpleNamespace(ok=True, output=self.image_ids[ref] + "\n")
+                    return SimpleNamespace(ok=False, output="", error="not found")
                 if args[:2] == ["docker", "pull"]:
-                    return SimpleNamespace(ok=False, output="manifest unknown", error="")
-                return docker_command(args)
-            fresh_mgr = su.SelfUpdateManager(fake_store_docker)
-            (docker_install / '.env').write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=1.0.0\n')
-            with patch.object(config, 'DATA_DIR', tmp_root / 'docker-update-data-2'), \
-                    patch.object(fresh_mgr, 'check', return_value=latest_d), \
-                    patch.object(su, 'run_command', side_effect=pull_fail):
-                fresh_mgr.start('v2.0.0')
-                fresh_mgr._thread.join(10)
-                pf_state = fresh_mgr.state()
-            check('拉取失败中止且未改 .env',
-                  pf_state['stage'] == 'failed'
-                  and 'AUTODEPLOY_IMAGE_TAG=1.0.0' in (docker_install / '.env').read_text()
-                  and '2.0.0' not in (docker_install / '.env').read_text()
-                  and '拉取失败' in pf_state['error'])
+                    if not self.pull_ok:
+                        return SimpleNamespace(ok=False, output="manifest unknown", error="")
+                    ref = args[-1]
+                    self.local.add(ref)
+                    self.ref_id(ref)
+                    return SimpleNamespace(ok=True, output="")
+                if args[:2] == ["docker", "tag"]:
+                    self.tag_cmds.append(args)
+                    self.image_ids[args[3]] = args[2]
+                    self.local.add(args[3])
+                    return SimpleNamespace(ok=True, output="")
+                if args[:3] == ["docker", "ps", "-a"]:
+                    return SimpleNamespace(ok=True, output="")
+                if args[:2] == ["docker", "rm"]:
+                    return SimpleNamespace(ok=True, output="")
+                if args[:2] == ["docker", "inspect"]:
+                    # 兼容两种实参顺序：inspect <cid> --format <fmt> 与
+                    # inspect --format <fmt> <name>。分支按格式串特征匹配，
+                    # .State.Running（执行器读目标容器）必须先于 Labels 判断。
+                    fmt = args[args.index('--format') + 1] if '--format' in args else ''
+                    target = args[2] if args[2] != '--format' else args[4]
+                    if '.State.Running' in fmt:
+                        labels = {"com.docker.compose.project": "auto-deploy",
+                                  "com.docker.compose.project.working_dir": str(docker_install),
+                                  "com.docker.compose.project.config_files":
+                                      str(docker_install / 'docker-compose.yml') + ","
+                                      + str(docker_install / 'docker-compose.override.yml'),
+                                  "com.docker.compose.service": "autodeploy"}
+                        running = not (target.startswith('auto-deploy-upgrade-') and self.executor_noop)
+                        return SimpleNamespace(ok=True, output="\t".join(
+                            [json.dumps(labels), self.container_ref,
+                             self.image_ids.get(self.container_ref, ''),
+                             'true' if running else 'false']))
+                    if '{{json .State}}' in fmt:
+                        return SimpleNamespace(ok=True, output='{"running":true,"restarting":false}')
+                    if '.State.Health' in fmt:
+                        return SimpleNamespace(ok=True, output='{"Status":"healthy"}')
+                    if fmt == '{{.Image}}':
+                        return SimpleNamespace(ok=True, output=self.image_ids.get(self.container_ref, '') + "\n")
+                    if 'Config.Labels' in fmt:
+                        return SimpleNamespace(ok=True, output=self.self_info_line())
+                    return SimpleNamespace(ok=False, output="", error="unsupported inspect")
+                if args[:2] == ["docker", "info"]:
+                    return SimpleNamespace(ok=True, output="")
+                raise AssertionError("Docker 更新测试禁止真实外部命令：" + str(args))
 
-            # 无 socket 的容器形态：直接拒绝并给出引导。
-            with patch.object(su, 'docker_available', return_value=False), \
-                    patch.object(su, 'run_command', side_effect=docker_command):
-                no_sock = su.SelfUpdateManager(fake_store_docker)
-                check('无 socket 判为 docker_no_socket', su.docker_run_mode() == 'docker_no_socket')
-                expect_raises('无 socket 升级拒绝并引导', lambda: no_sock.start('v2.0.0'), RuntimeError)
-                check('无 socket 拒绝时未动任何文件',
-                      no_sock.state().get('stage') in ('idle', 'failed', 'unverified', 'done', 'restarting')
-                      and '2.0.0' not in (docker_install / '.env').read_text())
+        def run_docker_scenarios(fake, data_dir):
+            with patch.object(config, 'ROOT_DIR', docker_install), \
+                    patch.object(config, 'DATA_DIR', data_dir), \
+                    patch.object(su, 'in_container', return_value=True), \
+                    patch.object(su, 'docker_available', return_value=True), \
+                    patch.object(su.SelfUpdateManager, '_self_container_id', return_value='abc123def456'), \
+                    patch.object(su, 'run_command', side_effect=fake), \
+                    patch.object(ue, 'run_command', side_effect=fake):
+                yield
 
-            # 面板升级依赖「安装目录在容器内可见」：真实容器里宿主机路径不一定
-            # 挂载进来（0.3.2 及更早的一键脚本就没有挂载），前置检查必须区分
-            # 「目录不可见」与「.env 缺失」并给出可操作的指引，而不是笼统报错。
-            # 两个分支都必须在动镜像/改 .env 之前拦下（不发任何 docker 命令）。
-            phantom_dir = tmp_root / 'host-dir-not-mounted'   # 刻意不创建，模拟未挂载
-            missing_env_dir = tmp_root / 'host-dir-without-env'
-            missing_env_dir.mkdir()
-            phantom_info = {'image': 'ghcr.io/j9kkk/auto-deploy:2.0.0',
-                            'working_dir': str(phantom_dir), 'project_working_dir': str(phantom_dir),
-                            'project': 'auto-deploy'}
-            missing_info = {**phantom_info, 'working_dir': str(missing_env_dir),
-                            'project_working_dir': str(missing_env_dir)}
-            docker_calls_before = len(docker_calls)
-            with patch.object(dmgr, '_docker_self_info', return_value=phantom_info):
-                expect_raises('安装目录不可见时中止升级',
-                              lambda: dmgr._docker_preflight(lambda message: None), RuntimeError)
-                try:
-                    dmgr._docker_preflight(lambda message: None)
-                except RuntimeError as exc:
-                    check('安装目录不可见时指引重跑一键脚本',
-                          '在容器内不可见' in str(exc) and '一键脚本' in str(exc))
-            with patch.object(dmgr, '_docker_self_info', return_value=missing_info):
-                try:
-                    dmgr._docker_preflight(lambda message: None)
-                except RuntimeError as exc:
-                    check('.env 缺失时给出创建或手动升级指引',
-                          '没有 .env' in str(exc) and 'docker compose pull' in str(exc))
-            check('安装目录不可用时不产生任何 docker 命令',
-                  len(docker_calls) == docker_calls_before)
+        fake = FakeDocker()
+        gen = run_docker_scenarios(fake, docker_data)
+        next(gen)
+        dmgr = su.SelfUpdateManager(fake_store_docker)
+        check('容器内 socket 可用判为 docker 形态', su.docker_run_mode() == 'docker')
+        context = dmgr._docker_upgrade_context()
+        check('升级上下文包含完整 compose 身份',
+              context['project'] == 'auto-deploy' and context['service'] == 'autodeploy'
+              and len(context['config_files']) == 2 and context['image_ref'] == REPO + ':1.0.0'
+              and context['env_file'] == str(docker_install / '.env'))
+        latest_d = su.UpdateCheck('1.0.0', 'v2.0.0', True, '')
 
-            # 一键脚本生成的 override 必须把安装目录同路径挂载进容器：
-            # 面板升级要改写宿主机 .env 并以该目录为 compose 工作目录，
-            # 路径不一致时容器内永远找不到 .env（0.3.2 的真实事故）。
-            bootstrap_text = (ROOT / 'scripts/bootstrap.sh').read_text(encoding='utf-8')
-            check('一键脚本 override 同路径挂载安装目录',
-                  '${INSTALL_DIR}:${INSTALL_DIR}' in bootstrap_text)
+        def wait_terminal(mgr, budget=60):
+            """等待当前操作落定终态（监控线程以 2 秒周期轮询状态文件）。"""
+            deadline = time.time() + budget
+            while time.time() < deadline:
+                if mgr.state().get('stage') in su.TERMINAL_STAGES:
+                    return
+                time.sleep(0.2)
+
+        with patch.object(dmgr, 'check', return_value=latest_d), \
+                patch.object(su, '__version__', '1.0.0'):
+            state = dmgr.start('v2.0.0')
+            dmgr._thread.join(30)
+            if dmgr._monitor_thread:
+                dmgr._monitor_thread.join(15)
+            wait_terminal(dmgr)
+        done_state = dmgr.state()
+        check('委托升级完成且确认信息齐备', done_state['stage'] == 'done'
+              and done_state.get('confirmed_operation_id') == state['operation_id']
+              and done_state.get('version') == '2.0.0'
+              and done_state.get('delegated') is True)
+        env_text = (docker_install / '.env').read_text()
+        check('镜像 tag 已写入 .env 且保留其余配置',
+              'AUTODEPLOY_IMAGE_TAG=2.0.0' in env_text
+              and 'AUTODEPLOY_IMAGE=ghcr.io/j9kkk/auto-deploy' in env_text
+              and 'AUTODEPLOY_PORT=8770' in env_text)
+        check('执行器以 root 与目标镜像 ID 运行并挂载 socket/安装目录/数据卷',
+              fake.run_cmds and '--user' in fake.run_cmds[0]
+              and fake.run_cmds[0][fake.run_cmds[0].index('--user') + 1] == '0'
+              and any(a == '/var/run/docker.sock:/var/run/docker.sock' for a in fake.run_cmds[0])
+              and any(a == f'{docker_install}:{docker_install}' for a in fake.run_cmds[0])
+              and any(a == 'auto-deploy-data:/app/data' for a in fake.run_cmds[0])
+              and any(a.startswith(su.EXECUTOR_LABEL + '=') for a in fake.run_cmds[0])
+              and fake.run_cmds[0][-5] == fake.image_ids[REPO + ':2.0.0']
+              and fake.run_cmds[0][-2:] == ['--plan', '/app/data/upgrade-plan.json'])
+        compose_ups = [a for a in fake.calls if a[:2] == ["docker", "compose"] and 'up' in a]
+        check('compose 命令固定项目/有序配置文件/工作目录并限定服务',
+              compose_ups and '-p' in compose_ups[0] and compose_ups[0][compose_ups[0].index('-p') + 1] == 'auto-deploy'
+              and compose_ups[0].count('-f') == 2
+              and compose_ups[0][compose_ups[0].index('--project-directory') + 1] == str(docker_install)
+              and compose_ups[0][-1] == 'autodeploy'
+              and f'{REPO}:2.0.0' in fake.local)
+        check('compose 子进程使用清洗环境（无 AUTODEPLOY_*）',
+              fake.compose_envs and all(env is not None and not any(
+                  str(k).startswith('AUTODEPLOY_') for k in env) for env in fake.compose_envs))
+        check('拉取发生在切换之前且按目标引用',
+              any(a[:3] == ["docker", "pull", REPO + ":2.0.0"] for a in fake.calls))
+        check('升级历史记录镜像前后引用',
+              dmgr.history() and dmgr.history()[0].get('from_image') == REPO + ':1.0.0'
+              and dmgr.history()[0].get('to_image') == REPO + ':2.0.0'
+              and dmgr.history()[0]['stage'] == 'done')
+
+        # 重建失败：执行器自动恢复 .env 快照并重建旧版本。
+        fake.up_fail_once = True
+        (docker_install / '.env').write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=1.0.0\n')
+        fake.container_ref = REPO + ':1.0.0'
+        fake.container_id = 'oldc1d2345678'
+        with patch.object(dmgr, 'check', return_value=latest_d), \
+                patch.object(su, '__version__', '1.0.0'):
+            dmgr.start('v2.0.0')
+            dmgr._thread.join(30)
+            if dmgr._monitor_thread:
+                dmgr._monitor_thread.join(15)
+            wait_terminal(dmgr)
+        rb_state = dmgr.state()
+        check('重建失败自动恢复 .env 并回到旧版本', rb_state['stage'] == 'rolled_back'
+              and 'AUTODEPLOY_IMAGE_TAG=1.0.0' in (docker_install / '.env').read_text()
+              and '2.0.0' not in (docker_install / '.env').read_text()
+              and fake.container_ref == REPO + ':1.0.0'
+              and '恢复' in rb_state.get('error', ''))
+        check('rolled_back 记录进入历史', dmgr.history()[0]['stage'] == 'rolled_back')
+        check('成功恢复后快照清理', not list(docker_data.glob('*.env.snapshot')))
+
+        # 人工篡改 .env 后指纹不符：拒绝覆盖，进入 recovery_required，快照保留。
+        fake.up_fail_once = True
+        fake.tamper_on_config = True
+        with patch.object(dmgr, 'check', return_value=latest_d), \
+                patch.object(su, '__version__', '1.0.0'):
+            dmgr.start('v2.0.0')
+            dmgr._thread.join(30)
+            if dmgr._monitor_thread:
+                dmgr._monitor_thread.join(15)
+            wait_terminal(dmgr)
+        tamper_state = dmgr.state()
+        check('切换后 .env 被人工改动时拒绝覆盖并转人工处置',
+              tamper_state['stage'] == 'recovery_required'
+              and '人工' in tamper_state.get('error', '')
+              and dmgr.deployment_blocked())
+        check('人工处置场景保留快照', bool(list(docker_data.glob('*.env.snapshot'))))
+        expect_raises('恢复失败后无法继续等待', lambda: dmgr.attention_action('wait'), RuntimeError)
+        dmgr.attention_action('resolve')
+        check('标记人工处理后解除禁入', dmgr.state()['stage'] == 'failed'
+              and not dmgr.deployment_blocked()
+              and dmgr.history()[0]['stage'] == 'failed')
+        for snapshot in docker_data.glob('*.env.snapshot'):
+            snapshot.unlink()
+
+        (docker_install / '.env').write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=1.0.0\n')
+
+        # 执行器崩溃（未记录终态）：监控转 attention；继续等待被拒，人工处理放行。
+        fake2 = FakeDocker()
+        fake2.executor_noop = True
+        gen2 = run_docker_scenarios(fake2, tmp_root / 'docker-update-data-3')
+        next(gen2)
+        crash_mgr = su.SelfUpdateManager(fake_store_docker)
+        with patch.object(crash_mgr, 'check', return_value=latest_d), \
+                patch.object(su, '__version__', '1.0.0'):
+            crash_mgr.start('v2.0.0')
+            crash_mgr._thread.join(30)
+            if crash_mgr._monitor_thread:
+                crash_mgr._monitor_thread.join(15)
+        check('执行器退出未落终态转人工处置', crash_mgr.state()['stage'] == 'attention'
+              and crash_mgr.deployment_blocked())
+        expect_raises('执行器缺席无法继续等待', lambda: crash_mgr.attention_action('wait'), RuntimeError)
+        expect_raises('不支持的处置动作拒绝', lambda: crash_mgr.attention_action('nonsense'), RuntimeError)
+        crash_mgr.attention_action('resolve')
+        check('崩溃操作人工处理后解除禁入', not crash_mgr.deployment_blocked())
+        gen2.close()
+
+        # 有运行中的部署任务：升级与回退都必须被准入拒绝（防止重建中断任务）。
+        busy_store = SimpleNamespace(runs=SimpleNamespace(count_active=lambda: 1))
+        busy_mgr = su.SelfUpdateManager(busy_store)
+        with patch.object(busy_mgr, 'check', return_value=latest_d), \
+                patch.object(su, '__version__', '1.0.0'):
+            expect_raises('有运行中任务时拒绝升级', lambda: busy_mgr.start('v2.0.0'), RuntimeError)
+            expect_raises('有运行中任务时拒绝回滚',
+                          lambda: busy_mgr.rollback(target_image=REPO + ':1.0.0'), RuntimeError)
+
+        # 预检必须拒绝不可重建的上下文，且全部发生在任何改动之前。
+        calls_before = len(fake.calls)
+        info_no_service = {'image': REPO + ':1.0.0', 'working_dir': str(docker_install),
+                           'project_working_dir': str(docker_install), 'project': 'auto-deploy',
+                           'config_files': '', 'service': '', 'mounts': [], 'image_id': ''}
+        with patch.object(dmgr, '_docker_self_info', return_value=info_no_service):
+            try:
+                dmgr._docker_preflight(lambda message: None)
+                raised = ''
+            except RuntimeError as exc:
+                raised = str(exc)
+        check('缺少 compose 服务标签拒绝升级', 'compose' in raised and '一键脚本' in raised)
+        info_outside = {**info_no_service, 'config_files': '/etc/other-compose.yml',
+                        'service': 'autodeploy'}
+        with patch.object(dmgr, '_docker_self_info', return_value=info_outside):
+            try:
+                dmgr._docker_preflight(lambda message: None)
+                raised = ''
+            except RuntimeError as exc:
+                raised = str(exc)
+        check('配置文件在安装目录外拒绝升级', '安装目录之外' in raised and '一键脚本' in raised)
+        info_no_mount = {**info_no_service, 'config_files': str(docker_install / 'docker-compose.yml'),
+                         'service': 'autodeploy'}
+        with patch.object(dmgr, '_docker_self_info', return_value=info_no_mount):
+            try:
+                dmgr._docker_preflight(lambda message: None)
+                raised = ''
+            except RuntimeError as exc:
+                raised = str(exc)
+        check('缺少数据卷挂载拒绝升级', '/app/data' in raised)
+        with patch.dict(os.environ, {'DOCKER_HOST': 'tcp://remote:2375'}):
+            try:
+                dmgr._docker_preflight(lambda message: None)
+                raised = ''
+            except RuntimeError as exc:
+                raised = str(exc)
+        check('自定义 DOCKER_HOST 拒绝面板升级', 'DOCKER_HOST' in raised)
+        check('上下文拒绝发生在任何改动之前', len(fake.calls) == calls_before)
+
+        # 安装目录不可见/.env 缺失：指引必须可操作，且不发任何 docker 命令。
+        phantom_dir = tmp_root / 'host-dir-not-mounted'   # 刻意不创建，模拟未挂载
+        missing_env_dir = tmp_root / 'host-dir-without-env'
+        missing_env_dir.mkdir()
+        phantom_info = {'image': REPO + ':2.0.0',
+                        'working_dir': str(phantom_dir), 'project_working_dir': str(phantom_dir),
+                        'project': 'auto-deploy', 'config_files': '', 'service': '',
+                        'mounts': [], 'image_id': ''}
+        missing_info = {**phantom_info, 'working_dir': str(missing_env_dir),
+                        'project_working_dir': str(missing_env_dir)}
+        calls_before = len(fake.calls)
+        with patch.object(dmgr, '_docker_self_info', return_value=phantom_info):
+            try:
+                dmgr._docker_preflight(lambda message: None)
+            except RuntimeError as exc:
+                check('安装目录不可见时指引重跑一键脚本',
+                      '在容器内不可见' in str(exc) and '一键脚本' in str(exc))
+        with patch.object(dmgr, '_docker_self_info', return_value=missing_info):
+            try:
+                dmgr._docker_preflight(lambda message: None)
+            except RuntimeError as exc:
+                check('.env 缺失时给出创建或手动升级指引',
+                      '没有 .env' in str(exc) and 'docker compose pull' in str(exc))
+        check('安装目录不可用时不产生任何 docker 命令', len(fake.calls) == calls_before)
+
+        # 拉取失败：中止且不动 .env 与旧容器（独立 DATA_DIR 与全新替身）。
+        fake_pull = FakeDocker()
+        fake_pull.pull_ok = False
+        (docker_install / '.env').write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=1.0.0\n')
+        gen_pull = run_docker_scenarios(fake_pull, tmp_root / 'docker-update-data-2')
+        next(gen_pull)
+        fresh_mgr = su.SelfUpdateManager(fake_store_docker)
+        with patch.object(fresh_mgr, 'check', return_value=latest_d), \
+                patch.object(su, '__version__', '1.0.0'):
+            fresh_mgr.start('v2.0.0')
+            fresh_mgr._thread.join(30)
+        pf_state = fresh_mgr.state()
+        check('拉取失败中止且未改 .env',
+              pf_state['stage'] == 'failed'
+              and 'AUTODEPLOY_IMAGE_TAG=1.0.0' in (docker_install / '.env').read_text()
+              and '2.0.0' not in (docker_install / '.env').read_text()
+              and '拉取失败' in pf_state['error'])
+        gen_pull.close()
+
+        # 无 socket 的容器形态：直接拒绝并给出引导。
+        fake3 = FakeDocker()
+        gen3 = run_docker_scenarios(fake3, tmp_root / 'docker-update-data-4')
+        next(gen3)
+        with patch.object(su, 'docker_available', return_value=False):
+            no_sock = su.SelfUpdateManager(fake_store_docker)
+            check('无 socket 判为 docker_no_socket', su.docker_run_mode() == 'docker_no_socket')
+            expect_raises('无 socket 升级拒绝并引导', lambda: no_sock.start('v2.0.0'), RuntimeError)
+        gen3.close()
+
+        # 后续回退/attention 场景继续在主场景的数据目录内运行。
+        gen_main = run_docker_scenarios(fake, docker_data)
+        next(gen_main)
+
+        # 正常回退：镜像本地已存在则直接使用，不重新拉取。
+        pulls_before = sum(1 for a in fake.calls if a[:2] == ["docker", "pull"])
+        fake.container_ref = REPO + ':2.0.0'
+        fake.container_id = 'newc1d2345678'
+        (docker_install / '.env').write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=2.0.0\n')
+        with patch.object(su, '__version__', '2.0.0'):
+            dmgr.rollback(target_image=REPO + ':1.0.0')
+            dmgr._thread.join(30)
+            if dmgr._monitor_thread:
+                dmgr._monitor_thread.join(15)
+            wait_terminal(dmgr)
+        check('镜像回退切回 .env 旧 tag 并确认完成',
+              dmgr.state()['stage'] == 'done' and dmgr.state().get('version') == '1.0.0'
+              and 'AUTODEPLOY_IMAGE_TAG=1.0.0' in (docker_install / '.env').read_text())
+        check('镜像回退记录 from/to 镜像',
+              dmgr.history()[0].get('from_image') == REPO + ':2.0.0'
+              and dmgr.history()[0].get('to_image') == REPO + ':1.0.0')
+        check('本地已有镜像时回退不重新拉取',
+              sum(1 for a in fake.calls if a[:2] == ["docker", "pull"]) == pulls_before
+              and REPO + ':1.0.0' in fake.local)
+
+        # 回退目标必须来自升级历史：凭空构造的镜像引用拒绝。
+        with patch.object(su, '__version__', '2.0.0'):
+            expect_raises('凭空镜像引用拒绝回退',
+                          lambda: dmgr.rollback(target_image='ghcr.io/evil/auto-deploy:v9.9.9'), RuntimeError)
+            expect_raises('非法镜像引用拒绝回退',
+                          lambda: dmgr.rollback(target_image='bad ref with space'), RuntimeError)
+
+        # attention 状态下恢复到升级前镜像：按记录的镜像 ID 打本地标记，不信任 tag。
+        att = dmgr._new_state('update', 'v2.0.0', '')
+        att.update(stage='attention', delegated=True, from_image_ref=REPO + ':1.0.0',
+                   from_image_id=fake.image_ids[REPO + ':1.0.0'], error='结果不确定')
+        su.save_state_file(att)
+        fake.container_ref = REPO + ':2.0.0'
+        (docker_install / '.env').write_text('AUTODEPLOY_PORT=8770\nAUTODEPLOY_IMAGE_TAG=2.0.0\n')
+        tag_calls_before = len(fake.tag_cmds)
+        with patch.object(su, '__version__', '2.0.0'):
+            dmgr.rollback(target_image=REPO + ':1.0.0')
+            dmgr._thread.join(30)
+            if dmgr._monitor_thread:
+                dmgr._monitor_thread.join(15)
+            wait_terminal(dmgr)
+        check('恢复回退使用记录的旧镜像 ID',
+              len(fake.tag_cmds) > tag_calls_before
+              and fake.tag_cmds[-1][2] == fake.image_ids[REPO + ':1.0.0'],
+)
+        check('恢复回退完成且 .env 指向本地标记',
+              dmgr.state()['stage'] == 'done'
+              and 'AUTODEPLOY_IMAGE_TAG=rollback-' in (docker_install / '.env').read_text())
+
+        # attention 状态下仅允许恢复到升级前镜像，其他目标拒绝。
+        att2 = dmgr._new_state('update', 'v2.0.0', '')
+        att2.update(stage='attention', delegated=True, from_image_ref=REPO + ':1.0.0',
+                    from_image_id=fake.image_ids[REPO + ':1.0.0'], error='结果不确定')
+        su.save_state_file(att2)
+        with patch.object(su, '__version__', '2.0.0'):
+            expect_raises('人工处置中仅允许恢复到升级前镜像',
+                          lambda: dmgr.rollback(target_image=REPO + ':2.0.0'), RuntimeError)
+        dmgr.attention_action('resolve')
+
+        gen_main.close()
+
+        # 一键脚本契约：同路径挂载、属主迁移、增量 .env、版本核对。
+        bootstrap_text = (ROOT / 'scripts/bootstrap.sh').read_text(encoding='utf-8')
+        check('一键脚本 override 同路径挂载安装目录',
+              '${INSTALL_DIR}:${INSTALL_DIR}' in bootstrap_text)
+        check('一键脚本迁移安装目录属主给容器用户', 'chown 1000:1000' in bootstrap_text)
+        check('一键脚本提供 .env 增量更新函数', 'upsert_env()' in bootstrap_text)
+        check('一键脚本完成后核对实际版本', '/api/health' in bootstrap_text and '不一致' in bootstrap_text)
+
+        # upsert_env 函数行为（以真实 /bin/bash 运行）。
+        import subprocess as _sp
+        extracted = _sp.run(['bash', '-c', "sed -n '/^upsert_env()/,/^}/p' scripts/bootstrap.sh"],
+                            capture_output=True, text=True, cwd=ROOT)
+        check('一键脚本 upsert_env 函数可提取', extracted.returncode == 0 and 'upsert_env()' in extracted.stdout)
+        bdir = tmp_root / 'bootstrap-env'
+        bdir.mkdir()
+        (bdir / '.env').write_text('AUTODEPLOY_PORT=8770\n# 自定义注释\nCUSTOM_KEY=V\n')
+        upsert_script = ("set -euo pipefail\ncd '" + str(bdir) + "'\nINSTALL_DIR='" + str(bdir)
+                         + "'\nSUDO=''\n" + extracted.stdout
+                         + "\nupsert_env AUTODEPLOY_PORT 9000\nupsert_env AUTODEPLOY_IMAGE_TAG 0.3.5\n"
+                         + "upsert_env --remove CUSTOM_KEY\n")
+        upsert_run = _sp.run(['bash', '-c', upsert_script], capture_output=True, text=True)
+        env_after = (bdir / '.env').read_text().splitlines() if upsert_run.returncode == 0 else []
+        check('upsert_env 增量更新保序且可删键',
+              upsert_run.returncode == 0
+              and env_after == ['# 自定义注释', 'AUTODEPLOY_PORT=9000', 'AUTODEPLOY_IMAGE_TAG=0.3.5'])
+
+        section('.env 安全写入、镜像引用解析与脱敏')
+
+        import hashlib as _hashlib
+
+        env_dir = tmp_root / 'env-unit'
+        env_dir.mkdir()
+        env_file = env_dir / '.env'
+        env_file.write_text('AUTODEPLOY_PORT=9000\n# 注释\nAUTODEPLOY_IMAGE=example.com/app\nAUTODEPLOY_IMAGE_TAG=1.0.0\n')
+        os.chmod(env_file, 0o640)
+        original_content = env_file.read_text()
+        rewritten = su.rewrite_env_content(original_content, {'AUTODEPLOY_IMAGE_TAG': '2.0.0'})
+        check('改写仅动目标键且保持行序',
+              rewritten.splitlines() == ['AUTODEPLOY_PORT=9000', '# 注释',
+                                         'AUTODEPLOY_IMAGE=example.com/app', 'AUTODEPLOY_IMAGE_TAG=2.0.0'])
+        su.write_env_atomic(env_file, rewritten, 0o640)
+        check('原子写入保留权限位且无临时残留',
+              (env_file.stat().st_mode & 0o777) == 0o640
+              and not list(env_dir.glob('.env.tmp-upgrade-*')))
+        linked = env_dir / 'linked.env'
+        linked.symlink_to(env_file)
+        expect_raises('软链拒绝写入', lambda: su.write_env_atomic(linked, 'x', 0o600), RuntimeError)
+        snapshot = su.read_env_snapshot(env_file)
+        check('快照含内容权限与指纹',
+              snapshot['sha256'] == _hashlib.sha256(rewritten.encode('utf-8')).hexdigest()
+              and snapshot['mode'] == 0o640)
+        su.restore_env_snapshot(env_file, snapshot, snapshot['sha256'])
+        check('指纹一致时恢复成功', env_file.read_text() == rewritten)
+        env_file.write_text('被人工改过\n')
+        expect_raises('指纹不符拒绝恢复',
+                      lambda: su.restore_env_snapshot(env_file, snapshot, snapshot['sha256']), RuntimeError)
+        check('镜像引用解析 registry 端口',
+              su.parse_image_ref('localhost:5000/auto-deploy:0.3.5')
+              == ('localhost:5000/auto-deploy', '0.3.5', ''))
+        check('镜像引用解析 digest',
+              (su.parse_image_ref('ghcr.io/a/b@sha256:' + '0' * 64) or ('', '', ''))[2]
+              == 'sha256:' + '0' * 64)
+        check('非法镜像引用拒绝',
+              su.parse_image_ref('bad ref with space') is None and su.parse_image_ref('') is None
+              and su.parse_image_ref('repo:@evil') is None)
+        check('URL 凭证脱敏', su.sanitize_url('https://user:secret@github.com/a/b') == 'https://github.com/a/b'
+              and su.sanitize_url('https://token@github.com/a/b') == 'https://github.com/a/b')
+        from app.executor import redact as _redact
+        check('Authorization 整值脱敏', _redact('Authorization: Bearer abc def') == 'Authorization: ***')
+        check('userinfo 型 URL 脱敏', _redact('https://user@github.com/a/b') == 'https://***@github.com/a/b')
+
+        section('状态写入围栏')
+
+        with patch.object(config, 'DATA_DIR', tmp_root / 'fencing-data'):
+            fmgr = su.SelfUpdateManager(fake_store)
+            op_a = fmgr._new_state('update', 'v2.0.0', '')
+            op_a.update(stage='executing', delegated=True)
+            check('新操作正常落盘', su.save_state_file(op_a))
+            # 同操作基于旧快照推进：对齐代数后允许写入（拒绝会卡死推进链）。
+            stale = dict(op_a, stage='prepared', generation=su.load_state_file()['generation'] - 1)
+            check('同操作旧快照对齐代数后写入', su.save_state_file(stale)
+                  and su.load_state_file()['stage'] == 'prepared')
+            # 同操作声明更高代数（旧执行器的未来写入）必须拒绝。
+            future = dict(op_a, stage='done', generation=su.load_state_file()['generation'] + 5)
+            check('同操作高代数写入被拒绝', not su.save_state_file(future)
+                  and su.load_state_file()['stage'] == 'prepared')
+            op_a = su.load_state_file()
+            op_b = fmgr._new_state('rollback', 'v1.0.0', '')
+            check('异操作不得覆盖进行中的操作', not su.save_state_file(op_b)
+                  and su.load_state_file()['operation_id'] == op_a['operation_id'])
+            op_a['stage'] = 'done'
+            op_a['generation'] = su.load_state_file()['generation']
+            check('操作落终态', su.save_state_file(op_a)
+                  and su.load_state_file()['stage'] == 'done')
+            check('终态后异操作可写入', su.save_state_file(op_b)
+                  and su.load_state_file()['operation_id'] == op_b['operation_id'])
+
+        section('重启确认与委托操作启动收尾')
+
+        # PID 不再是确认条件：容器 PID namespace 完全可能复用相同数值。
+        with patch.object(config, 'DATA_DIR', tmp_root / 'pid-confirm-data'):
+            pmgr = su.SelfUpdateManager(fake_store)
+            pid_state = pmgr._new_state('update', 'v2.0.0', 'autodeploy.service')
+            pid_state.update(stage='restarting', restart='self-exit', restart_deadline=time.time() + 60)
+            pmgr._save_state(pid_state)
+            with patch.object(su, 'PROCESS_BOOT_ID', 'pid-same-boot'), \
+                    patch.object(su.os, 'getpid', return_value=pid_state['before_pid']), \
+                    patch.object(su, '__version__', '2.0.0'):
+                pmgr.reconcile_on_startup()
+            check('PID 复用也确认成功', pmgr.state()['stage'] == 'done'
+                  and pmgr.state()['confirmed_operation'] == 'update')
+
+        # 委托操作：新进程只写启动标记，绝不伪报成功；执行器缺席转人工处置。
+        with patch.object(config, 'DATA_DIR', tmp_root / 'delegated-data'):
+            dmgr2 = su.SelfUpdateManager(fake_store)
+            del_state = dmgr2._new_state('update', 'v2.0.0', '')
+            del_state.update(stage='executing', delegated=True,
+                             executor_container='auto-deploy-upgrade-x',
+                             expected_version='2.0.0', before_boot_id='old-boot',
+                             exec_deadline=time.time() + 60)
+            dmgr2._save_state(del_state)
+            with patch.object(su, 'PROCESS_BOOT_ID', 'marker-boot'), \
+                    patch.object(su, '__version__', '2.0.0'), \
+                    patch.object(su, 'run_command',
+                                 return_value=SimpleNamespace(ok=False, output='', error='no docker')):
+                dmgr2.reconcile_on_startup()
+            marker = json.loads((tmp_root / 'delegated-data' / su.MARKER_FILE_NAME).read_text())
+            check('新进程写入启动标记而不伪报成功',
+                  marker['version'] == '2.0.0' and marker['boot_id'] == 'marker-boot'
+                  and dmgr2.state()['stage'] in ('executing', 'attention'))
+            check('执行器缺席且无终态转人工处置', dmgr2.state()['stage'] == 'attention'
+                  and dmgr2.deployment_blocked())
+            expect_raises('执行器缺席无法继续等待', lambda: dmgr2.attention_action('wait'), RuntimeError)
+            dmgr2.attention_action('resolve')
+            check('人工处理后解除禁入并记录历史',
+                  dmgr2.state()['stage'] == 'failed' and not dmgr2.deployment_blocked()
+                  and dmgr2.history()[0]['stage'] == 'failed')
+
+        # 旧版 docker-recreate 记录的重启期限仍然生效（迁移兼容）。
+        with patch.object(config, 'DATA_DIR', tmp_root / 'legacy-recreate-data'):
+            lmgr = su.SelfUpdateManager(fake_store)
+            lmgr._save_state({'schema_version': su.STATE_SCHEMA_VERSION, 'stage': 'restarting',
+                              'restart': 'docker-recreate', 'restart_deadline': time.time() - 1,
+                              'target_version': '2.0.0', 'log': []})
+            check('旧版容器内重建记录超时同样判失败', lmgr.state()['stage'] == 'failed')
 
         section('旧版更新状态与备份兼容')
         with patch.object(config, 'DATA_DIR', tmp_root / 'legacy-update-data'):
@@ -2293,12 +2746,20 @@ def run() -> int:
             legacy_mgr._save_state(no_deadline)
             check('现代协议缺期限不得降级为旧记录', legacy_mgr.state()['stage'] == 'failed'
                   and 'legacy_stage' not in legacy_mgr.state())
+            # 容器各自有独立 PID namespace，PID 数值可复用：缺 PID 不阻断确认，
+            # 缺 boot_id（真正的进程身份）才拒绝。
             missing_pid = dict(saved, restart_deadline=time.time() + 60)
             missing_pid.pop('before_pid')
             legacy_mgr._save_state(missing_pid)
             with patch.object(su, 'PROCESS_BOOT_ID', 'missing-pid-boot'), patch.object(su, '__version__', '2.0.0'):
                 legacy_mgr.reconcile_on_startup()
-            check('缺重启前进程身份不得确认成功', legacy_mgr.state()['stage'] == 'failed')
+            check('缺 PID 不阻断确认（boot 才是身份）', legacy_mgr.state()['stage'] == 'done')
+            missing_boot = dict(saved, restart_deadline=time.time() + 60)
+            missing_boot.pop('before_boot_id')
+            legacy_mgr._save_state(missing_boot)
+            with patch.object(su, 'PROCESS_BOOT_ID', 'missing-boot-check'), patch.object(su, '__version__', '2.0.0'):
+                legacy_mgr.reconcile_on_startup()
+            check('缺重启前 boot 身份不得确认成功', legacy_mgr.state()['stage'] == 'failed')
             legacy_mgr._save_state({'schema_version': 999, 'stage': 'done', 'log': []})
             unknown_bytes = legacy_mgr.state_path.read_bytes()
             check('未知协议不确认也不改写原文件', legacy_mgr.state()['stage'] == 'unverified'

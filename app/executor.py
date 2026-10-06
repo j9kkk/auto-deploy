@@ -25,12 +25,16 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 # Strings that must never reach a log file: tokens embedded in remote URLs.
-_CREDENTIAL_PATTERNS = (
-    re.compile(r"(https?://)([^/\s:@]+):([^/\s@]+)@", re.IGNORECASE),
-    re.compile(r"(//)([^/\s:@]+):([^/\s@]+)@"),
-    re.compile(r"(Authorization:\s*)(\S+)", re.IGNORECASE),
-    re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,})"),
-    re.compile(r"\b(github_pat_[A-Za-z0-9_]{20,})"),
+# (pattern, replacement) applied in order; Authorization must swallow the whole
+# remaining value (Bearer tokens contain spaces), and user@host URLs are
+# redacted even without a password segment.
+_CREDENTIAL_SUBSTITUTIONS = (
+    (re.compile(r"(https?://)([^/\s:@]+):([^/\s@]+)@", re.IGNORECASE), r"\1***:***@"),
+    (re.compile(r"(https?://)([A-Za-z0-9._%+-]+)@", re.IGNORECASE), r"\1***@"),
+    (re.compile(r"(//)([^/\s:@]+):([^/\s@]+)@"), r"\1***:***@"),
+    (re.compile(r"(Authorization:\s*).*", re.IGNORECASE | re.MULTILINE), r"\1***"),
+    (re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{16,})"), "***"),
+    (re.compile(r"\b(github_pat_[A-Za-z0-9_]{20,})"), "***"),
 )
 
 
@@ -39,11 +43,8 @@ def redact(text: str) -> str:
     if not text:
         return text
     result = text
-    result = _CREDENTIAL_PATTERNS[0].sub(r"\1***:***@", result)
-    result = _CREDENTIAL_PATTERNS[1].sub(r"\1***:***@", result)
-    result = _CREDENTIAL_PATTERNS[2].sub(r"\1***", result)
-    result = _CREDENTIAL_PATTERNS[3].sub("***", result)
-    result = _CREDENTIAL_PATTERNS[4].sub("***", result)
+    for pattern, replacement in _CREDENTIAL_SUBSTITUTIONS:
+        result = pattern.sub(replacement, result)
     return result
 
 
@@ -115,6 +116,7 @@ def run_command(
     *,
     cwd: Path | str | None = None,
     env: Mapping[str, str] | None = None,
+    base_env: Mapping[str, str] | None = None,
     timeout: int = 600,
     log: Callable[[str], None] | None = None,
     label: str | None = None,
@@ -128,6 +130,10 @@ def run_command(
     ``log`` is called once per output line (without the trailing newline) and
     once with the exit summary.  ``check_cancelled`` is polled while reading, so
     a cancellation request stops the command promptly even mid-stream.
+
+    ``base_env`` replaces the inherited process environment entirely when given
+    (compose interpolation must not see the image's own AUTODEPLOY_* defaults);
+    ``env`` is always applied on top of the base.
     """
     if not args or not all(isinstance(a, str) for a in args):
         raise ValueError("args must be a non-empty sequence of strings")
@@ -139,7 +145,7 @@ def run_command(
     if log:
         log(header)
 
-    resolved_env = os.environ.copy()
+    resolved_env = dict(base_env) if base_env is not None else os.environ.copy()
     if env:
         resolved_env.update({str(k): str(v) for k, v in env.items()})
 

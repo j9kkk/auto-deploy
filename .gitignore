@@ -21,3 +21,8 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+
+# 本地预览与开发产物
+.local-run/
+docker-compose.override.yml
+.zcode/

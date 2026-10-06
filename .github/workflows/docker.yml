@@ -1,6 +1,11 @@
-# 构建并推送 Docker 镜像到 GHCR。
-# push 到 main 产生 latest 标签（跟随主分支，一键脚本默认拉取）；
-# push v* 标签追加语义化版本标签（0.2.0 / 0.2），供 AUTODEPLOY_VERSION 锁定版本。
+# AutoDeploy 镜像发布三段流水线：候选构建 → 真实升级 E2E → 正式发布。
+# 1) build-candidate：构建 linux/amd64 候选镜像，推送到 GHCR 的 e2e-<sha> 候选标签；
+# 2) e2e：用上一发布版本真实安装，经面板 API 升级到候选版本再回退，
+#    逐跳断言版本切换与配置数据保留（scripts/ci/e2e-upgrade.sh）；
+# 3) publish / release：E2E 全部通过后才发布正式镜像与 Release
+#    （push main → latest；push v* 标签 → 语义化版本 0.3.4 / 0.3，
+#    v* 标签另从 CHANGELOG.md 提取对应段落创建 GitHub Release）。
+# 未通过 E2E 的提交绝不产生 latest / 语义化标签，杜绝旧实例升级到坏版本。
 # 首次发布后需在 GitHub → Packages → auto-deploy 将包可见性改为 Public，
 # 否则未登录的 docker pull 会被拒绝。
 name: Docker
@@ -11,6 +16,12 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# 同一分支/标签同时只允许一条流水线，且不取消进行中的 run：
+# 防止旧 run 晚完成，用旧内容覆盖新 latest。
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
@@ -19,8 +30,111 @@ env:
   REGISTRY_IMAGE: ghcr.io/j9kkk/auto-deploy
 
 jobs:
-  image:
-    name: 构建并推送镜像
+  build-candidate:
+    name: 构建候选镜像（amd64）
+    runs-on: ubuntu-latest
+    outputs:
+      candidate: ${{ steps.candidate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送候选镜像（仅 amd64）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY_IMAGE }}:e2e-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 记录候选镜像标签
+        id: candidate
+        run: echo "tag=${REGISTRY_IMAGE}:e2e-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    name: 真实升级 E2E（安装上一版本 → 面板升级 → 回退）
+    needs: build-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # 解析上一发布版本 PREV：匿名 ls-remote 远端 v* 语义化 tag（剔除注解
+      # tag 的 ^{} 尾巴），去 v 前缀后按版本排序。本次是 v* tag 推送时取
+      # 小于当前 tag 的最大值，否则取最大值。解析失败（含远端无任何 v* tag、
+      # 当前 tag 之前没有历史版本）立即失败，不带病进入 E2E。
+      - name: 解析上一发布版本（PREV）
+        id: prev
+        run: |
+          set -euo pipefail
+          TAGS="$(git ls-remote --tags origin 'v*' \
+            | awk '{print $2}' \
+            | sed -e 's|^refs/tags/||' -e 's/\^{}$//' \
+            | grep -E '^v[0-9]+(\.[0-9]+)*$' \
+            | sort -uV)" || true
+          if [ -z "${TAGS}" ]; then
+            echo "::error::远端不存在任何 v* 语义化 tag，无法确定上一发布版本 PREV（首次发版请先手动发布一个版本标签）"
+            exit 1
+          fi
+          CURRENT="${GITHUB_REF_NAME}"
+          PREV=""
+          if [[ "${CURRENT}" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+            while IFS= read -r t; do
+              if [ "$(printf '%s\n%s\n' "${t#v}" "${CURRENT#v}" | sort -V | head -n1)" = "${t#v}" ] \
+                 && [ "${t#v}" != "${CURRENT#v}" ]; then
+                PREV="${t}"
+              fi
+            done <<< "${TAGS}"
+            if [ -z "${PREV}" ]; then
+              echo "::error::不存在小于 ${CURRENT} 的历史版本 tag，无法确定上一发布版本 PREV"
+              exit 1
+            fi
+          else
+            PREV="$(printf '%s\n' "${TAGS}" | tail -n1)"
+          fi
+          echo "PREV_TAG=${PREV}"
+          echo "prev=${PREV}" >> "${GITHUB_OUTPUT}"
+
+      - name: 登录 GHCR（拉取候选与历史镜像）
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 运行升级 E2E
+        env:
+          CANDIDATE_IMAGE: ${{ needs.build-candidate.outputs.candidate }}
+          PREV_TAG: ${{ steps.prev.outputs.prev }}
+          E2E_PORT: 18770
+        run: bash scripts/ci/e2e-upgrade.sh
+
+      # 脚本负责把诊断写入 .e2e-run/logs/（初始密码只留在其外的 bootstrap.log，不入工件）。
+      - name: 上传 E2E 诊断工件
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-diagnostics-${{ github.run_id }}
+          path: .e2e-run/logs/
+          if-no-files-found: ignore
+
+  publish:
+    name: 发布正式镜像（amd64 + arm64）
+    needs: [build-candidate, e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,3 +172,53 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release:
+    name: 创建 GitHub Release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # 从 CHANGELOG.md 提取 "## <版本>" 段落（到下一个 "## " 之前）；
+      # 标题兼容 "## 0.3.4" 与 "## [0.3.4] - 日期" 两种写法。
+      - name: 从 CHANGELOG.md 提取本版本段落
+        id: notes
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          VER_RE="$(printf '%s' "${VER}" | sed 's/\./\\./g')"
+          BODY="$(awk -v ver="${VER_RE}" '
+            $0 ~ ("^## \\[?" ver "\\]?( |$)") { flag = 1; next }
+            /^## / { flag = 0 }
+            flag { print }
+          ' CHANGELOG.md)"
+          if [ -z "${BODY}" ]; then
+            echo "::warning::CHANGELOG.md 中未找到版本 ${VER} 的段落，Release 正文将使用兜底说明"
+            BODY="CHANGELOG.md 中未找到 ${VER} 的段落，完整变更请查看仓库 CHANGELOG.md。"
+          fi
+          {
+            echo 'body<<GH_RELEASE_NOTES_EOF'
+            printf '%s\n' "${BODY}"
+            echo 'GH_RELEASE_NOTES_EOF'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: 创建 Release（已存在则跳过）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} 已存在，跳过创建"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "AutoDeploy ${VER}" \
+              --notes "${RELEASE_NOTES}"
+            echo "已创建 Release：${GITHUB_REF_NAME}（AutoDeploy ${VER}）"
+          fi

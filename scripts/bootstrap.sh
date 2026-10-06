@@ -55,6 +55,20 @@ else
 fi
 
 # ---- 安装目录 ----
+# 规范化：去掉尾部多余的 /（根目录 / 保持原样，属边界情况）。
+while [ "${INSTALL_DIR}" != "/" ] && [ "${INSTALL_DIR%/}" != "${INSTALL_DIR}" ]; do
+  INSTALL_DIR="${INSTALL_DIR%/}"
+done
+# compose 挂载写作「宿主路径:容器路径」，面板升级也依赖同一绝对路径映射：
+# 相对路径会导致两处路径不一致，冒号 / 换行会破坏挂载语法，均直接拒绝。
+case "${INSTALL_DIR}" in
+  /*) ;;
+  *) fail "安装目录必须使用绝对路径（compose 挂载与面板升级依赖同路径映射）" ;;
+esac
+case "${INSTALL_DIR}" in
+  *:*)     fail "安装目录不能包含冒号 :（会破坏 compose 挂载语法），请更换目录" ;;
+  *$'\n'*) fail "安装目录不能包含换行符（会破坏 compose 挂载语法），请更换目录" ;;
+esac
 # 旧版脚本曾把仓库克隆到安装目录；克隆残留与镜像部署混放会互相覆盖，直接拒绝。
 if [ -d "${INSTALL_DIR}/.git" ]; then
   fail "目录 ${INSTALL_DIR} 是旧版克隆安装的残留，请先备份其中的 .env 后删除该目录再重试"
@@ -90,19 +104,73 @@ else
   rm -f "${TMP_COMPOSE}"
 fi
 
-# ---- 端口 / 镜像：写入 .env 供 compose 读取；已有 .env 时尊重现有配置 ----
-if [ ! -f .env ] || [ -n "${PORT}" ] || [ -n "${AUTODEPLOY_IMAGE+x}" ] \
-   || { [ -n "${AUTODEPLOY_VERSION+x}" ] && [ "${VERSION}" != "main" ]; }; then
-  {
-    printf 'AUTODEPLOY_PORT=%s\n' "${PORT:-8770}"
-    if [ -n "${AUTODEPLOY_VERSION+x}" ] && [ "${VERSION}" != "main" ]; then
-      # 锁定版本时同步锁定镜像 tag（GHCR 的语义化标签不含 v 前缀）
-      printf 'AUTODEPLOY_IMAGE_TAG=%s\n' "${VERSION#v}"
+# ---- upsert_env：.env 增量更新（只增删改指定键，其余行、注释与顺序原样保留）----
+# 之前在指定端口 / 镜像 / 版本时整份重写 .env，会把用户已有的镜像源、版本锁等
+# 配置一并冲掉；改为增量更新后，重复执行脚本不再丢失既有配置。
+# 临时文件必须建在安装目录内（与 .env 同一文件系统），install 的替换才能在该
+# 文件系统上原子完成；落在 /tmp 等别处会跨设备，无法原子替换。
+upsert_env() {
+  # 用法：upsert_env KEY VALUE 设置键值；upsert_env --remove KEY 删除该键的所有行
+  local ACTION="set" KEY VALUE MODE TMP RC
+  if [ "${1:-}" = "--remove" ]; then
+    ACTION="remove"
+    shift
+  fi
+  KEY="${1:?upsert_env 缺少键名}"
+  VALUE=""
+  if [ "${ACTION}" = "set" ]; then
+    VALUE="${2:?upsert_env 缺少键值}"
+  fi
+  # 无提权且现有 .env 不可读时直接中止，避免把旧配置清空（root 创建后普通用户重跑的场景）
+  if [ -z "${SUDO}" ] && [ -f .env ] && [ ! -r .env ]; then
+    fail "无法读取现有 .env（权限不足），已中止写入以保护原有配置；请用 sudo 重新执行本脚本"
+  fi
+  if [ -f .env ]; then
+    MODE="$(stat -c %a .env 2>/dev/null || true)"
+    [ -n "${MODE}" ] || MODE="600"   # 取不到权限位时按 600 处理
+  else
+    MODE="600"   # 新建 .env 固定 600，不对本机其他用户开放
+  fi
+  TMP="$(mktemp "${INSTALL_DIR}/.env.tmp.XXXXXX")"
+  RC=0
+  if [ -f .env ]; then
+    # grep -v 无匹配行返回 1（属正常，需兜底避免 set -e 误退），返回 2 及以上才是读错误
+    ${SUDO} grep -v "^${KEY}=" .env >"${TMP}" || RC=$?
+    if [ "${RC}" -gt 1 ]; then
+      rm -f "${TMP}"
+      fail "读取现有 .env 失败，已中止写入以保护原有配置；请检查文件权限后重试"
     fi
-    if [ -n "${AUTODEPLOY_IMAGE+x}" ]; then
-      printf 'AUTODEPLOY_IMAGE=%s\n' "${AUTODEPLOY_IMAGE}"
-    fi
-  } | ${SUDO} tee .env >/dev/null
+  else
+    : >"${TMP}"
+  fi
+  if [ "${ACTION}" = "set" ]; then
+    printf '%s=%s\n' "${KEY}" "${VALUE}" >>"${TMP}"
+  fi
+  if ! ${SUDO} install -m "${MODE}" "${TMP}" ".env"; then
+    rm -f "${TMP}"
+    fail "写入 .env 失败，请检查安装目录权限后重试"
+  fi
+  rm -f "${TMP}"
+}
+
+# ---- 端口 / 镜像：按意图增量写入 .env；已有 .env 时只改动本次显式指定的键 ----
+# 未显式给任何变量且 .env 已存在时什么都不改（保留现有行为：默认重跑不动已锁定的 tag）。
+if [ ! -f .env ]; then
+  upsert_env AUTODEPLOY_PORT "${PORT:-8770}"
+elif [ -n "${PORT}" ]; then
+  upsert_env AUTODEPLOY_PORT "$PORT"
+fi
+if [ -n "${AUTODEPLOY_VERSION+x}" ]; then
+  if [ "${VERSION}" = "main" ]; then
+    # 显式指定 main（最新渠道）时解除版本锁：删除 tag 锁定行，恢复跟随 latest 镜像
+    upsert_env --remove AUTODEPLOY_IMAGE_TAG
+  else
+    # 锁定版本时同步锁定镜像 tag（GHCR 的语义化标签不含 v 前缀）
+    upsert_env AUTODEPLOY_IMAGE_TAG "${VERSION#v}"
+  fi
+fi
+if [ -n "${AUTODEPLOY_IMAGE+x}" ]; then
+  upsert_env AUTODEPLOY_IMAGE "$AUTODEPLOY_IMAGE"
 fi
 SERVICE_PORT="$(grep -E '^AUTODEPLOY_PORT=' .env 2>/dev/null | tail -n 1 | cut -d= -f2 || true)"
 SERVICE_PORT="${SERVICE_PORT:-8770}"
@@ -162,6 +230,19 @@ else
   log "已按 AUTODEPLOY_MOUNT_DOCKER_SOCKET=0 跳过 socket 挂载"
 fi
 
+# ---- 属主迁移：把安装目录交给面板容器运行用户（UID 1000）----
+# 面板容器以 UID 1000 运行，旧版本面板（0.3.3/0.3.4）的面板内升级要在容器内以
+# UID 1000 改写安装目录的 .env，属主不迁移会导致 Permission denied（0.3.4 的
+# 真实事故）；新版执行器以 root 运行不依赖此项，但迁移路径需要。
+# root 直跑时 SUDO 为空但文件同样归 root，故两种情况都执行；已属 1000 时
+# chown 是无害的 no-op。自定义 override 非脚本代管，不动其属主。
+if [ "$(id -u)" -eq 0 ] || [ -n "${SUDO}" ]; then
+  ${SUDO} chown 1000:1000 "${INSTALL_DIR}" .env docker-compose.yml
+  if [ "${OURS_OVERRIDE}" -eq 1 ]; then
+    ${SUDO} chown 1000:1000 "${OVERRIDE_FILE}"
+  fi
+fi
+
 # ---- 拉取镜像并启动 ----
 log "拉取官方镜像并启动（首次需要下载几百 MB）…"
 if ! ${DOCKER} compose pull; then
@@ -181,6 +262,22 @@ for _ in $(seq 1 90); do
 done
 if [ "${READY}" -ne 1 ]; then
   fail "服务未就绪，请查看日志：cd ${INSTALL_DIR} && ${DOCKER} compose logs autodeploy"
+fi
+
+# ---- 版本核对：报告运行中的服务版本；锁定版本时不一致即失败 ----
+HEALTH_JSON="$(curl -fsS "http://127.0.0.1:${SERVICE_PORT}/api/health" 2>/dev/null || true)"
+RUNNING_VERSION="$(printf '%s' "${HEALTH_JSON}" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+if [ -n "${RUNNING_VERSION}" ]; then
+  log "服务版本: ${RUNNING_VERSION}"
+else
+  log "服务版本: 未知（未能从 /api/health 读取）"
+fi
+if [ -n "${AUTODEPLOY_VERSION+x}" ] && [ "${VERSION}" != "main" ]; then
+  # 接口返回形如 0.3.5，锁定值可能带 v 前缀，比较前先统一去掉
+  LOCKED_VERSION="${VERSION#v}"
+  if [ "${RUNNING_VERSION#v}" != "${LOCKED_VERSION}" ]; then
+    fail "服务版本 ${RUNNING_VERSION:-未知} 与锁定的 ${LOCKED_VERSION} 不一致，请查看 compose 日志排查"
+  fi
 fi
 
 # ---- 初始密码（仅首次启动打印一次）----

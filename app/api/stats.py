@@ -16,6 +16,7 @@ from .. import config
 from .. import selfupdate
 from ..selfupdate import ACTIVE_STAGES
 from ..deployer import METHOD_LABELS, cleanup_path
+from ..executor import redact
 from ..runner import STATUS_LABELS
 from ..schedule import iso, local_tz, utcnow
 from ..service import Service
@@ -317,9 +318,11 @@ def self_update_status(
 ) -> dict[str, Any]:
     state = service.selfupdate.state()
     mode = selfupdate.docker_run_mode()
+    blocked = service.selfupdate.deployment_blocked()
     return {
         **state,
-        "active": state.get("stage") in ACTIVE_STAGES,
+        "active": state.get("stage") in ACTIVE_STAGES or blocked,
+        "blocked": blocked,
         **service.selfupdate.backup_status(),
         "current_version": VERSION,
         "run_mode": mode,
@@ -359,7 +362,7 @@ def start_self_update(
         state = service.selfupdate.start(body.get("target_version"))
     except RuntimeError as exc:
         audit(service, "self_update_rejected", actor=user["username"],
-              target="self-update", detail=f"target={body.get('target_version')} error={exc}",
+              target="self-update", detail=redact(f"target={body.get('target_version')} error={exc}"),
               ip=client_ip(request) if request else "")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit(service, "self_update_started", actor=user["username"],
@@ -385,11 +388,34 @@ def rollback_self_update(
         )
     except RuntimeError as exc:
         audit(service, "self_update_rejected", actor=user["username"],
-              target="self-update", detail=f"rollback target={target or target_image} error={exc}",
+              target="self-update", detail=redact(f"rollback target={target or target_image} error={exc}"),
               ip=client_ip(request) if request else "")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     audit(service, "self_update_rollback", actor=user["username"],
           target="self-update",
-          detail=f"image={target_image}" if target_image else (f"target={target}" if target else "最近备份"),
+          detail=redact(f"image={target_image}" if target_image else (f"target={target}" if target else "最近备份")),
           ip=client_ip(request) if request else "")
     return result
+
+
+@router.post("/system/self-update/attention")
+def handle_attention(
+    payload: dict[str, Any] | None = None,
+    request: Request = None,  # type: ignore[assignment]  # FastAPI 按名注入；显式默认 None 仅为审计容错
+    service: Service = Depends(get_service),
+    user: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """人工处置结果不确定的升级：继续等待执行器，或确认已手动处理。"""
+    body = payload or {}
+    action = body.get("action")
+    try:
+        state = service.selfupdate.attention_action(action if isinstance(action, str) else "")
+    except RuntimeError as exc:
+        audit(service, "self_update_attention_rejected", actor=user["username"],
+              target="self-update", detail=redact(f"action={action} error={exc}"),
+              ip=client_ip(request) if request else "")
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    audit(service, "self_update_attention", actor=user["username"],
+          target="self-update", detail=f"action={action}",
+          ip=client_ip(request) if request else "")
+    return {"ok": True, "state": state}

@@ -3111,12 +3111,18 @@ AD.views = {};
     queued: '排队中', checking: '检查中', downloading: '下载中', backing_up: '备份代码',
     applying: '替换代码', dependencies: '更新依赖', pulling_image: '拉取镜像',
     recreating: '重建容器', restarting: '等待重启确认',
+    preparing: '升级准备', prepared: '等待切换', switching: '切换版本',
+    executing: '升级执行器运行中', verifying: '验证新版本',
+    rolled_back: '已恢复旧版本', attention: '需要人工处理', recovery_required: '需要人工恢复',
     done: '已确认完成', failed: '失败', error: '失败', idle: '尚未更新',
     unverified: '历史操作未确认',
   };
   // 步骤条：Docker 与裸机各自的阶段序列，drawUpdateProgress 用来画进度。
+  // Docker 新模型为独立执行器容器（拉取 → 执行器运行 → 验证）；旧版本写入的
+  // docker-recreate 状态仍按「拉取 → 重建 → 重启」展示。
   const UPD_STAGE_STEPS = {
-    docker: ['pulling_image', 'recreating', 'restarting'],
+    docker: ['pulling_image', 'executing', 'verifying'],
+    docker_recreate: ['pulling_image', 'recreating', 'restarting'],
     bare: ['downloading', 'backing_up', 'applying', 'dependencies', 'restarting'],
   };
 
@@ -3154,6 +3160,7 @@ AD.views = {};
       + '<div id="upd-alerts"></div>'
       + '<div id="upd-progress"></div>';
     loadUpdateSettings(ctx);  // 更新源与代理说明用于确认弹窗和配置弹窗
+    loadUpdateHistory(ctx);   // 预载升级历史：首次进页面即可渲染「回退 ▾」（失败静默）
     drawUpdateRow(ctx);
     drawUpdateProgress(ctx);
     pollUpdateStatus(ctx);    // 先恢复持久化状态，不用 health 推断成功。
@@ -3196,13 +3203,22 @@ AD.views = {};
     } catch (err) { /* 说明文字退化为默认文案，不影响升级主流程 */ }
   }
 
-  /** 严格确认：只有重启后进程身份与版本都对齐才认定成功。 */
+  /** 预载升级历史供回退菜单使用；失败静默，点击展开菜单时仍会重新拉取。 */
+  async function loadUpdateHistory(ctx) {
+    try {
+      const data = await updateRequest(ctx, '/api/system/self-update/history', 'GET', undefined, 20000);
+      if (updateAlive(ctx)) { ctx.historyData = data; drawUpdateRow(ctx); }
+    } catch (err) { /* 回退菜单退化为点击展开时再拉取，不影响升级主流程 */ }
+  }
+
+  /** 严格确认：重启后启动身份与版本对齐才认定成功；跨容器 PID 可能相同，不作依据。 */
   function updateConfirmed(state) {
     return state.stage === 'done' && state.confirmed_operation_id === state.operation_id && state.operation_id
       && state.confirmed_operation === state.operation && ['update', 'rollback'].includes(state.operation)
-      && state.boot_id && state.boot_id !== state.before_boot_id && state.pid !== state.before_pid
-      && bareVersion(state.current_version) === state.expected_version
-      && bareVersion(state.version) === state.expected_version;
+      && state.boot_id && state.boot_id !== state.before_boot_id
+      // 仅在后端给出 expected_version 时校验版本一致；缺失时不阻断确认。
+      && (!state.expected_version || (bareVersion(state.current_version) === state.expected_version
+        && bareVersion(state.version) === state.expected_version));
   }
 
   // ----------------------------------------------------------- 单行展示区
@@ -3244,7 +3260,9 @@ AD.views = {};
       latest = '<span class="upd-latest dim">当前已是最新版本</span>';
     }
     // 轮询每 1.5s 触发一次；只有内容真的变了才重建节点，避免打断悬停与焦点。
-    const signature = [current, active, ctx.checking, latest, ctx.rollbackOpen, isAdmin].join('|');
+    // 历史预载完成后也要重建一次：回退按钮依赖 ctx.historyData。
+    const signature = [current, active, ctx.checking, latest, ctx.rollbackOpen, isAdmin,
+      Boolean(ctx.historyData)].join('|');
     if (signature === ctx.rowSig) return;
     ctx.rowSig = signature;
     row.innerHTML = '<span class="upd-item">当前版本 <strong class="mono">'
@@ -3341,13 +3359,23 @@ AD.views = {};
     const unverified = state.stage === 'unverified' || (state.stage === 'done' && !confirmed)
       || (state.stage === 'restarting' && !state.active);
     const failed = Boolean(state.error) || ['failed', 'error'].includes(state.stage);
-    const tone = failed ? 'error' : unverified ? 'warning' : confirmed ? 'success' : state.active ? 'info' : 'neutral';
+    // 委托执行器的协同阶段用专属 tone 与按钮区，不落入通用的失败/未确认分支。
+    const stageTone = { attention: 'warning', recovery_required: 'error', rolled_back: 'warning' }[state.stage] || '';
+    const tone = stageTone || (failed ? 'error' : unverified ? 'warning' : confirmed ? 'success'
+      : state.active ? 'info' : 'neutral');
     const label = unverified ? '历史操作未确认' : UPD_STAGE_LABELS[state.stage] || state.stage || '状态未知';
     const logs = state.log || [];
-    const steps = (state.restart === 'docker-recreate' || ctx.runMode === 'docker'
-      ? UPD_STAGE_STEPS.docker : UPD_STAGE_STEPS.bare);
+    // 旧记录（restart === 'docker-recreate'）沿用旧步骤序列；新模型为执行器容器
+    // 三步。preparing/prepared/switching 都折叠到「升级执行器运行中」这一步。
+    const steps = (state.restart === 'docker-recreate' ? UPD_STAGE_STEPS.docker_recreate
+      : ctx.runMode === 'docker' ? UPD_STAGE_STEPS.docker : UPD_STAGE_STEPS.bare);
+    const stepStage = steps.includes(state.stage) ? state.stage
+      : ['preparing', 'prepared', 'switching'].includes(state.stage) && steps.includes('executing')
+        ? 'executing' : null;
+    const restoreRef = state.from_image_ref || '';
     const signature = [state.stage, state.active, tone, label, confirmed, unverified,
-      state.target_version, state.version, state.error, state.notice, logs.length, logs[logs.length - 1]]
+      state.target_version, state.version, state.error, state.notice, logs.length, logs[logs.length - 1],
+      restoreRef]
       .join('|');
     if (signature === ctx.progSig) return;
     ctx.progSig = signature;
@@ -3355,8 +3383,23 @@ AD.views = {};
       + (state.active ? '当前操作状态：' : '上次操作状态：') + e(label)
       + (state.target_version ? ' · 目标版本 ' + e(versionText(state.target_version)) : '')
       + (state.error ? '<div class="upd-operation-error">' + e(state.error) + '</div>' : '') + '</div>';
-    if (state.active && steps.includes(state.stage)) {
-      const index = steps.indexOf(state.stage);
+    if (state.stage === 'attention') {
+      // 执行器还在运行、结果未定：给出三个出口；恢复按钮依赖旧镜像引用。
+      html += '<div>'
+        + (restoreRef ? '<button class="sm" id="upd-attention-restore">恢复到升级前版本</button>' : '')
+        + '<button class="sm" id="upd-attention-wait">继续等待</button>'
+        + '<button class="sm" id="upd-attention-resolve">我已手动处理</button></div>';
+    } else if (state.stage === 'recovery_required') {
+      // 执行器已退出且自动恢复失败：只能恢复旧版本，或确认人工已处理。
+      html += '<div>'
+        + (restoreRef ? '<button class="sm" id="upd-recovery-restore">恢复到升级前版本</button>' : '')
+        + '<button class="sm" id="upd-recovery-resolve">我已手动处理</button></div>';
+    } else if (state.stage === 'rolled_back') {
+      // 自动恢复已完成：说明旧容器仍在服务，无需用户操作。
+      html += '<div class="alert warning">升级失败，已自动恢复到升级前版本；旧容器继续提供服务</div>';
+    }
+    if (state.active && stepStage) {
+      const index = steps.indexOf(stepStage);
       html += '<div class="upd-steps" id="upd-steps">' + steps.map((stage, i) => {
         const tone2 = i < index ? 'done' : i === index ? 'current' : 'todo';
         return '<span class="upd-step ' + tone2 + '"><span class="upd-step-dot"></span>'
@@ -3373,7 +3416,7 @@ AD.views = {};
         + e(versionText(state.version || state.target_version)) + '</strong>，请刷新页面以加载新界面。'
         + '<div><button class="primary sm" id="upd-reload">刷新页面</button></div></div>';
     }
-    if (failed && state.operation_id && state.operation === 'update') {
+    if (failed && !stageTone && state.operation_id && state.operation === 'update') {
       html += '<div><button class="sm" id="upd-failed-rollback">回退到升级前版本</button></div>';
     }
     if (state.active || logs.length) {
@@ -3399,11 +3442,36 @@ AD.views = {};
       location.reload();
     });
     box.querySelector('#upd-failed-rollback')?.addEventListener('click', () => {
-      // 升级失败后的快捷回退：优先按镜像引用回退（Docker），否则回退最近备份。
-      const ref = ctx.state && ctx.state.from_image;
+      // 升级失败后的快捷回退：优先按镜像引用回退（Docker；新状态为 from_image_ref，
+      // 旧状态为 from_image），否则回退最近备份。
+      const ref = ctx.state && (ctx.state.from_image_ref || ctx.state.from_image);
       if (ref) startUpdateOperation(ctx, 'rollback', ref.split(':').pop() || ref, { target_image: ref });
       else startUpdateOperation(ctx, 'rollback', '');
     });
+    const restoreUpgrade = () => {
+      // 协同阶段的恢复入口：按升级前镜像引用回退（Docker 委托执行的固定路径）。
+      const ref = ctx.state && ctx.state.from_image_ref;
+      if (ref) startUpdateOperation(ctx, 'rollback', ref.split(':').pop() || ref, { target_image: ref });
+      else startUpdateOperation(ctx, 'rollback', '');
+    };
+    box.querySelector('#upd-attention-restore')?.addEventListener('click', restoreUpgrade);
+    box.querySelector('#upd-recovery-restore')?.addEventListener('click', restoreUpgrade);
+    const attentionAction = (action) => async () => {
+      // wait=执行器仍在运行，继续等待；resolve=用户已手动处理（转 failed 并解除禁入）。
+      // 轮询循环在 attention 阶段不会停（active=true 持续 setTimeout），这里只就地重绘。
+      try {
+        const result = await updateRequest(ctx, '/api/system/self-update/attention', 'POST', { action }, 30000);
+        if (!updateAlive(ctx)) return;
+        ctx.state = { ...ctx.state, ...result.state };
+        drawUpdateRow(ctx);
+        drawUpdateProgress(ctx);
+      } catch (err) {
+        updateError(ctx, err.status ? err.message : err.message + '；请求可能已送达，可重新读取状态确认');
+      }
+    };
+    box.querySelector('#upd-attention-wait')?.addEventListener('click', attentionAction('wait'));
+    box.querySelector('#upd-attention-resolve')?.addEventListener('click', attentionAction('resolve'));
+    box.querySelector('#upd-recovery-resolve')?.addEventListener('click', attentionAction('resolve'));
   }
 
   async function pollUpdateStatus(ctx) {
@@ -3486,7 +3554,8 @@ AD.views = {};
       let detail;
       if (operation === 'update' && ctx.runMode === 'docker') {
         message = '将拉取新镜像 ' + e(versionText(target)) + ' 并重建容器（约 10 秒，期间面板短暂不可用）。';
-        detail = '任务数据、配置与历史记录均保留（数据在独立卷中）；拉取失败或启动异常时旧容器不受影响，可一键回退。'
+        detail = '任务数据、配置与历史记录均保留（数据在独立卷中）；切换前会备份 .env 并记录旧镜像，'
+          + '启动异常时自动恢复旧版本；恢复失败时界面会给出人工处理指引。'
           + '更新源：' + e(repo) + '；网络代理：' + e(proxy) + '。';
       } else if (isImage) {
         message = '将把镜像切回 ' + e(target) + ' 并重建容器（期间面板短暂不可用）。';
@@ -3514,7 +3583,8 @@ AD.views = {};
       const result = await updateRequest(ctx, path, 'POST', payload, 30000);
       if (!updateAlive(ctx)) return false;
       ctx.operationId = result.state.operation_id;
-      ctx.deadline = Date.now() + 30 * 60 * 1000;
+      // 执行器升级含拉取、切换与验证，预算从 30 分钟放宽到 45 分钟。
+      ctx.deadline = Date.now() + 45 * 60 * 1000;
       ctx.polls = 0;
       ctx.failures = 0;
       ctx.state = { ...(ctx.state || {}), ...result.state, active: true };
