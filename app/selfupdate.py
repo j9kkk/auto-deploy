@@ -613,6 +613,14 @@ class SelfUpdateManager:
     def _log(self, state: dict[str, Any], message: str) -> None:
         log_line(state, message)
 
+    def _log_and_save(self, state: dict[str, Any], message: str) -> None:
+        """后台清理路径的日志：写内存并落盘，失败静默（清理本身不重要）。"""
+        log_line(state, message)
+        try:
+            save_state_file(state)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------- 历史
     @property
     def history_path(self) -> Path:
@@ -1419,6 +1427,8 @@ class SelfUpdateManager:
             if fresh.get("operation_id") != operation_id:
                 return
             if fresh.get("stage") in TERMINAL_STAGES:
+                # 终态即清理已退出的执行器容器，不留到下一次升级才收。
+                self._cleanup_executor_containers(lambda m: self._log_and_save(fresh, m))
                 return
             if time.time() > deadline:
                 self._mark_attention(fresh, "升级执行器超时且未记录结果，结果不确定；请处置后继续")
@@ -1428,6 +1438,7 @@ class SelfUpdateManager:
                 fresh = load_state_file()
                 if (fresh.get("operation_id") == operation_id
                         and fresh.get("stage") in TERMINAL_STAGES):
+                    self._cleanup_executor_containers(lambda m: self._log_and_save(fresh, m))
                     return
                 self._mark_attention(
                     fresh, f"升级执行器已退出但未记录结果，结果不确定；可查看执行器日志：docker logs {name}")
@@ -1674,6 +1685,9 @@ class SelfUpdateManager:
         fresh = load_state_file()
         if (fresh.get("operation_id") == state.get("operation_id")
                 and fresh.get("stage") in TERMINAL_STAGES):
+            # 新进程接管后补一次清理：监控线程可能随旧容器重建一起消失，
+            # 没机会执行终态清理；这里兜底避免执行器容器残留。
+            self._cleanup_executor_containers(lambda m: self._log_and_save(fresh, m))
             return
         payload = fresh if fresh.get("operation_id") == state.get("operation_id") else dict(state)
         self._mark_attention(payload, "升级执行器不在运行且未记录结果，结果不确定；请处置后继续")

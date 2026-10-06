@@ -2239,7 +2239,8 @@ def run() -> int:
                     self.local.add(args[3])
                     return SimpleNamespace(ok=True, output="")
                 if args[:3] == ["docker", "ps", "-a"]:
-                    return SimpleNamespace(ok=True, output="")
+                    # 执行器容器已退出（真实环境终态后应被清理的残留形态）。
+                    return SimpleNamespace(ok=True, output="execdeadbeef1234 exited\n")
                 if args[:2] == ["docker", "rm"]:
                     return SimpleNamespace(ok=True, output="")
                 if args[:2] == ["docker", "inspect"]:
@@ -2345,6 +2346,10 @@ def run() -> int:
               dmgr.history() and dmgr.history()[0].get('from_image') == REPO + ':1.0.0'
               and dmgr.history()[0].get('to_image') == REPO + ':2.0.0'
               and dmgr.history()[0]['stage'] == 'done')
+        rm_ids = [a[3] for a in fake.calls if a[:2] == ["docker", "rm"]]
+        check('终态后已退出的执行器容器被清理（不留到下次升级）',
+              bool(rm_ids) and all(cid == 'execdeadbeef1234' for cid in rm_ids),
+              f'rm 调用：{rm_ids[:3]}')
 
         # 重建失败：执行器自动恢复 .env 快照并重建旧版本。
         fake.up_fail_once = True
