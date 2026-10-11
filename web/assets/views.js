@@ -1902,14 +1902,29 @@ AD.views = {};
   // ======================================================================
   // Runs list
   // ======================================================================
-  const runFilter = { status: '', task_id: '', search: '' };
+  const RUNS_PAGE_SIZE = 60;
+  const runFilter = { status: '', task_id: '', search: '', page: 1 };
 
-  AD.views.runs = async function (container) {
-    const params = new URLSearchParams({ limit: '60' });
+  // 列表与轮询共用同一组参数：offset 由当前页推导，就地同步只刷新当前页的行。
+  function runsQueryParams() {
+    const params = new URLSearchParams({
+      limit: String(RUNS_PAGE_SIZE),
+      offset: String((runFilter.page - 1) * RUNS_PAGE_SIZE),
+    });
     if (runFilter.status) params.set('status', runFilter.status);
     if (runFilter.task_id) params.set('task_id', runFilter.task_id);
     if (runFilter.search) params.set('search', runFilter.search);
-    const data = await AD.api.get('/api/runs?' + params.toString());
+    return params;
+  }
+
+  AD.views.runs = async function (container) {
+    const data = await AD.api.get('/api/runs?' + runsQueryParams().toString());
+    const totalPages = Math.max(1, Math.ceil((data.total || 0) / RUNS_PAGE_SIZE));
+    if (runFilter.page > totalPages) {
+      // 筛选收紧或记录被删除后当前页可能越界，收敛到最后一页重取一次。
+      runFilter.page = totalPages;
+      return AD.views.runs(container);
+    }
 
     if (!AD.state.tasks.length) {
       try { AD.state.tasks = (await AD.api.get('/api/tasks')).tasks || []; } catch (err) { /* ignore */ }
@@ -1966,24 +1981,45 @@ AD.views = {};
         : `<div class="empty"><div class="big">📋</div><h3>没有匹配的运行记录</h3>
            <p class="faint">调整筛选条件，或先在任务页面手动运行一次</p></div>`}
       </div>
+      ${totalPages > 1 ? `
+      <div class="pager" id="runs-pager">
+        <button class="ghost sm"${runFilter.page <= 1 ? ' disabled' : ''} data-run-page="1">首页</button>
+        <button class="ghost sm"${runFilter.page <= 1 ? ' disabled' : ''} data-run-page="${runFilter.page - 1}">上一页</button>
+        <span class="pager-info">第 ${runFilter.page} / ${totalPages} 页 · 共 ${data.total} 条</span>
+        <button class="ghost sm"${runFilter.page >= totalPages ? ' disabled' : ''} data-run-page="${runFilter.page + 1}">下一页</button>
+        <button class="ghost sm"${runFilter.page >= totalPages ? ' disabled' : ''} data-run-page="${totalPages}">末页</button>
+      </div>` : ''}
     `;
 
     container.querySelector('#runs-refresh').addEventListener('click', () => AD.render('runs'));
 
+    // 翻页：整页重绘即可，筛选与页码都留在 runFilter 里。
+    const pager = container.querySelector('#runs-pager');
+    if (pager) {
+      pager.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-run-page]');
+        if (!button || button.disabled) return;
+        runFilter.page = Number(button.dataset.runPage);
+        AD.render('runs');
+      });
+    }
+
     container.querySelectorAll('#status-filter button').forEach((button) => {
-      button.addEventListener('click', () => { runFilter.status = button.dataset.status; AD.render('runs'); });
+      button.addEventListener('click', () => {
+        runFilter.status = button.dataset.status; runFilter.page = 1; AD.render('runs');
+      });
     });
 
     const taskFilter = container.querySelector('#task-filter');
-    taskFilter.addEventListener('change', () => { runFilter.task_id = taskFilter.value; AD.render('runs'); });
+    taskFilter.addEventListener('change', () => { runFilter.task_id = taskFilter.value; runFilter.page = 1; AD.render('runs'); });
 
     const search = container.querySelector('#run-search');
-    search.addEventListener('input', AD.debounce(() => { runFilter.search = search.value; AD.render('runs'); }, 320));
+    search.addEventListener('input', AD.debounce(() => { runFilter.search = search.value; runFilter.page = 1; AD.render('runs'); }, 320));
 
     const clear = container.querySelector('#runs-clear');
     if (clear) {
       clear.addEventListener('click', () => {
-        runFilter.status = ''; runFilter.task_id = ''; runFilter.search = '';
+        runFilter.status = ''; runFilter.task_id = ''; runFilter.search = ''; runFilter.page = 1;
         AD.render('runs');
       });
     }
@@ -2011,11 +2047,7 @@ AD.views = {};
     // 就地更新：只同步状态变化了的行，不重建表格。没有活跃运行时不发请求。
     AD.state.viewRefresh = async () => {
       if (!container.querySelector('[data-run-cancel]')) return;
-      const params = new URLSearchParams({ limit: '60' });
-      if (runFilter.status) params.set('status', runFilter.status);
-      if (runFilter.task_id) params.set('task_id', runFilter.task_id);
-      if (runFilter.search) params.set('search', runFilter.search);
-      const fresh = await AD.api.get('/api/runs?' + params.toString());
+      const fresh = await AD.api.get('/api/runs?' + runsQueryParams().toString());
       const byId = new Map((fresh.runs || []).map((run) => [run.id, run]));
       for (const run of byId.values()) AD.syncRunInPlace(run);
     };

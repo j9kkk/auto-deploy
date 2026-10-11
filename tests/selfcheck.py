@@ -1486,6 +1486,35 @@ def run() -> int:
         response = client.get("/api/runs?search=端到端")
         check("按关键字搜索生效", response.status_code == 200)
 
+        # --- runs pagination -----------------------------------------
+        # 播种一批已结束运行，让分页断言与前面部署产生了多少条记录无关。
+        seed_task = service.store.tasks.get(task_id)
+        for _ in range(8):
+            seeded = service.store.runs.create(seed_task, trigger="manual")
+            service.store.runs.mark_finished(
+                seeded, status="success", exit_code=0, duration_ms=100)
+        all_total = client.get("/api/runs?limit=1").json()["total"]
+        page_one = client.get("/api/runs?limit=3").json()
+        check("分页回显 limit/offset/total",
+              page_one["limit"] == 3 and page_one["offset"] == 0
+              and page_one["total"] == all_total,
+              str(page_one["total"]))
+        check("首页返回 limit 条记录", len(page_one["runs"]) == 3)
+        page_two = client.get("/api/runs?limit=3&offset=3").json()
+        ids_one = [r["id"] for r in page_one["runs"]]
+        ids_two = [r["id"] for r in page_two["runs"]]
+        check("翻页不重叠且整体按新到旧",
+              not set(ids_one) & set(ids_two)
+              and ids_one + ids_two == sorted(ids_one + ids_two, reverse=True),
+              f"{ids_one} + {ids_two}")
+        over = client.get("/api/runs?limit=3&offset=999").json()
+        check("越界分页返回空列表且 total 不变",
+              over["runs"] == [] and over["total"] == all_total)
+        filtered = client.get("/api/runs?status=success&limit=2&offset=2").json()
+        check("筛选与分页可叠加",
+              all(r["status"] == "success" for r in filtered["runs"])
+              and filtered["total"] >= 8)
+
         # --- log tail polling ---------------------------------------
         response = client.get(f"/api/runs/{run}/tail?after=0")
         check("日志增量接口可用", response.status_code == 200)
