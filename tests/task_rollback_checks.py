@@ -81,6 +81,10 @@ def run_checks(ok, TMP):
                 rollback_log.extend(lines)
                 rollback_log.append(message)
                 status = "success" if ok_flag else "failed"
+                # 先记 outcomes 再落终态：request() 的等待循环只看运行记录是否
+                # 脱离 queued/running，若落终态在先，循环可能在 outcomes.append
+                # 之前返回，后面的 next(...) 断言会偶发 StopIteration。
+                outcomes.append((run_id, ok_flag, message))
                 store.runs.mark_running(run_id)
                 store.runs.mark_finished(
                     run_id, status=status, exit_code=0 if ok_flag else 1, error="" if ok_flag else message
@@ -88,7 +92,6 @@ def run_checks(ok, TMP):
                 store.tasks.record_run_finished(
                     int(task_row["id"]), run_id=run_id, status=status, duration_ms=1
                 )
-                outcomes.append((run_id, ok_flag, message))
 
             service = SimpleNamespace(
                 store=store, settings=config.Settings(), scheduler=SimpleNamespace(_lock=lock),
