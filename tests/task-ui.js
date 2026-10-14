@@ -759,9 +759,14 @@ function styleChecks() {
   }
   // 每个任务单元格都必须带 data-label，否则卡片模式下标签缺失。
   const labels = source.match(/data-label="([^"]+)"/g) || [];
-  for (const label of ['任务', '状态', '调度', '部署方式', '最近运行', '下次执行', '操作']) {
+  for (const label of ['启用', '任务', '状态', '调度', '部署方式', '最近运行', '下次执行', '操作']) {
     assert.ok(labels.includes('data-label="' + label + '"'), '任务行缺少 data-label="' + label + '"');
   }
+  // 启用列是行首 switch（复选框 + 轨道），不是图标按钮。
+  assert.ok(source.includes('class="switch"'), '任务行缺少行首启用 switch');
+  assert.ok(css.includes('input:checked + .switch-track'), '缺少 switch 选中态样式');
+  assert.ok(source.includes('<td data-label="启用">'), '任务行缺少行首启用列');
+  assert.ok(css.includes('td[data-label="启用"]'), '移动端缺少启用列对齐样式');
 }
 
 (async () => {

@@ -66,8 +66,6 @@ AD.views = {};
     scroll: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4.5h9.5a2 2 0 0 1 2 2v11a2 2 0 0 0 2 2H8.5a2 2 0 0 1-2-2z"/><path d="M8.5 20.5a2 2 0 0 1-2-2v-11a2 2 0 0 0-2-2"/><path d="M10.5 9h5M10.5 12.5h5"/></svg>',
     log: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 5.5h16M4 12h16M4 18.5h10"/></svg>',
     edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20h4.5L19 9.5a2.1 2.1 0 0 0-3-3L5.5 17 4 20z"/></svg>',
-    disable: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.2"/><path d="M6 6l12 12"/></svg>',
-    enable: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
     refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v4h-4"/></svg>',
     download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 11 5 5 5-5"/><path d="M5 20h14"/></svg>',
     rollback: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>',
@@ -387,7 +385,7 @@ AD.views = {};
     return `<div class="panel">
       <div class="table-wrap"><table class="task-table">
         <thead><tr>
-          <th>任务</th><th>状态</th><th>调度</th><th>部署方式</th>
+          <th>启用</th><th>任务</th><th>状态</th><th>调度</th><th>部署方式</th>
           <th>最近运行</th><th>下次执行</th><th class="right">操作</th>
         </tr></thead>
         <tbody>${tasks.map(taskRow).join('')}</tbody>
@@ -423,14 +421,15 @@ AD.views = {};
       : `<button class="icon-btn run" data-task-run="${task.id}" title="立即运行" aria-label="立即运行">${ICONS.play}</button>`;
 
     const expanded = AD.state.expandedTaskId === task.id;
-    // 启用/禁用用颜色区分状态：启用=绿底（点击将禁用），禁用=灰/黄底（点击将启用）
-    const toggleButton = task.enabled
-      ? `<button class="icon-btn state-on" data-task-toggle="${task.id}"
-                 title="禁用调度" aria-label="禁用调度">${ICONS.disable}</button>`
-      : `<button class="icon-btn state-off" data-task-toggle="${task.id}"
-                 title="启用调度" aria-label="启用调度">${ICONS.enable}</button>`;
+    // 行首 switch 表示整个任务的启用/禁用（含调度触发），不再是「仅调度」。
+    const enabledSwitch = `<label class="switch" title="${task.enabled ? '已启用，点击禁用' : '已禁用，点击启用'}">
+      <input type="checkbox" data-task-toggle="${task.id}"${task.enabled ? ' checked' : ''}
+             aria-label="${task.enabled ? '禁用任务' : '启用任务'}">
+      <span class="switch-track" aria-hidden="true"></span>
+    </label>`;
 
     return `<tr data-task-row="${task.id}" class="${task.enabled ? '' : 'row-disabled'}">
+      <td data-label="启用">${enabledSwitch}</td>
       <td class="task-name-cell" data-label="任务">
         <button type="button" class="task-name-link" data-task-edit="${task.id}"
                 title="点击编辑任务">${e(task.name)}</button>
@@ -451,7 +450,6 @@ AD.views = {};
                   aria-label="${expanded ? '收起日志' : '展开最近日志'}"
                   aria-expanded="${expanded ? 'true' : 'false'}">${ICONS.scroll}</button>
           ${runButton}
-          ${toggleButton}
           <button class="icon-btn danger" data-task-delete="${task.id}"
                   title="${active ? '任务运行中，需先取消才能删除' : '删除任务'}"
                   aria-label="${active ? '任务运行中，需先取消才能删除' : '删除任务'}">${ICONS.trash}</button>
@@ -525,11 +523,22 @@ AD.views = {};
       }
       const toggle = event.target.closest('[data-task-toggle]');
       if (toggle) {
-        handle(toggle, async () => {
-          const result = await AD.api.post(`/api/tasks/${toggle.dataset.taskToggle}/toggle`);
-          AD.toastSuccess(result.enabled ? '任务已启用' : '任务已禁用');
-          await AD.refreshTaskRowsInPlace();
-        });
+        // 现在是行首的 switch 复选框：请求期间保持新状态、失败时回滚勾选，
+        // 不能套用 setBusy（它会把 innerHTML 覆写成 spinner 文本）。
+        if (toggle.disabled) return;
+        const input = toggle;
+        input.disabled = true;
+        const revert = () => { input.checked = !input.checked; input.disabled = false; };
+        (async () => {
+          try {
+            const result = await AD.api.post(`/api/tasks/${input.dataset.taskToggle}/toggle`);
+            AD.toastSuccess(result.enabled ? '任务已启用' : '任务已禁用');
+            await AD.refreshTaskRowsInPlace();
+          } catch (err) {
+            revert();
+            AD.toastError(err.message);
+          }
+        })();
         return;
       }
       const remove = event.target.closest('[data-task-delete]');
@@ -586,7 +595,7 @@ AD.views = {};
     const placeholder = document.createElement('tr');
     placeholder.className = 'expand-row';
     placeholder.id = `task-expand-${taskId}`;
-    placeholder.innerHTML = `<td colspan="7"><div class="task-expand">
+    placeholder.innerHTML = `<td colspan="8"><div class="task-expand">
       <div class="loading-block" style="padding:22px"><span class="spinner"></span> 加载中…</div>
     </div></td>`;
     row.after(placeholder);
@@ -943,7 +952,8 @@ AD.views = {};
       }
 
       // 状态徽标与计数：与新表格同一套渲染逻辑，避免两者显示不一致。
-      const statusCell = row.querySelector('td:nth-child(2)');
+      // 按 data-label 定位，列序调整（如行首插入启用 switch）不会错位。
+      const statusCell = row.querySelector('td[data-label="状态"]');
       if (statusCell) {
         const statusBadge = active
           ? `<span class="badge ${e(active.status)}"><span class="dot ${e(active.status)}"></span>${e(AD.statusLabel(active.status))}</span>`
@@ -957,7 +967,7 @@ AD.views = {};
       }
 
       // 最近运行列
-      const lastRunCell = row.querySelector('td:nth-child(5)');
+      const lastRunCell = row.querySelector('td[data-label="最近运行"]');
       if (lastRunCell) {
         lastRunCell.innerHTML = found.last_status
           ? `<span class="badge ${e(found.last_status)}">${e(AD.statusLabel(found.last_status))}</span>

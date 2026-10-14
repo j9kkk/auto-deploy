@@ -295,19 +295,46 @@ tbody tr:last-child td { border-bottom: none; }
   color: var(--accent);
 }
 
-/* 启用/禁用按钮：用底色区分当前状态（点击后状态翻转） */
-.icon-btn.state-on {
-  background: var(--success-soft);
-  border-color: rgba(62,207,142,0.4);
-  color: var(--success);
+/* 启用 switch：行首列，表示整个任务是否启用（含调度触发与自动部署）。
+ * 开=绿色、关=灰色；禁用行整体压暗由 .row-disabled 负责。 */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  vertical-align: middle;
 }
-.icon-btn.state-on:hover:not(:disabled) { background: rgba(62,207,142,0.24); }
-.icon-btn.state-off {
-  background: var(--warning-soft);
-  border-color: rgba(245,181,68,0.45);
-  color: var(--warning);
+.switch input {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
-.icon-btn.state-off:hover:not(:disabled) { background: rgba(245,181,68,0.28); }
+.switch-track {
+  width: 34px; height: 19px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  position: relative;
+  transition: background .18s ease;
+  flex: none;
+}
+.switch-track::after {
+  content: '';
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 15px; height: 15px;
+  border-radius: 50%;
+  background: #cfd5df;
+  transition: transform .18s cubic-bezier(.16,1,.3,1), background .18s ease;
+}
+.switch input:checked + .switch-track { background: rgba(62,207,142,0.55); }
+.switch input:checked + .switch-track::after { transform: translateX(15px); background: var(--success); }
+.switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.switch:hover input:not(:disabled) + .switch-track { background: var(--border-strong); }
+.switch:hover input:checked:not(:disabled) + .switch-track { background: rgba(62,207,142,0.75); }
+.switch input:disabled + .switch-track { opacity: 0.5; cursor: wait; }
 
 .icon-btn.run { background: var(--success-soft); border-color: rgba(62,207,142,0.4); color: var(--success); }
 .icon-btn.run:hover:not(:disabled) { background: rgba(62,207,142,0.24); }
@@ -353,12 +380,12 @@ tbody tr:last-child td { border-bottom: none; }
  * 而是把行内辅助文字(faint)提升为 dim 色、dim 保持原色，主文字保持原色。
  * 结果：主文字 9.1:1、辅助文字 6.8:1，均满足 WCAG AA；
  * 操作按钮与状态徽标不变。禁用感由颜色层次 + 徽标状态传达。 */
-tr.row-disabled .task-name-cell,
 tr.row-disabled td:nth-child(2),
 tr.row-disabled td:nth-child(3),
 tr.row-disabled td:nth-child(4),
 tr.row-disabled td:nth-child(5),
-tr.row-disabled td:nth-child(6) { opacity: 0.92; }
+tr.row-disabled td:nth-child(6),
+tr.row-disabled td:nth-child(7) { opacity: 0.92; }
 tr.row-disabled .faint { color: var(--text-dim); }
 tr.row-disabled .dim { color: var(--text-dim); }
 tr.row-disabled .row-actions { opacity: 1; }
@@ -367,15 +394,17 @@ tr.row-disabled .row-actions { opacity: 1; }
 /* 展开行的内容是整行跨列的，不参与列宽计算；同时给任务表固定列宽，
    避免展开/收起时浏览器重算列宽造成整表宽度跳动（闪烁）。 */
 .task-table { table-layout: fixed; width: 100%; }
-.task-table th:nth-child(1) { width: 30%; }
-.task-table th:nth-child(2) { width: 13%; }
-.task-table th:nth-child(3) { width: 10%; }
-.task-table th:nth-child(4) { width: 11%; }
-.task-table th:nth-child(5) { width: 12%; }
-.task-table th:nth-child(6) { width: 14%; }
-.task-table th:nth-child(7) { width: 10%; }
+.task-table th:nth-child(1) { width: 44px; }
+.task-table th:nth-child(2) { width: 28%; }
+.task-table th:nth-child(3) { width: 13%; }
+.task-table th:nth-child(4) { width: 10%; }
+.task-table th:nth-child(5) { width: 11%; }
+.task-table th:nth-child(6) { width: 12%; }
+.task-table th:nth-child(7) { width: 14%; }
+.task-table th:nth-child(8) { width: 10%; }
 .task-table td { overflow: hidden; }
 .task-table .task-name-cell { min-width: 0; }
+.task-table td:first-child { text-align: center; }
 
 .expand-row > td {
   padding: 0;
@@ -690,6 +719,8 @@ tr.row-disabled .row-actions { opacity: 1; }
   }
   /* 除任务名外的单元格：左标签、右值，标签文本取自 data-label。 */
   .task-table td[data-label]:not(.task-name-cell) { display: flex; align-items: baseline; gap: 10px; }
+  /* switch 不是文字，基线对齐会悬空，改居中。 */
+  .task-table td[data-label="启用"] { align-items: center; }
   .task-table td[data-label]:not(.task-name-cell)::before {
     content: attr(data-label); flex: 0 0 72px; color: var(--text-dim); font-size: 12px;
   }
