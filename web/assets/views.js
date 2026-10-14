@@ -300,9 +300,10 @@ AD.views = {};
     container.querySelector('#task-new').addEventListener('click', () => AD.openTaskForm(null));
 
     // 就地更新：运行状态落定时只改受影响的行与已展开的面板。
-    // 没有活跃运行时不发请求；正在观看的行内日志有自己的轮询，无需这里兜底。
+    // 守卫不能读 AD.state.tasks 的 active_run（旧值）：定时器/Webhook 触发的
+    // 运行只有本次请求才能看到，用旧 state 判断会永远跳过、面板收不到新运行。
+    // 每 5 秒一次列表请求与其它视图的心跳成本一致。
     AD.state.viewRefresh = async () => {
-      if (!AD.state.tasks.some((task) => task.active_run)) return;
       await refreshTaskRowsInPlace();
     };
   };
@@ -760,8 +761,10 @@ AD.views = {};
       });
       if (scroll) logEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     };
-    root.querySelectorAll('[data-inline-run-log]').forEach((button) => {
-      button.addEventListener('click', () => selectRun(Number(button.dataset.inlineRunLog), true));
+    // 事件委托而非逐按钮绑定：面板打开期间新插入的运行行（见 applyRun）无需重新绑定。
+    root.addEventListener('click', (event) => {
+      const logButton = event.target.closest('[data-inline-run-log]');
+      if (logButton) selectRun(Number(logButton.dataset.inlineRunLog), true);
     });
 
     // --- 就地同步：运行状态落定时更新本面板，不重绘整个视图 ---------
@@ -781,7 +784,24 @@ AD.views = {};
         else runs.unshift(run);
         renderCancelSlot();
         updateRollbackControls();
-        const row = root.querySelector(`[data-inline-run-row="${run.id}"]`);
+        let row = root.querySelector(`[data-inline-run-row="${run.id}"]`);
+        if (!row) {
+          // 面板打开期间出现的新运行（定时/Webhook 触发）：就地插入表格顶部，
+          // 不插入的话「详情」按钮不出现，用户只能刷新页面才能看到。
+          const runsBox = root.querySelector('[data-inline-runs]');
+          const tbody = runsBox?.querySelector('tbody');
+          if (tbody) {
+            tbody.insertAdjacentHTML('afterbegin', renderInlineRunRow(run));
+            row = tbody.querySelector(`[data-inline-run-row="${run.id}"]`);
+          } else if (runsBox) {
+            // 此前没有任何运行记录：整块重建出表格骨架。
+            runsBox.innerHTML = renderInlineRuns(runs, taskId);
+            row = runsBox.querySelector(`[data-inline-run-row="${run.id}"]`);
+          }
+          const countEl = root.querySelector('[data-inline-run-count]');
+          if (countEl) countEl.textContent = `共 ${runs.length} 条记录`;
+          if (row) row.classList.add('row-flash');
+        }
         if (row) {
           const statusCell = row.querySelector('[data-inline-run-status]');
           if (statusCell) statusCell.innerHTML = runBadgeHtml(run);
@@ -802,6 +822,20 @@ AD.views = {};
           schedule.textContent = dedupeIn([
             AD.scheduleText(task), nextRunInlineText(task),
           ]).join(' · ');
+        }
+        // 任务页 5 秒轮询只到任务级：把活跃运行喂给面板，让面板打开期间
+        // 新触发的运行（定时/Webhook）就地插入「最近运行」并同步状态。
+        if (task.active_run) {
+          this.applyRun(task.active_run);
+        } else {
+          // 活跃运行刚结束：面板里仍标记为进行中的记录重新拉取收敛终态
+          //（用户正在观看的那条由日志轮询自己收敛，这里兜底其余的）。
+          const stale = runs.filter((item) => item.status === 'queued' || item.status === 'running');
+          for (const item of stale) {
+            AD.api.get(`/api/runs/${item.id}`)
+              .then((detail) => { if (root.isConnected && detail.run) this.applyRun(detail.run); })
+              .catch(() => { /* 下次轮询兜底 */ });
+          }
         }
       },
     });
@@ -836,11 +870,9 @@ AD.views = {};
     return out;
   }
 
-  function renderInlineRuns(runs, taskId) {
-    if (!runs.length) return '<p class="faint">还没有运行记录；点击右上角「运行」开始第一次部署。</p>';
-    return `<table><thead><tr>
-        <th>#</th><th>状态</th><th>提交</th><th>触发</th><th>耗时</th><th>时间</th><th></th>
-      </tr></thead><tbody>${runs.slice(0, 8).map((run) => `<tr data-inline-run-row="${run.id}">
+  /** 单条运行行：展开面板与就地插入共用同一套 HTML，避免两处渲染漂移。 */
+  function renderInlineRunRow(run) {
+    return `<tr data-inline-run-row="${run.id}">
         <td class="mono dim">${run.id}</td>
         <td data-inline-run-status>${runBadgeHtml(run)}</td>
         <td class="mono dim truncate" style="max-width:200px" title="${a(run.commit_message || '')}">${run.commit_after ? e(AD.shortCommit(run.commit_after)) + ' ' + e(run.commit_message || '') : '—'}</td>
@@ -848,8 +880,15 @@ AD.views = {};
         <td class="dim nowrap" data-inline-run-duration>${e(AD.formatDuration(run.duration_ms))}</td>
         <td class="dim nowrap">${e(AD.formatRelative(run.queued_at))}</td>
         <td class="right"><button class="sm" data-inline-run-log="${run.id}" aria-pressed="false">详情</button></td>
-      </tr>`).join('')}</tbody></table>
-      <div class="faint" style="margin-top:6px">共 ${runs.length} 条记录</div>`;
+      </tr>`;
+  }
+
+  function renderInlineRuns(runs, taskId) {
+    if (!runs.length) return '<p class="faint">还没有运行记录；点击右上角「运行」开始第一次部署。</p>';
+    return `<table><thead><tr>
+        <th>#</th><th>状态</th><th>提交</th><th>触发</th><th>耗时</th><th>时间</th><th></th>
+      </tr></thead><tbody>${runs.slice(0, 8).map(renderInlineRunRow).join('')}</tbody></table>
+      <div class="faint" data-inline-run-count style="margin-top:6px">共 ${runs.length} 条记录</div>`;
   }
 
   // 会话令牌同时保护正在等待的请求，防止切换日志后旧响应覆盖新内容。
@@ -870,7 +909,20 @@ AD.views = {};
 
   function startInlineLog(taskId, runId, logEl, metaEl, onRun) {
     AD.stopInlineLog(taskId);
-    logEl.innerHTML = `<span class="log-empty">${runId ? '加载中…' : '该任务还没有运行记录'}</span>`;
+    // 切换日志用交叉渐变替代内容跳变：淡出到透明 → 同步替换内容 → 淡入。
+    // 不用 transitionend/定时器延迟替换：前者在隐藏元素上不触发，后者会与
+    // 首屏日志竞态（日志先到却被兜底回调覆盖回「加载中…」）。
+    const crossfade = (fill) => {
+      logEl.classList.remove('log-swap-in');
+      logEl.classList.add('log-swap-out');
+      fill();
+      // 强制 reflow，让「淡出→淡入」成为一次可过渡的变化而不是瞬间归位。
+      void logEl.offsetHeight;
+      logEl.classList.remove('log-swap-out');
+      logEl.classList.add('log-swap-in');
+    };
+    if (runId) crossfade(() => { logEl.innerHTML = '<span class="log-empty">加载中…</span>'; });
+    else logEl.innerHTML = '<span class="log-empty">该任务还没有运行记录</span>';
     metaEl.textContent = runId ? `运行 #${runId} · 加载中…` : '';
     if (!runId) return;
     const session = {};
@@ -880,7 +932,13 @@ AD.views = {};
 
     const paint = (lines, reset) => {
       const follow = reset || logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= 32;
-      if (reset || logEl.querySelector('.log-empty')) logEl.innerHTML = '';
+      if (reset || logEl.querySelector('.log-empty')) {
+        // 首屏内容就位：保持 crossfade 的渐显态，让日志随过渡一起浮现；
+        // 轮询增量不重放动画。
+        logEl.innerHTML = '';
+        logEl.classList.remove('log-swap-out');
+        logEl.classList.add('log-swap-in');
+      }
       logEl.insertAdjacentHTML('beforeend',
         lines.map((line) => `<div class="log-line">${colorize(line)}</div>`).join(''));
       while (logEl.childElementCount > 800) logEl.removeChild(logEl.firstChild);

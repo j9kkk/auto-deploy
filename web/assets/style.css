@@ -404,7 +404,9 @@ tr.row-disabled .row-actions { opacity: 1; }
 .task-table th:nth-child(8) { width: 10%; }
 .task-table td { overflow: hidden; }
 .task-table .task-name-cell { min-width: 0; }
-.task-table td:first-child { text-align: center; }
+/* 只居中任务行首列的 switch；展开行 tr.expand-row 的唯一 td 也是"首列"，
+ * 不能用 .task-table td:first-child，否则整个展开面板（含日志）被居中。 */
+.task-table tr[data-task-row] > td:first-child { text-align: center; }
 
 .expand-row > td {
   padding: 0;
@@ -444,6 +446,9 @@ tr.row-disabled .row-actions { opacity: 1; }
 .task-expand .inline-rollback-reason { color: var(--text-dim); font-size: 12px; margin: 8px 0 12px; }
 .task-expand [data-inline-run-log].active { color: var(--accent-hover); border-color: var(--accent); background: var(--accent-soft); }
 .task-expand .mini-runs { overflow-x: auto; }
+/* 面板打开期间新插入的运行行短暂高亮，提示这是刚出现的记录。 */
+@keyframes rowFlash { from { background: var(--accent-soft); } to { background: transparent; } }
+.task-expand .mini-runs tr.row-flash { animation: rowFlash 1.6s ease-out; }
 
 /* --------------------------------------------------------------- badges -- */
 .badge {
@@ -495,6 +500,10 @@ tr.row-disabled .row-actions { opacity: 1; }
 .log-line .l-stage { color: var(--warning); font-weight: 600; }
 .log-line .l-sep { color: var(--text-faint); }
 .log-empty { color: var(--text-faint); font-style: italic; }
+
+/* 行内日志切换动画：选「详情」换运行时旧内容渐隐、新内容渐显，替代内容跳变。 */
+.log-view.log-swap-out { opacity: 0; transition: opacity .12s ease; }
+.log-view.log-swap-in { opacity: 1; transition: opacity .18s ease; }
 
 /* -------------------------------------------------------- self update --- */
 #upd-body { min-width: 0; }

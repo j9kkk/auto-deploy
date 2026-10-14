@@ -37,7 +37,8 @@ class Element {
         const add = force === undefined ? !names.has(name) : force;
         if (add) names.add(name); else names.delete(name);
         this.className = [...names].join(' '); return add;
-      }, remove: name => this.classList.toggle(name, false) };
+      }, add: name => this.classList.toggle(name, true),
+      remove: name => this.classList.toggle(name, false) };
   }
   get isConnected() { return this.tag === 'document' || Boolean(this.parent?.isConnected); }
   get childElementCount() { return this.children.filter(n => n instanceof Element).length; }
