@@ -15,12 +15,12 @@ import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 import sys
 import tempfile
 import threading
 import time
 import traceback
-from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -732,6 +732,315 @@ def run() -> int:
           f"插入缺失: {sorted(_out_keys - set(_INSERT))}")
     check("校验输出字段均可更新", not (_out_keys - set(_UPDATE)),
           f"更新缺失: {sorted(_out_keys - set(_UPDATE))}")
+
+    # --- 远程主机仓储与校验 ---------------------------------------------
+    host_cred_id = store.credentials.create(
+        {"name": "host-key", "kind": "ssh_key", "username": "deploy",
+         "secret": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n"}
+    )
+    host_id = store.hosts.create(
+        {"name": "Web_1", "address": "10.0.0.5", "port": 2222, "username": "deploy",
+         "credential_id": host_cred_id, "base_dir": "/srv/autodeploy"}
+    )
+    saved_host = store.hosts.get(host_id)
+    check("主机创建后可按 id 取回",
+          saved_host["name"] == "Web_1" and saved_host["port"] == 2222)
+    check("主机默认状态为未检测", saved_host["status"] == "unknown")
+    check("主机名唯一性不区分大小写", store.hosts.name_taken("web_1"))
+    check("排除自身时不误报重名", not store.hosts.name_taken("Web_1", exclude_id=host_id))
+    check("主机列表可读取", [h["name"] for h in store.hosts.list_all()] == ["Web_1"])
+
+    # 任务可以指向主机；引用计数用于删除保护。
+    host_task = store.tasks.create({
+        "name": "Hosted_task", "repo_url": "https://github.com/a/b.git",
+        "deploy_method": "script", "deploy_script": "echo hi", "host_id": host_id,
+    })
+    check("任务可保存目标主机", store.tasks.get(host_task)["host_id"] == host_id)
+    check("任务默认部署源为 git", store.tasks.get(host_task)["source_mode"] == "git")
+    check("任务默认数据源为空列表", store.tasks.get(host_task)["data_sources"] == "[]")
+    check("主机引用计数正确", store.hosts.usage_counts().get(host_id) == 1)
+
+    store.hosts.record_check(host_id, status="online", host_key="ssh-ed25519 SHA256:abc")
+    checked = store.hosts.get(host_id)
+    check("连通性检查记录状态与指纹",
+          checked["status"] == "online" and checked["host_key"] == "ssh-ed25519 SHA256:abc")
+    store.hosts.record_check(host_id, status="unknown", host_key="")
+    check("重置指纹会清空 host_key", store.hosts.get(host_id)["host_key"] == "")
+
+    # 校验：地址/用户名的 shell 元字符、相对基础目录、越界 ..、非法端口都必须拒绝。
+    from app.validation import ValidationError as _ValidationError
+    from app.validation import describe_host as _describe_host
+    from app.validation import validate_host_payload as _validate_host
+
+    _host_ok = _validate_host({"name": "h", "address": "web.example.com",
+                               "username": "deploy", "base_dir": "/srv/app/"})
+    check("主机校验补全默认端口", _host_ok["port"] == 22)
+    check("主机校验去掉尾部斜杠", _host_ok["base_dir"] == "/srv/app")
+    for _bad, _field in [
+        ({"name": "h", "address": "evil;rm -rf /", "username": "u"}, "address"),
+        ({"name": "h", "address": "h", "username": "u;id"}, "username"),
+        ({"name": "h", "address": "h", "username": "u", "base_dir": "relative/x"}, "base_dir"),
+        ({"name": "h", "address": "h", "username": "u", "base_dir": "/a/../../b"}, "base_dir"),
+        ({"name": "h", "address": "h", "username": "u", "port": 70000}, "port"),
+        ({"name": "", "address": "h", "username": "u"}, "name"),
+    ]:
+        _raised = False
+        try:
+            _validate_host(_bad)
+        except _ValidationError as exc:
+            _raised = _field in exc.errors
+        check(f"主机校验拒绝非法 {_field}", _raised, str(_bad)[:80])
+    check("主机描述包含端口",
+          _describe_host({"username": "d", "address": "h", "port": 2222}) == "d@h:2222")
+    check("主机描述省略默认端口",
+          _describe_host({"username": "d", "address": "h", "port": 22}) == "d@h")
+
+    # 传输层：远端命令必须逐参数转义，避免把值拼进 shell 后被解释。
+    from app.remote import build_remote_command as _build_remote, SshTransport as _SshTransport
+
+    _remote_cmd = _build_remote(["echo", "a b; rm -rf /"], cwd="/srv/x", env={"K": "v 1"})
+    check("远端命令逐参数转义",
+          "a b; rm -rf /" not in _remote_cmd.split("&&")[-1].replace("'a b; rm -rf /'", ""),
+          _remote_cmd)
+    check("远端命令包含工作目录", "cd /srv/x" in _remote_cmd)
+    check("远端命令导出环境变量", "export K='v 1'" in _remote_cmd)
+    _transport = _SshTransport(address="h", username="u", private_key="KEY",
+                               work_dir=tmp_root / "ssh-probe")
+    _ssh_base = _transport.ssh_base()
+    check("SSH 默认禁用交互提示", "BatchMode=yes" in _ssh_base)
+    check("SSH 只用指定私钥", "IdentitiesOnly=yes" in _ssh_base)
+    check("SSH 使用独立 known_hosts",
+          any(str(tmp_root / "ssh-probe") in part for part in _ssh_base))
+    _transport.cleanup()
+    check("私钥临时文件在清理后删除",
+          not (tmp_root / "ssh-probe" / "id_remote").exists())
+    _passphrase_transport = _SshTransport(
+        address="h", username="u", private_key="KEY", passphrase="secret",
+        work_dir=tmp_root / "ssh-pass",
+    )
+    _passphrase_error = ""
+    try:
+        _passphrase_transport.ssh_base()
+    except Exception as exc:  # noqa: BLE001 - 只要被拒绝即可
+        _passphrase_error = str(exc)
+    _passphrase_transport.cleanup()
+    check("带口令的私钥被明确拒绝而不是挂起", "口令" in _passphrase_error, _passphrase_error)
+
+    # SSH 失败信息必须可操作：原始输出只有退出码 255 时用户无从下手。
+    from app.executor import CommandResult as _CommandResult
+    from app.remote import _describe_ssh_failure as _ssh_failure
+
+    _ssh_cases = [
+        ("Permission denied (publickey).", "认证失败"),
+        ("ssh: connect to host h port 22: Connection refused", "端口未开放"),
+        ("ssh: connect to host h port 22: No route to host", "无法到达"),
+        ("ssh: Could not resolve hostname h: Name or service not known", "无法解析"),
+        ("Host key verification failed.", "指纹已变化"),
+    ]
+    for _raw, _expect in _ssh_cases:
+        _message = _ssh_failure(_CommandResult("ssh", 255, _raw, 10))
+        check(f"SSH 失败信息可操作（{_expect}）", _expect in _message, _message)
+    _fallback = _ssh_failure(_CommandResult("ssh", 255, "", 10))
+    check("SSH 失败兜底信息不为空且中文", bool(_fallback) and "SSH" in _fallback, _fallback)
+
+    store.tasks.delete(host_task)
+    store.hosts.delete(host_id)
+    check("主机可删除", store.hosts.get(host_id) is None)
+
+    # --- 远程部署：目标抽象与远程回滚校验 ------------------------------
+    from app.executor import CommandResult
+    from app.target import (
+        LocalTarget as _LocalTarget,
+        RemoteTarget as _RemoteTarget,
+        STAGE_EXCLUDES as _STAGE_EXCLUDES,
+        resolve_remote_layout as _resolve_layout,
+    )
+
+    _layout = _resolve_layout({"base_dir": "/opt/autodeploy"}, {"name": "myapp"})
+    check("远程布局按任务名分目录",
+          _layout.workspace == "/opt/autodeploy/workspaces/myapp")
+    check("远程发布根与 current 同源",
+          _layout.releases_root == "/opt/autodeploy/releases/myapp/releases"
+          and _layout.current_link == "/opt/autodeploy/releases/myapp/current")
+    _layout_td = _resolve_layout(
+        {"base_dir": "/opt/autodeploy"}, {"name": "myapp", "target_dir": "/srv/www/app/"}
+    )
+    check("配置 target_dir 时发布目录随之迁移",
+          _layout_td.releases_root == "/srv/www/app/releases"
+          and _layout_td.current_link == "/srv/www/app/current")
+    _bad_layout = ""
+    try:
+        _resolve_layout({"base_dir": "relative"}, {"name": "x"})
+    except Exception as exc:  # noqa: BLE001 - 只要被拒绝
+        _bad_layout = str(exc)
+    check("非绝对路径的基础目录被拒绝", "绝对路径" in _bad_layout, _bad_layout)
+
+    _local = _LocalTarget()
+    check("本机目标不符合远程标记", not _local.is_remote and _local.label == "本机")
+    check("本机目标返回 Path", isinstance(_local.path("/tmp/x"), Path))
+    # 本机 upload 是语义 no-op：源码已经在位。
+    check("本机 upload 不报错", _local.upload(tmp_root, "/ignored").ok)
+
+    # 远程目标的命令构造：路径逐参数转义、bundle 用 tar、换链用原子 mv -T。
+    _remote_calls = []
+
+    class _FakeTransport:
+        username = "deploy"
+        address = "10.0.0.5"
+        is_remote = True
+
+        def run(self, args, **kwargs):
+            _remote_calls.append(("run", list(args)))
+            return CommandResult(" ".join(args), 0, "", 0)
+
+        def run_script(self, script, **kwargs):
+            _remote_calls.append(("script", script))
+            return CommandResult(script, 0, "42", 0)
+
+        def rsync_up(self, local, remote, **kwargs):
+            _remote_calls.append(("up", local, remote, kwargs))
+            return CommandResult("rsync", 0, "", 0)
+
+        def rsync_down(self, remote, local, **kwargs):
+            _remote_calls.append(("down", remote, local))
+            return CommandResult("rsync", 0, "", 0)
+
+    _rt = _RemoteTarget(_FakeTransport())
+    check("远程目标标记为 remote", _rt.is_remote and _rt.label == "deploy@10.0.0.5")
+    check("远程目标返回字符串路径", _rt.path("/srv/x") == "/srv/x")
+    _rt.make_dirs("/srv/app dir")
+    check("远程建目录逐参数转义",
+          _remote_calls[-1] == ("run", ["mkdir", "-p", "/srv/app dir"]), str(_remote_calls[-1]))
+    _rt.swap_symlink("/srv/app/current", "/srv/app/releases/20260101-abcdef12")
+    _swap_script = _remote_calls[-1][1]
+    check("远程换链使用原子 mv -T", "mv -Tf" in _swap_script and "ln -sfn" in _swap_script,
+          _swap_script)
+    _rt.bundle("/srv/app/releases/r1", "/srv/app/artifacts/a.tar.gz")
+    _bundle_script = _remote_calls[-1][1]
+    check("远程打包使用 tar czf 且先写 .part",
+          "tar czf" in _bundle_script and ".part" in _bundle_script, _bundle_script)
+    _before_upload = len(_remote_calls)
+    _rt.upload(Path("/tmp/src"), "/srv/app/ws", delete=True, excludes=[".git"])
+    _upload_calls = _remote_calls[_before_upload:]
+    check("远程上传会先建目标目录",
+          _upload_calls[0] == ("run", ["mkdir", "-p", "/srv/app/ws"]), str(_upload_calls))
+    check("远程上传排除 .git 并启用 delete",
+          _upload_calls[1][0] == "up"
+          and _upload_calls[1][1] == Path("/tmp/src")
+          and _upload_calls[1][2] == "/srv/app/ws"
+          and _upload_calls[1][3].get("delete") is True
+          and ".git" in _upload_calls[1][3].get("excludes", []),
+          str(_upload_calls[1]))
+    check("staged 排除项包含 .git 与 node_modules",
+          ".git" in _STAGE_EXCLUDES and "node_modules" in _STAGE_EXCLUDES)
+
+    # 远程回滚校验：越界路径、非法名字、软链、当前版本都必须被拒绝。
+    from app.deployer import DeployError as _DeployError
+    from app.deployer import _remote_rollback_target as _remote_target
+
+    class _Layout:
+        releases_root = "/srv/app/releases"
+        current_link = "/srv/app/current"
+
+    class _RollbackTarget:
+        def __init__(self, *, dirs=(), links=None, symlinks=(), root="/srv/app/releases"):
+            # 发布根本身也必须是目录，否则一切校验都会先卡在「没有发布目录」。
+            self.dirs = set(dirs) | {root}
+            self.links = links or {}
+            self.symlinks = set(symlinks)
+
+        def is_symlink(self, path):
+            return str(path) in self.symlinks
+
+        def is_dir(self, path):
+            return str(path) in self.dirs
+
+        def readlink(self, path):
+            return self.links.get(str(path))
+
+        def list_dirs(self, root):
+            return sorted(
+                d.rsplit("/", 1)[-1] for d in self.dirs
+                if d.startswith(str(root) + "/")
+            )
+
+    _good = "20260101-120000-abcdef12"
+    _base_task = {"id": 1, "deploy_method": "release"}
+    _rt_target = _RollbackTarget(
+        dirs={f"/srv/app/releases/{_good}", "/srv/app/releases/20251231-120000-00000000"},
+        links={"/srv/app/current": f"/srv/app/releases/{_good}"},
+    )
+    _names_ok = False
+    try:
+        _root, _link, _active, _chosen = _remote_target(
+            _base_task, None, _rt_target, _Layout()
+        )
+        _names_ok = _chosen.endswith("20251231-120000-00000000") and _active is not None
+    except _DeployError:
+        _names_ok = False
+    check("远程回滚默认指向非当前的最新版本", _names_ok)
+
+    for _label, _run, _expect in [
+        ("不在发布根下的路径", {"release_dir": "/etc/passwd", "task_id": 1,
+                                "status": "success", "deploy_method": "release"},
+         "发布根下"),
+        ("含 .. 的路径", {"release_dir": "/srv/app/releases/../../etc", "task_id": 1,
+                          "status": "success", "deploy_method": "release"}, "无效"),
+        ("非法版本名", {"release_dir": "/srv/app/releases/evil", "task_id": 1,
+                        "status": "success", "deploy_method": "release"}, "有效的版本"),
+        ("未成功的运行", {"release_dir": f"/srv/app/releases/{_good}", "task_id": 1,
+                          "status": "failed", "deploy_method": "release"}, "部署成功"),
+        ("属于其它任务", {"release_dir": f"/srv/app/releases/{_good}", "task_id": 99,
+                          "status": "success", "deploy_method": "release"}, "不属于该任务"),
+    ]:
+        _rejected = ""
+        try:
+            _remote_target(_base_task, _run, _rt_target, _Layout())
+        except _DeployError as exc:
+            _rejected = str(exc)
+        check(f"远程回滚拒绝{_label}", _expect in _rejected, _rejected)
+
+    # 已经是当前版本时拒绝（避免无意义回滚与日志误导）。
+    _same_current = _RollbackTarget(
+        dirs={f"/srv/app/releases/{_good}"},
+        links={"/srv/app/current": f"/srv/app/releases/{_good}"},
+    )
+    _same_msg = ""
+    try:
+        _remote_target(
+            _base_task,
+            {"release_dir": f"/srv/app/releases/{_good}", "task_id": 1,
+             "status": "success", "deploy_method": "release"},
+            _same_current, _Layout(),
+        )
+    except _DeployError as exc:
+        _same_msg = str(exc)
+    check("远程回滚拒绝重复指向当前版本", "已经是当前版本" in _same_msg, _same_msg)
+
+    # 运行记录必须留存主机快照；主机稍后改名不影响历史。
+    _host_snap_id = store.hosts.create(
+        {"name": "snap-host", "address": "192.0.2.77", "username": "deploy",
+         "credential_id": host_cred_id}
+    )
+    _snap_task_id = store.tasks.create({
+        "name": "Snap_task", "repo_url": "https://github.com/a/b.git",
+        "deploy_method": "script", "deploy_script": "echo hi", "host_id": _host_snap_id,
+    })
+    _snap_run = store.runs.create(store.tasks.get(_snap_task_id), trigger="manual")
+    _snap_run_row = store.runs.get(_snap_run)
+    check("运行记录自动带上任务的目标主机",
+          _snap_run_row["host_id"] == _host_snap_id and not _snap_run_row["host_name"])
+    _host_id_2, _host_name_2 = store.hosts.snapshot_for_run(store.tasks.get(_snap_task_id))
+    check("主机快照取到当前名称", _host_id_2 == _host_snap_id and _host_name_2 == "snap-host")
+    store.hosts.delete(_host_snap_id)
+    # 外键是 ON DELETE SET NULL：主机被删后任务自动回到本机，不会留下悬空引用。
+    _after_delete = store.tasks.get(_snap_task_id)
+    check("主机删除后任务回到本机（外键置空）", _after_delete["host_id"] is None,
+          str(_after_delete.get("host_id")))
+    _missing_id, _missing_name = store.hosts.snapshot_for_run({"host_id": _host_snap_id})
+    check("指向已删除主机的快照给出明确占位",
+          _missing_id == _host_snap_id and "已删除" in _missing_name, _missing_name)
+    store.tasks.delete(_snap_task_id)
 
     store.tasks.set_next_run(task_id, iso(datetime.utcnow() - timedelta(minutes=1)))
     check("到期任务可查询", len(store.tasks.due(iso(datetime.utcnow()))) == 1)
@@ -1761,7 +2070,484 @@ def run() -> int:
         response = client.delete(f"/api/tasks/{cancel_id}")
         check("清理取消测试任务", response.status_code == 200)
 
+        # --- 远程主机 API 自检 ---------------------------------------
+        # 用 ssh_key 凭据建主机；不发起真实 SSH（测试机无目标主机），
+        # 只验证接口契约、校验拒绝与安全字段不外泄。
+        api_host_cred = client.post("/api/credentials", json={
+            "name": "api-host-key", "kind": "ssh_key", "username": "deploy",
+            "secret": "-----BEGIN OPENSSH PRIVATE KEY-----\nfake-key-body\n-----END OPENSSH PRIVATE KEY-----\n",
+        })
+        check("可为主机创建 ssh_key 凭据", api_host_cred.status_code == 201, api_host_cred.text[:150])
+        api_host_cred_id = api_host_cred.json()["credential"]["id"]
+
+        created_host = client.post("/api/hosts", json={
+            "name": "Api_host", "address": "192.0.2.10", "port": 22,
+            "username": "deploy", "credential_id": api_host_cred_id,
+            "base_dir": "/srv/autodeploy",
+        })
+        check("创建主机返回 201", created_host.status_code == 201, created_host.text[:200])
+        host_body = created_host.json()["host"]
+        api_host_id = host_body["id"]
+        check("主机响应不含私钥内容", "secret" not in created_host.text.lower())
+        check("主机响应提供连接目标描述", host_body["target"] == "deploy@192.0.2.10")
+        check("新建主机状态为未检测", host_body["status"] == "unknown")
+
+        listed_hosts = client.get("/api/hosts")
+        check("主机列表返回 200 且包含新建主机",
+              listed_hosts.status_code == 200
+              and any(h["id"] == api_host_id for h in listed_hosts.json()["hosts"]))
+
+        # 重名与非法参数必须被拒绝，且不落库。
+        dup_host = client.post("/api/hosts", json={
+            "name": "API_HOST", "address": "192.0.2.11", "username": "deploy",
+            "credential_id": api_host_cred_id,
+        })
+        check("主机重名被拒绝", dup_host.status_code == 409, dup_host.text[:120])
+        bad_host = client.post("/api/hosts", json={
+            "name": "Bad_host", "address": "h;id", "username": "deploy",
+            "credential_id": api_host_cred_id,
+        })
+        check("非法主机地址被拒绝", bad_host.status_code == 422, bad_host.text[:120])
+        bad_dir = client.post("/api/hosts", json={
+            "name": "Bad_dir", "address": "192.0.2.12", "username": "deploy",
+            "credential_id": api_host_cred_id, "base_dir": "relative/dir",
+        })
+        check("相对基础目录被拒绝", bad_dir.status_code == 422, bad_dir.text[:120])
+        # 非 ssh_key 类型凭据必须被拒绝：用了也无法 SSH 登录。
+        https_cred = client.post("/api/credentials", json={
+            "name": "api-host-https", "kind": "https_token",
+            "username": "git", "secret": "ghp_" + "a" * 30,
+        })
+        check("可创建 HTTPS 凭据用于对照", https_cred.status_code == 201, https_cred.text[:150])
+        https_cred_id = https_cred.json()["credential"]["id"]
+        wrong_kind = client.post("/api/hosts", json={
+            "name": "Wrong_cred", "address": "192.0.2.13", "username": "deploy",
+            "credential_id": https_cred_id,
+        })
+        check("非 SSH 类型的凭据被拒绝", wrong_kind.status_code == 422, wrong_kind.text[:150])
+
+        # 被任务引用时禁止删除，避免任务悄悄退回本机部署。
+        host_linked_task = client.post("/api/tasks", json={
+            "name": "Host_linked", "repo_url": str(origin), "repo_branch": "main",
+            "deploy_method": "script", "deploy_script": "echo hosted",
+            "skip_if_no_changes": False, "host_id": api_host_id,
+        })
+        check("任务可绑定目标主机", host_linked_task.status_code == 201,
+              host_linked_task.text[:200])
+        host_linked_id = host_linked_task.json()["task"]["id"]
+        check("任务详情回显目标主机",
+              client.get(f"/api/tasks/{host_linked_id}").json()["task"]["host_id"] == api_host_id)
+        blocked_delete = client.delete(f"/api/hosts/{api_host_id}")
+        check("被任务引用的主机不能删除", blocked_delete.status_code == 409,
+              blocked_delete.text[:150])
+
+        # 凭据的主机引用：只绑定主机（不碰仓库）的私钥此前在列表里显示
+        # 「未使用」，删除也不会被拦下——外键置空后该主机再无法登录。
+        listed_cred = next(c for c in client.get("/api/credentials").json()["credentials"]
+                           if c["id"] == api_host_cred_id)
+        check("凭据列表统计主机引用", listed_cred.get("used_by_hosts") == 1,
+              str(listed_cred.get("used_by_hosts")))
+        check("只绑主机的凭据不算未使用",
+              listed_cred.get("used_by") == 0 and listed_cred.get("used_by_hosts") == 1)
+        cred_detail = client.get(f"/api/credentials/{api_host_cred_id}").json()["credential"]
+        check("凭据详情点名引用它的主机",
+              [h["id"] for h in cred_detail.get("hosts") or []] == [api_host_id],
+              str(cred_detail.get("hosts")))
+        blocked_cred_delete = client.delete(f"/api/credentials/{api_host_cred_id}")
+        check("被主机引用的凭据不能直接删除", blocked_cred_delete.status_code == 409,
+              blocked_cred_delete.text[:150])
+        check("删除拦截文案点名主机",
+              "主机" in blocked_cred_delete.json().get("detail", ""),
+              blocked_cred_delete.text[:150])
+
+        # 主机登录测试：不发起真实 SSH，只验证接口契约（类型、必填、超时清理）。
+        wrong_kind_test = client.post(f"/api/credentials/{https_cred_id}/test-host",
+                                      json={"address": "192.0.2.20", "username": "deploy"})
+        check("HTTPS 凭据拒绝主机登录测试", wrong_kind_test.status_code == 422,
+              wrong_kind_test.text[:150])
+        bad_address = client.post(f"/api/credentials/{api_host_cred_id}/test-host",
+                                  json={"address": "h;id", "username": "deploy"})
+        check("主机登录测试校验地址", bad_address.status_code == 422, bad_address.text[:150])
+        missing_user = client.post(f"/api/credentials/{api_host_cred_id}/test-host",
+                                   json={"address": "192.0.2.20"})
+        check("主机登录测试要求用户名", missing_user.status_code == 422,
+              missing_user.text[:150])
+        # 主机登录结论独立落库：失败不能把「仓库可用」一起抹掉。
+        service.store.credentials.record_test(api_host_cred_id, ok=True, error="")
+        failed_host_test = client.post(f"/api/credentials/{api_host_cred_id}/test-host",
+                                       json={"address": "127.0.0.1", "port": 1,
+                                             "username": "deploy"})
+        check("主机登录测试返回 200 + ok:false（失败是结果不是请求错误）",
+              failed_host_test.status_code == 200
+              and failed_host_test.json().get("ok") is False,
+              failed_host_test.text[:200])
+        after_host_test = service.store.credentials.get(api_host_cred_id)
+        check("主机登录测试不覆盖仓库测试结论",
+              after_host_test.get("last_test_ok") == 1,
+              str(after_host_test.get("last_test_ok")))
+        check("主机登录测试结论单独记录",
+              after_host_test.get("last_host_test_ok") == 0
+              and bool(after_host_test.get("last_host_test_at")))
+        check("主机登录测试返回目标描述",
+              "@" in (failed_host_test.json().get("target") or ""),
+              str(failed_host_test.json().get("target")))
+        # 换私钥后两侧结论都必须失效，否则界面会拿旧结论骗人。
+        client.put(f"/api/credentials/{api_host_cred_id}",
+                   json={"secret": "-----BEGIN OPENSSH PRIVATE KEY-----\nnew\n-----END OPENSSH PRIVATE KEY-----\n"})
+        cleared = service.store.credentials.get(api_host_cred_id)
+        check("修改私钥后仓库测试结论失效", cleared.get("last_test_ok") is None)
+        check("修改私钥后主机测试结论失效", cleared.get("last_host_test_ok") is None)
+
+        client.delete(f"/api/tasks/{host_linked_id}")
+        api_delete = client.delete(f"/api/hosts/{api_host_id}")
+        check("解除引用后主机可删除", api_delete.status_code == 200, api_delete.text[:150])
+        check("删除后主机不再出现在列表",
+              all(h["id"] != api_host_id for h in client.get("/api/hosts").json()["hosts"]))
+        after_host_gone = client.delete(f"/api/credentials/{api_host_cred_id}")
+        check("主机解除绑定后凭据可删除", after_host_gone.status_code == 200,
+              after_host_gone.text[:150])
+        client.delete(f"/api/credentials/{https_cred_id}")
+
+        # --- 监控 API 自检 -------------------------------------------
+        from app.monitor import HostMonitor
+        snap = HostMonitor().sample_host()
+        check("HostMonitor 采样成功", snap.cpu_cores >= 1 and snap.memory_total > 0)
+        check("HostMonitor 包含必要字段", bool(snap.timestamp and snap.os_name))
+        check("HostMonitor 包含磁盘I/O速率与应用数据大小",
+              hasattr(snap, "disk_read_rate") and hasattr(snap, "disk_write_rate") and hasattr(snap, "app_data_bytes"))
+
+        host_resp = client.get("/api/monitor/host")
+        check("主机监控接口返回 200", host_resp.status_code == 200)
+        host_data = host_resp.json()
+        check("主机监控数据包含 CPU/内存/磁盘/应用大小",
+              "cpu_percent" in host_data and "memory_percent" in host_data
+              and "disk_percent" in host_data and "app_data_bytes" in host_data)
+        # 存储卡片已改为展示宿主机分区占用：三个分区字段必须同时可用，
+        # 只给百分比会让「已用 / 总量」无处取值。
+        check("主机监控返回分区已用/总量/剩余（存储卡片主指标）",
+              all(isinstance(host_data.get(key), int) and host_data.get(key) >= 0
+                  for key in ("disk_total", "disk_used", "disk_free"))
+              and host_data["disk_used"] + host_data["disk_free"] <= host_data["disk_total"] + 1,
+              f"total={host_data.get('disk_total')} used={host_data.get('disk_used')} "
+              f"free={host_data.get('disk_free')}")
+        check("主机监控包含磁盘I/O吞吐字段",
+              "disk_read_rate" in host_data and "disk_write_rate" in host_data)
+        check("主机监控包含系统名与运行时长", "os_name" in host_data and "uptime_seconds" in host_data)
+
+        task_mon_resp = client.get("/api/monitor/tasks")
+        check("任务资源监控接口返回 200", task_mon_resp.status_code == 200)
+        check("任务资源监控返回列表", isinstance(task_mon_resp.json(), list))
+
+        # 容器明细字段：抽屉面板要用原始字节数算内存百分比、展示镜像，
+        # 只有 human 字符串（"20.5MiB"）无法得出进度条比例。
+        from app.monitor import TaskResourceMonitor, get_monitor
+        fake_stats = {
+            "abc123": {
+                "id": "abc1234567890",
+                "name": "web-1",
+                "compose_project": "autodeploy-mon-sample",
+                "image": "nginx:1.27",
+                "status": "running",
+                "cpu_percent": 3.5,
+                "mem_usage_human": "20.5MiB",
+                "mem_usage_bytes": 20 * 1024**2,
+                "mem_limit_bytes": 1024**3,
+                "net_io": "1.2kB / 3.4kB",
+                "block_io": "0B / 8.19kB",
+                "pids": 4,
+            }
+        }
+        sample_task = {"id": 99123, "name": "mon-sample", "deploy_method": "docker_compose",
+                       "enabled": True}
+        from unittest.mock import patch as mon_patch
+        # 只替换 docker stats 来源，聚合逻辑仍走真实实现，避免测试自证。
+        with mon_patch.object(type(get_monitor()), "get_docker_stats", return_value=fake_stats):
+            detail_rows = TaskResourceMonitor.get_task_resources([sample_task])
+        check("任务资源监控能按 compose 项目聚合容器", len(detail_rows) == 1
+              and detail_rows[0]["container_count"] == 1, str(detail_rows)[:200])
+        detail = (detail_rows[0].get("containers") or [{}])[0]
+        check("容器明细带内存字节与上限（供抽屉算占用比例）",
+              detail.get("mem_usage_bytes") == 20 * 1024**2
+              and detail.get("mem_limit_bytes") == 1024**3, str(detail)[:200])
+        check("容器明细带镜像名与进程数", detail.get("image") == "nginx:1.27" and detail.get("pids") == 4)
+        check("docker stats 内存单位解析不回退成错误数值",
+              TaskResourceMonitor._parse_mem_usage("20.5MiB / 1.5GiB") == (20 * 1024**2 + 524288, 3 * 1024**3 // 2),
+              str(TaskResourceMonitor._parse_mem_usage("20.5MiB / 1.5GiB")))
+
+        history_resp = client.get("/api/monitor/history?range=1h&limit=10")
+        check("监控历史时序接口 1h 返回 200", history_resp.status_code == 200)
+        check("监控历史返回快照数组", isinstance(history_resp.json(), list))
+
+        # 持久化时序库与多时间跨度查询
+        service.store.metrics.record({
+            "timestamp": snap.timestamp,
+            "cpu_percent": snap.cpu_percent,
+            "memory_percent": snap.memory_percent,
+            "disk_read_rate": snap.disk_read_rate,
+            "disk_write_rate": snap.disk_write_rate,
+            "net_rx_rate": snap.net_rx_rate,
+            "net_tx_rate": snap.net_tx_rate,
+        })
+        h24_resp = client.get("/api/monitor/history?range=24h&limit=50")
+        check("监控历史 24h 查询返回 200", h24_resp.status_code == 200 and len(h24_resp.json()) >= 1)
+        h7d_resp = client.get("/api/monitor/history?range=7d&limit=50")
+        check("监控历史 7d 查询返回 200", h7d_resp.status_code == 200)
+        check("非法范围参数被拒绝", client.get("/api/monitor/history?range=invalid").status_code == 422)
+
+        # --- 容器维度监控：采样速率、落库、分桶与透视 -----------------
+        # docker stats 的 NetIO / BlockIO 是累计量，速率必须由相邻两次采样差值算出；
+        # 直接把累计值当速率会让图表随时间无限上涨。
+        check("docker stats 累计 I/O 文本可解析为字节",
+              TaskResourceMonitor._parse_io_pair("1.2kB / 3.4MB") == (1200, 3400000),
+              str(TaskResourceMonitor._parse_io_pair("1.2kB / 3.4MB")))
+        check("docker stats 未就绪时的 I/O 占位不报错",
+              TaskResourceMonitor._parse_io_pair("--") == (0, 0)
+              and TaskResourceMonitor._parse_bytes("0B") == 0)
+
+        from app.monitor import MonitorService
+        rate_monitor = MonitorService()
+        base_stats = {
+            "ct1": {"id": "ct1-abcdef", "name": "web-1", "compose_project": "autodeploy-c1",
+                    "status": "running", "cpu_percent": 12.5, "mem_usage_human": "20MiB",
+                    "mem_usage_bytes": 20 * 1024**2, "mem_limit_bytes": 1024**3,
+                    "net_io": "1kB / 2kB", "block_io": "3kB / 4kB",
+                    "net_rx_total": 100000, "net_tx_total": 200000,
+                    "block_read_total": 30000, "block_write_total": 40000, "pids": 3},
+        }
+        rate_monitor._record_container_samples(base_stats, 1000.0)
+        later_stats = {"ct1": dict(base_stats["ct1"])}
+        later_stats["ct1"].update({
+            "net_rx_total": 100000 + 204800,     # 200 KiB / 2s = 100 KB/s
+            "block_read_total": 30000 + 102400,  # 100 KiB / 2s = 50 KB/s
+        })
+        rate_monitor._record_container_samples(later_stats, 1002.0)
+        batches = rate_monitor.get_container_batches()
+        first_sample = batches[0][0]
+        second_sample = batches[1][0]
+        check("容器首次采样速率为 0（没有基线可比）",
+              first_sample["net_rx_rate"] == 0.0 and first_sample["disk_read_rate"] == 0.0,
+              str(first_sample))
+        check("容器网络速率由累计量差值算出",
+              abs(second_sample["net_rx_rate"] - 100.0) < 0.5 and second_sample["net_tx_rate"] == 0.0,
+              str(second_sample["net_rx_rate"]))
+        check("容器磁盘读速率由累计量差值算出",
+              abs(second_sample["disk_read_rate"] - 50.0) < 0.5, str(second_sample["disk_read_rate"]))
+        check("容器内存占用率按上限换算", abs(second_sample["memory_percent"] - 1.95) < 0.05,
+              str(second_sample["memory_percent"]))
+        check("容器重启后累计量回退不产生负速率", all(
+              rate >= 0 for rate in (second_sample["net_rx_rate"], second_sample["disk_read_rate"])))
+
+        # 持久化 + 分桶透视：同一容器的列数组必须与共享时间轴等长，
+        # 否则前端按下标取值会串行。
+        from app.api.monitor import CONTAINER_METRIC_KEYS, _bucket_rows, _pivot_containers
+        from datetime import timezone as _mon_timezone
+        bucket_base = 1792317600  # 固定纪元，避免依赖真实时钟
+        sample_rows = []
+        for step in range(6):
+            ts = datetime.fromtimestamp(bucket_base + step * 25, tz=_mon_timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for cid, cname in (("c1", "web-1"), ("c2", "db-1")):
+                sample_rows.append({
+                    "timestamp": ts, "container_id": cid, "container_name": cname,
+                    "compose_project": "autodeploy-c", "cpu_percent": float(step),
+                    "memory_bytes": 1024.0, "memory_percent": 1.0,
+                    "disk_read_rate": 1.0, "disk_write_rate": 2.0,
+                    "net_rx_rate": 3.0, "net_tx_rate": 4.0,
+                })
+        bucketed = _bucket_rows(sample_rows, 60, CONTAINER_METRIC_KEYS,
+                                identity=True, since_epoch=bucket_base)
+        check("容器采样按 60 秒分桶合并", len(bucketed) == 6, str(len(bucketed)))
+        check("分桶后同一桶内取平均", bucketed[0]["cpu_percent"] == 1.0, str(bucketed[0]))
+        pivoted = _pivot_containers(bucketed)
+        check("容器透视按名称排序并共用时间轴",
+              [c["name"] for c in pivoted["containers"]] == ["db-1", "web-1"]
+              and len(pivoted["timestamps"]) == 3, str(pivoted)[:200])
+        check("容器列数组与时间轴等长",
+              all(len(c["cpu_percent"]) == len(pivoted["timestamps"])
+                  and len(c["net_tx_rate"]) == len(pivoted["timestamps"])
+                  for c in pivoted["containers"]))
+        outside = _bucket_rows(sample_rows, 60, CONTAINER_METRIC_KEYS,
+                               identity=True, since_epoch=bucket_base + 100)
+        check("窗口外的采样被丢弃", outside and outside[0]["timestamp"].endswith("10:01:00Z"),
+              str(outside[0] if outside else None))
+        host_only = _bucket_rows(sample_rows, 20, CONTAINER_METRIC_KEYS,
+                                 identity=False, since_epoch=bucket_base)
+        check("主机口径不按容器拆分", len(host_only) == len({r["timestamp"] for r in sample_rows})
+              or len({r["timestamp"] for r in host_only}) < len(sample_rows) * 2,
+              str(len(host_only)))
+
+        check("容器时序落库不再写空批次", isinstance(
+              service.store.container_metrics.record_many([]), type(None)))
+        service.store.container_metrics.record_many([
+            {"timestamp": sample_rows[0]["timestamp"], "container_id": "c1",
+             "container_name": "web-1", "compose_project": "p", "cpu_percent": 3.0,
+             "memory_bytes": 1024, "memory_percent": 1.0, "disk_read_rate": 1.0,
+             "disk_write_rate": 2.0, "net_rx_rate": 3.0, "net_tx_rate": 4.0}
+        ])
+        persisted = service.store.container_metrics.query_bucketed("2000-01-01T00:00:00Z", 60)
+        check("容器时序可落库并按桶查询", len(persisted) == 1
+              and persisted[0]["container_name"] == "web-1", str(persisted)[:200])
+
+        ch1 = client.get("/api/monitor/containers/history?range=1h")
+        check("容器历史接口 1h 返回 200", ch1.status_code == 200, ch1.text[:200])
+        ch1_data = ch1.json()
+        check("容器历史返回时间轴与容器列数组",
+              isinstance(ch1_data.get("timestamps"), list)
+              and isinstance(ch1_data.get("containers"), list))
+        check("容器历史各列长度与时间轴一致",
+              all(len(c.get("cpu_percent") or []) == len(ch1_data["timestamps"])
+                  for c in ch1_data["containers"]))
+        check("容器历史非法范围被拒绝",
+              client.get("/api/monitor/containers/history?range=invalid").status_code == 422)
+        ch7 = client.get("/api/monitor/containers/history?range=7d")
+        check("容器历史 7d 查询返回 200", ch7.status_code == 200)
+
+        # 7d 窗口必须取最新的 limit 条：旧实现 ORDER BY id ASC + LIMIT 会只返回
+        # 窗口最前面的点，页面看起来像「只有刚上线那几小时有数据」。
+        from app.schedule import utcnow as _mon_utcnow
+        for offset in range(5):
+            service.store.metrics.record({
+                "timestamp": iso(_mon_utcnow() - timedelta(seconds=60 * (5 - offset))),
+                "cpu_percent": float(offset), "memory_percent": 1.0,
+                "disk_read_rate": 0.0, "disk_write_rate": 0.0,
+                "net_rx_rate": 0.0, "net_tx_rate": 0.0,
+            })
+        recent = service.store.metrics.query_range(
+            iso(_mon_utcnow() - timedelta(days=7)), limit=2)
+        check("长周期查询保留最新的点（不回退到最早）",
+              len(recent) == 2 and float(recent[-1]["cpu_percent"]) == 4.0, str(recent))
+
+        # --- 备份与恢复全流程自检 -------------------------------------
+        # 1. 创建备份
+        bk_create_resp = client.post("/api/backups", json={"include_logs": False, "include_artifacts": False, "retention_count": 5})
+        check("创建备份接口返回 200", bk_create_resp.status_code == 200, bk_create_resp.text[:150])
+        bk_obj = bk_create_resp.json()["backup"]
+        bk_id = bk_obj["id"]
+        check("备份对象包含 ID 和文件名", bk_id > 0 and "autodeploy-backup-" in bk_obj["filename"])
+        check("备份文件已生成且大小大于 0", bk_obj["size_bytes"] > 0 and len(bk_obj["sha256"]) == 64)
+
+        # 2. 列表查询
+        bk_list_resp = client.get("/api/backups")
+        check("备份列表返回 200", bk_list_resp.status_code == 200)
+        check("备份列表中存在新建备份", any(b["id"] == bk_id for b in bk_list_resp.json()["backups"]))
+
+        # 3. 预检与完整性
+        bk_inspect_resp = client.post(f"/api/backups/{bk_id}/inspect")
+        check("备份预检接口返回 200", bk_inspect_resp.status_code == 200)
+        inspection = bk_inspect_resp.json()["inspection"]
+        check("预检结果确认数据库完整", inspection["valid"] is True)
+
+        # 4. 下载接口
+        bk_dl_resp = client.get(f"/api/backups/{bk_id}/download")
+        check("备份下载接口返回 200", bk_dl_resp.status_code == 200)
+        check("下载内容类型为 gzip", "gzip" in bk_dl_resp.headers.get("content-type", ""))
+
+        # 5. 灾难恢复测试
+        # 先创建一个标记任务，恢复后该任务应该消失
+        temp_task_id = service.store.tasks.create({
+            "name": "Should_Disappear_After_Restore",
+            "repo_url": str(origin),
+            "deploy_method": "script",
+            "deploy_script": "true",
+        })
+        check("已创建用于恢复验证的临时任务", service.store.tasks.get(temp_task_id) is not None)
+        restore_resp = client.post(f"/api/backups/{bk_id}/restore")
+        check("恢复备份接口返回 200", restore_resp.status_code == 200, restore_resp.text[:150])
+        check("数据已恢复（临时任务已回退消除）", service.store.tasks.get(temp_task_id) is None)
+        # 恢复后备份资产自动补录：磁盘上已有的备份文件在恢复后依然保留在 backups 表中，
+        # 用户在前端不会看到备份“自杀式消失”。
+        check("恢复后现存备份记录完好保留",
+              service.store.backups.get_by_filename(bk_obj["filename"]) is not None)
+
+        # 6. 删除备份
+        bk_del_resp = client.delete(f"/api/backups/{bk_id}")
+        check("删除备份接口返回 200", bk_del_resp.status_code == 200)
+        check("删除后记录与磁盘文件均不存在",
+              service.store.backups.get(bk_id) is None and not Path(bk_obj["filepath"]).exists())
+        check("删除不存在的备份返回 404", client.delete(f"/api/backups/{bk_id}").status_code == 404)
+
+        # --- 云端存储与适配器自检 -----------------------------------
+        from app.cloud.webdav import WebDAVProvider
+        from app.cloud import prune_cloud_backups
+        from app.cloud.base import CloudProvider
+
+        # 调度器定时备份任务测试：直接面向 store 执行，无需任何全局 Service 单例。
+        service.scheduler.invalidate_backup_schedule()
+        check("设置变更后备份调度缓存已失效", service.scheduler._next_backup_time is None)
+        before_sched_count = service.store.backups.count()
+        service.scheduler._run_backup_job(include_logs=False, include_artifacts=False, retention_count=5)
+        check("调度器后台线程成功执行定时备份", service.store.backups.count() == before_sched_count + 1)
+
+        # 新增设置字段必须真实落盘（白名单遗漏会让保存静默丢失）。
+        settings_resp = client.put("/api/settings", json={
+            "backup_enabled": True,
+            "backup_schedule_type": "cron",
+            "backup_schedule_expression": "30 4 * * *",
+            "backup_retention_count": 7,
+            "backup_include_logs": False,
+            "backup_include_artifacts": False,
+            "cloud_backup_enabled": False,
+            "cloud_provider": "webdav",
+            "cloud_webdav_url": "https://dav.example.com/dav/",
+            "cloud_webdav_username": "user",
+            "cloud_webdav_password": "secret-pass",
+            "cloud_webdav_root": "auto/backups",
+            "cloud_retention_count": 5,
+        })
+        check("备份与云端设置保存成功", settings_resp.status_code == 200, settings_resp.text[:200])
+        saved = service.settings
+        check("备份定时设置已持久化", saved.backup_enabled is True
+              and saved.backup_schedule_expression == "30 4 * * *"
+              and saved.backup_retention_count == 7)
+        check("云端存储设置已持久化", saved.cloud_provider == "webdav"
+              and saved.cloud_webdav_url == "https://dav.example.com/dav/"
+              and saved.cloud_webdav_password == "secret-pass")
+        check("云端 WebDAV 密码不回显",
+              "cloud_webdav_password" not in service.export_settings()
+              and service.export_settings().get("cloud_webdav_password_set") is True)
+        check("非法备份表达式被拒绝",
+              client.put("/api/settings", json={"backup_schedule_expression": "not-a-cron"}).status_code == 422)
+        check("非法云端目录（路径穿越）被拒绝",
+              client.put("/api/settings", json={"cloud_webdav_root": "../escape"}).status_code == 422)
+        check("非法 rclone 目标（缺冒号）被拒绝",
+              client.put("/api/settings", json={"cloud_rclone_remote": "no-colon"}).status_code == 422)
+
+        dav = WebDAVProvider("https://dav.example.com/dav/", "user", "pass", "my-backups")
+        check("WebDAV 路径拼接正确", dav._target_url("test.tar.gz") == "https://dav.example.com/dav/my-backups/test.tar.gz")
+        check("WebDAV Basic Auth 头生成正常", "Basic " in dav._headers().get("Authorization", ""))
+
+        # 测试云端保留淘汰算法
+        class MockCloudProvider(CloudProvider):
+            def __init__(self):
+                self.deleted = []
+            def test_connection(self):
+                return True, "ok"
+            def upload_file(self, local_path, remote_filename):
+                return True, "ok"
+            def delete_file(self, remote_filename):
+                self.deleted.append(remote_filename)
+                return True, "ok"
+            def list_files(self):
+                return [
+                    {"name": "autodeploy-backup-20261016-010000.tar.gz"},
+                    {"name": "autodeploy-backup-20261016-020000.tar.gz"},
+                    {"name": "autodeploy-backup-20261016-030000.tar.gz"},
+                    {"name": "other-file.txt"},
+                ]
+
+        mock_p = MockCloudProvider()
+        pruned_cnt = prune_cloud_backups(mock_p, keep_count=2)
+        check("云端保留策略正确淘汰最旧备份", pruned_cnt == 1 and mock_p.deleted == ["autodeploy-backup-20261016-010000.tar.gz"])
+
+        # 测试云存储连通性接口
+        cloud_test_bad = client.post("/api/backups/cloud/test", json={"provider": "webdav", "webdav_url": "bad-url"})
+        check("非法 WebDAV URL 测试返回失败状态", cloud_test_bad.status_code == 200 and cloud_test_bad.json()["ok"] is False)
+
+        cloud_test_invalid_type = client.post("/api/backups/cloud/test", json={"provider": "unknown_type"})
+        check("未知存储驱动类型被拒绝", cloud_test_invalid_type.status_code == 400)
+
         client.post("/api/auth/logout")
+        check("未登录访问监控接口被拒绝", client.get("/api/monitor/host").status_code == 401)
+        check("未登录访问备份接口被拒绝", client.get("/api/backups").status_code == 401)
         response = client.get("/api/tasks")
         check("退出后无法访问", response.status_code == 401)
 
@@ -1979,6 +2765,25 @@ def run() -> int:
               for text in ssh_kind["notes"] + ssh_kind["steps"]))
     check("指引每步都有内容",
           all(item["steps"] for item in guide["kinds"]))
+    # 主机用途必须单独成段：只讲 Deploy Keys 会让「部署到远程主机」的用户
+    # 在凭据页找不到 authorized_keys 这条路径。
+    check("SSH 指引给出主机登录步骤",
+          bool(ssh_kind.get("host_steps"))
+          and any("authorized_keys" in s for s in ssh_kind["host_steps"]))
+    check("SSH 指引说明主机登录不支持口令私钥",
+          any("口令" in n for n in ssh_kind["notes"]))
+    check("SSH 指引标注两种用途",
+          len(ssh_kind.get("usages") or []) == 2, str(ssh_kind.get("usages")))
+    check("令牌指引声明不能用于主机登录",
+          any("主机" in n for n in token_kind["notes"]))
+
+    # 类型选项也要带上用途：任务表单的凭据下拉与主机页都依赖它。
+    from app.api.credentials import list_kinds
+    kind_options = {k["value"]: k for k in list_kinds(user={"username": "admin"})["kinds"]}
+    check("明文选项说明 SSH 私钥两种用途",
+          len(kind_options["ssh_key"].get("usages") or []) == 2)
+    check("令牌类型不声称可用于主机",
+          len(kind_options["https_token"].get("usages") or []) == 1)
 
     # --- 代理 URL 与脱敏 ---
     st = Settings()
@@ -3279,6 +4084,54 @@ def run() -> int:
     preview = scheduler.preview("cron", "0 0 * * *", 3)
     check("cron 预览返回 3 项", len(preview) == 3)
     check("非法表达式预览为空", scheduler.preview("cron", "bad", 3) == [])
+
+    # --- 日志链路：批量写入、周期 flush、截断保尾 -----------------------
+    # 大日志/频繁部署场景：文件触顶后磁盘上必须保住结尾（失败原因所在），
+    # 而不是实时视图看得到结尾、落盘后只剩开头。
+    import app.runner  # noqa: F401 - 确认模块可导入且常量存在
+    from app.runner import ActiveRun, LOG_FLUSH_EVERY_LINES
+
+    log_probe = ActiveRun(run_id=990001, task_id=1, log_max_bytes=4096)
+    log_path = tmp_root / "probe-run.log"
+    log_probe.log_file = log_path.open("a", encoding="utf-8", errors="replace")
+    noisy = [f"noise line {i:05d} paddingpadding" for i in range(200)]
+    runner._write_log_batch(log_probe, noisy)
+    check("批量写入一次性入缓冲", log_probe.tail_count == len(noisy))
+    # 首批 200 行已超上限：写循环内每行检查 tell()，超限即关文件，
+    # flush 计数随最后一次批量写入清零（周期 flush 在批内被触发过）。
+    check("批量触顶后句柄关闭并置截断标记",
+          log_probe.log_file is None and log_probe.log_truncated)
+    runner._write_log_batch(log_probe, ["tail-keeper"])
+    closed_bytes = runner._close_log(log_probe, log_path)
+    final_text = log_path.read_text(encoding="utf-8")
+    check("截断后收口重写文件为内存尾部", final_text.startswith("! 日志前段因超过大小上限被截断"))
+    check("重写后的文件包含结尾内容（失败原因可找回）",
+          "tail-keeper" in final_text
+          and "noise line 00199" in final_text
+          and "noise line 00000" not in final_text)
+    check("收口返回重写后的字节数", closed_bytes == log_path.stat().st_size and closed_bytes > 0)
+    check("重写内容尊重大小上限", closed_bytes <= log_probe.log_max_bytes,
+          f"{closed_bytes} > {log_probe.log_max_bytes}")
+
+    # 周期 flush：写入超过阈值行数后应把 flush 计数清零（文件 flush 被调用过）
+    flush_probe = ActiveRun(run_id=990002, task_id=1, log_max_bytes=10_000_000)
+    flush_path = tmp_root / "flush-run.log"
+    flush_probe.log_file = flush_path.open("a", encoding="utf-8", errors="replace")
+    runner._write_log_batch(flush_probe, [f"line-{i}" for i in range(LOG_FLUSH_EVERY_LINES * 2)])
+    check("写入达到行距阈值后 flush 计数归零", flush_probe.lines_since_flush == 0)
+    flush_probe.log_file.close()
+
+    # 批量回调链路：executor 的 log_batch 应整批到达，而不是逐行 log()
+    batch_seen: list[list[str]] = []
+    from app.executor import run_command as _rc
+    _rc(["python3", "-c",
+         "import sys\nfor i in range(5): print(f'bulk-{i}')"],
+        timeout=30, log_batch=batch_seen.append)
+    check("executor 批量回调收到整批输出", len(batch_seen) >= 1
+          and sum(len(b) for b in batch_seen) == 5, str(batch_seen)[:200])
+    check("批量输出内容完整", [l for b in batch_seen for l in b][:5] ==
+          [f"bulk-{i}" for i in range(5)])
+
 
     # 工作目录以任务名命名；旧目录及外部占用通过认领标记隔离。
     from app import config as app_config

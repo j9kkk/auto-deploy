@@ -29,8 +29,11 @@ from ..schedule import iso, next_run_time, utcnow
 from ..security import new_token
 from ..service import Service
 from ..store import TaskNameConflict, decode_task
+from ..remote import RemoteError
+from ..target import TargetError, build_target, resolve_remote_layout
 from ..validation import (
     ValidationError,
+    describe_host,
     describe_task_schedule,
     validate_task_payload,
 )
@@ -68,6 +71,19 @@ def _decorate(
     else:
         enriched["webhook_url"] = ""
     enriched["active_run"] = None
+    # 目标主机的展示标签：本机 / user@addr，或「已删除的主机 #N」。
+    enriched["host_label"] = "本机"
+    enriched["host_missing"] = False
+    host_id = task.get("host_id")
+    if host_id:
+        host_row = service.store.hosts.get(int(host_id))
+        if host_row is None:
+            enriched["host_label"] = f"已删除的主机 #{host_id}"
+            enriched["host_missing"] = True
+        else:
+            host = describe_host(host_row)
+            enriched["host_label"] = str(host_row.get("name") or "") or host
+            enriched["host_target"] = host
     if last_run is _UNSET:
         runs = service.store.runs.list_for_task(int(task["id"]), limit=1)
         last_run = runs[0] if runs else None
@@ -131,6 +147,21 @@ def _ensure_credential_exists(service: Service, body: dict[str, Any]) -> None:
         )
 
 
+def _ensure_host_exists(service: Service, body: dict[str, Any]) -> None:
+    """所选目标主机必须真实存在。
+
+    host_id 为空表示本机，是合法值；指定了却查不到则说明主机被删，
+    继续保存会让任务在运行时莫名退回本机部署。
+    """
+    host_id = body.get("host_id")
+    if host_id is not None and service.store.hosts.get(int(host_id)) is None:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "参数校验失败",
+                    "errors": {"host_id": "所选目标主机不存在，可能已被删除"}},
+        )
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_task(
     payload: dict[str, Any],
@@ -143,6 +174,7 @@ def create_task(
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
     _ensure_credential_exists(service, body)
+    _ensure_host_exists(service, body)
 
     try:
         task_id = service.store.tasks.create(body)
@@ -182,6 +214,20 @@ def get_task(
     if row is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     task = _decorate(decode_task(row) or {}, service, request)
+    if row.get("host_id"):
+        # 远程任务的发布目录在目标主机上：详情页不为渲染去发起 SSH，
+        # 只说清位置，并提供主机名给界面提示。
+        return {
+            "task": task,
+            "releases": [],
+            "releases_remote": True,
+            "releases_note": (
+                f"发布版本位于目标主机「{task.get('host_label') or '远程主机'}」，"
+                "请在目标主机上查看"
+            ),
+            "preflight": preflight(row),
+            "runs": service.store.runs.list_for_task(task_id, limit=20),
+        }
     releases_root, current_link = resolve_release_paths(row)
     releases = [
         {
@@ -219,6 +265,7 @@ def update_task(
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
         _ensure_credential_exists(service, body)
+        _ensure_host_exists(service, body)
 
         if "name" in body and body["name"] != existing["name"]:
             if service.store.runs.has_active_for_task(task_id):
@@ -284,7 +331,18 @@ def delete_task(
 
     # 锁外执行：容器停止依赖的 compose 文件此时仍在发布目录里。
     container_log: list[str] = []
-    containers = stop_task_containers(row, log=container_log.append)
+    if row.get("host_id"):
+        # 远程任务的容器与发布目录都在目标主机上：本机的 stop_task_containers
+        # 只会对着控制机做无害的 no-op，反而让用户误以为已经清理干净。
+        host_row = service.store.hosts.get(int(row["host_id"]))
+        host_name = str((host_row or {}).get("name") or "") or f"主机 #{row['host_id']}"
+        container_log.append(
+            f"! 该任务部署在远程主机「{host_name}」上：容器与发布目录未在目标主机清理，"
+            f"请登录该主机自行停止容器并删除发布目录"
+        )
+        containers: list[str] = []
+    else:
+        containers = stop_task_containers(row, log=container_log.append)
 
     purged: list[str] = []
     kept: list[str] = []
@@ -474,7 +532,11 @@ def rollback(
         # 运行版本合法性（存在/成功/目录有效）留到后台执行时校验——那需要
         # 解析发布目录的软链与路径边界，放在锁内会拖住其它调度操作。
         selected_run = (service.store.runs.get(run_id) or {}) if run_id is not None else None
-        rollback_run_id = service.store.runs.create(row, trigger="rollback")
+        rollback_host_id, rollback_host_name = service.store.hosts.snapshot_for_run(row)
+        rollback_run_id = service.store.runs.create(
+            row, trigger="rollback",
+            host_id=rollback_host_id, host_name=rollback_host_name,
+        )
 
     threading.Thread(
         target=service.runner.execute_rollback,
@@ -506,15 +568,47 @@ def task_preflight(
         raise HTTPException(status_code=404, detail="任务不存在")
     releases_root, current_link = resolve_release_paths(row)
     task = _decorate(decode_task(row) or {}, service, request)
+    # 远程任务：把检查项也落到目标主机上（这是用户主动点「环境检查」的路径，
+    # 发一次 SSH 是可接受的；发布列表那种被动 GET 则不发）。
+    checks = preflight(row)
+    remote_info: dict[str, Any] = {}
+    if row.get("host_id"):
+        host_row = service.store.hosts.get(int(row["host_id"]))
+        if host_row is None:
+            checks = [{"name": "目标主机", "ok": False, "message": "任务指定的目标主机已被删除"}]
+            remote_info = {"host_missing": True}
+        else:
+            credential_row = None
+            if host_row.get("credential_id"):
+                credential_row = service.store.credentials.get(int(host_row["credential_id"]))
+            try:
+                target = build_target(
+                    host_row, credential_row,
+                    work_dir=config.TMP_DIR / f"task-{task_id}-host",
+                )
+                layout = resolve_remote_layout(host_row, row)
+                checks = preflight(row, target=None) + preflight(row, target=target)
+                remote_info = {
+                    "remote": True,
+                    "host_name": str(host_row.get("name") or ""),
+                    "host_target": describe_host(host_row),
+                    "workspace": layout.workspace,
+                    "releases_root": layout.releases_root,
+                    "current_link": layout.current_link,
+                }
+            except (TargetError, RemoteError) as exc:
+                checks = [{"name": "目标主机", "ok": False, "message": str(exc)}]
+                remote_info = {"remote": True, "host_error": str(exc)}
     return {
-        "checks": preflight(row),
+        "checks": checks,
         "required_binaries": sorted({*REQUIRED_BINARIES, *METHOD_BINARIES.values()}),
-        "releases_root": str(releases_root),
-        "current_link": str(current_link),
+        "releases_root": remote_info.get("releases_root", str(releases_root)),
+        "current_link": remote_info.get("current_link", str(current_link)),
         "current_target": (
-            str(current_release(releases_root, current_link) or "")
+            "" if remote_info.get("remote")
+            else str(current_release(releases_root, current_link) or "")
         ),
-        "workspace": task["workspace"],
+        "workspace": remote_info.get("workspace", task["workspace"]),
         "workspace_error": task.get("workspace_error", ""),
         "disk": disk_usage(config.DATA_DIR),
         "next_run_at": row.get("next_run_at"),
@@ -531,6 +625,19 @@ def task_releases(
     row = service.store.tasks.get(task_id)
     if row is None:
         raise HTTPException(status_code=404, detail="任务不存在")
+    # 远程任务的发布目录在目标主机上：一次列表请求不该为此发起 SSH，
+    # 否则慢连接会把整个任务详情页拖住。明确告知位置即可。
+    if row.get("host_id"):
+        host_row = service.store.hosts.get(int(row["host_id"]))
+        host_name = str((host_row or {}).get("name") or "") or f"主机 #{row['host_id']}"
+        return {
+            "releases": [],
+            "current": "",
+            "root": "",
+            "remote": True,
+            "host_name": host_name,
+            "note": f"该任务的发布版本位于目标主机「{host_name}」，请在目标主机上查看",
+        }
     releases_root, current_link = resolve_release_paths(row)
     active = current_release(releases_root, current_link)
     return {

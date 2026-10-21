@@ -156,40 +156,49 @@ def tail_run(
     same trailing window returned in ``total``. The server sends whatever
     follows, so the browser only transfers new output.
     """
+    def response(
+        status_payload: dict[str, Any], lines: list[str], total: int, *,
+        reset: bool, active: bool,
+    ) -> dict[str, Any]:
+        return {"lines": lines, "total": total, "reset": reset, "active": active, **status_payload}
+
+    # 活跃运行先走内存探测：整个活跃分支不查库（每打开一个日志视图的轮询
+    # 每 1.2 秒一次，SQLite 读放大在多视图同时观看时是纯浪费）。状态在
+    # mark_running 之后恒为 running，duration/exit_code 属于终态字段，
+    # 客户端在活跃期间本来就不消费它们。
+    active, live_total = service.runner.tail_meta(run_id)
+    if active:
+        status_payload = {"status": "running", "status_label": STATUS_LABELS["running"]}
+
+        if after == live_total:
+            # 客户端已追平输出：直接返回空增量，免去复制整个 2000 行环形缓冲。
+            return response(status_payload, [], live_total, reset=False, active=True)
+
+        lines = service.runner.tail(run_id, limit=LOG_WINDOW_LINES) or []
+        if after > len(lines):
+            # The client holds more lines than the server can see (the in-memory
+            # ring buffer was trimmed, or the service restarted). Tell it to reset
+            # and resend the whole tail so both sides agree again.
+            return response(status_payload, lines, len(lines), reset=True, active=True)
+        # `after == len(lines)` means the client is fully caught up; the slice below
+        # then yields an empty list, which is what keeps the live view from
+        # duplicating output on every poll.
+        return response(status_payload, lines[after:], len(lines), reset=False, active=True)
+
+    # 非活跃运行（终态）：从库里取终态字段，日志回退到磁盘文件尾部。
     run = service.store.runs.get_decoded(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="运行记录不存在")
-
     status_payload = {
         "status": run.get("status"),
         "status_label": STATUS_LABELS.get(str(run.get("status")), str(run.get("status"))),
         "duration_ms": run.get("duration_ms"),
         "exit_code": run.get("exit_code"),
     }
-
-    def response(lines: list[str], total: int, *, reset: bool, active: bool) -> dict[str, Any]:
-        return {"lines": lines, "total": total, "reset": reset, "active": active, **status_payload}
-
-    # 活跃运行先用轻量计数比对：客户端已追平输出时直接返回空增量，
-    # 免去复制整个 2000 行环形缓冲的开销。
-    active, live_total = service.runner.tail_meta(run_id)
-    if active and after == live_total:
-        return response([], live_total, reset=False, active=True)
-
-    if active:
-        lines = service.runner.tail(run_id, limit=LOG_WINDOW_LINES) or []
-    else:
-        lines = _read_tail(_log_path(run), lines=LOG_WINDOW_LINES)
-
+    lines = _read_tail(_log_path(run), lines=LOG_WINDOW_LINES)
     if after > len(lines):
-        # The client holds more lines than the server can see (the in-memory
-        # ring buffer was trimmed, or the service restarted). Tell it to reset
-        # and resend the whole tail so both sides agree again.
-        return response(lines, len(lines), reset=True, active=active)
-    # `after == len(lines)` means the client is fully caught up; the slice below
-    # then yields an empty list, which is what keeps the live view from
-    # duplicating output on every poll.
-    return response(lines[after:], len(lines), reset=False, active=active)
+        return response(status_payload, lines, len(lines), reset=True, active=False)
+    return response(status_payload, lines[after:], len(lines), reset=False, active=False)
 
 
 @router.post("/{run_id}/cancel")

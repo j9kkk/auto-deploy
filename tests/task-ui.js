@@ -160,6 +160,8 @@ async function scenario(runs = [run(30), run(20)], taskExtra = {}, options = {})
     else if (method === 'GET' && url === '/api/tasks') result = { tasks: [task] };
     else if (method === 'GET' && url === '/api/tasks/1') result = { task, runs };
     else if (method === 'GET' && url === '/api/credentials') result = { credentials: [] };
+    // 任务表单会拉取主机下拉；默认无远程主机（任务在本机执行）。
+    else if (method === 'GET' && url === '/api/hosts') result = { hosts: options.hosts || [] };
     else if (method === 'GET' && url.startsWith('/api/runs?') && options.runsView) {
       result = { runs, total: runs.length, statuses: [] };
     } else if (method === 'POST' && url === '/api/settings/schedule/preview') result = { ok: true, description: '固定间隔', next_runs: [] };
@@ -628,6 +630,41 @@ async function formChecks() {
 }
 
 async function taskFormUxChecks() {
+  // 行首启用开关：请求结束后必须恢复可交互，并回填服务端状态。
+  // 旧缺陷是成功路径忘了清除 disabled，表现为「点了之后一直转圈、再也点不动」。
+  {
+    const toggleTest = await scenario();
+    const input = toggleTest.q('[data-task-toggle]');
+    assert.equal(input.checked, true, '初始应为已启用');
+    // 切换成功后前端会重新拉取任务列表做收敛；模拟服务端已持久化新状态，
+    // 否则断言测的只是本地乐观值而不是最终一致的界面。
+    toggleTest.enqueue('POST', '/api/tasks/1/toggle', { ok: true, enabled: false });
+    toggleTest.enqueue('GET', '/api/tasks', { tasks: [{ ...toggleTest.task, enabled: false }] });
+    await toggleTest.click('[data-task-toggle]');
+    assert.equal(input.checked, false, '开关应按服务端返回切到关闭');
+    assert.equal(input.disabled, false, '成功切换后必须恢复可点击，不能永久禁用');
+    assert.equal(input.getAttribute('aria-label'), '启用任务', '可访问名应随状态更新');
+    // 再点一次（重新启用）：确认可以连续操作，而不是只成功一次。
+    toggleTest.enqueue('POST', '/api/tasks/1/toggle', { ok: true, enabled: true });
+    toggleTest.enqueue('GET', '/api/tasks', { tasks: [{ ...toggleTest.task, enabled: true }] });
+    await toggleTest.click('[data-task-toggle]');
+    assert.equal(input.checked, true, '第二次切换也应生效');
+    assert.equal(input.disabled, false, '第二次切换后仍需可点击');
+    toggleTest.finish();
+  }
+
+  // 切换失败：状态回滚到点击前，且同样恢复可点击。
+  {
+    const failTest = await scenario();
+    const input = failTest.q('[data-task-toggle]');
+    failTest.enqueue('POST', '/api/tasks/1/toggle', new Error('权限不足'));
+    await failTest.click('[data-task-toggle]');
+    assert.equal(input.checked, true, '失败时应回滚到原状态');
+    assert.equal(input.disabled, false, '失败后必须恢复可点击');
+    assert.deepEqual(failTest.errors, ['权限不足']);
+    failTest.finish();
+  }
+
   // 切换部署方式保留输入：来回切换不清空已填内容（清空只发生在提交时，
   // 且只清空与当前方式无关的字段）。
   const switched = await scenario();
@@ -709,6 +746,69 @@ async function taskFormUxChecks() {
   assert.match(summaryText, /触发：固定间隔 1h/);
   summarised.finish();
 
+  // ---- 分页表单 ------------------------------------------------------
+  // 1) 默认停在「基础」，其余面板全部隐藏（但仍在 DOM 中）。
+  const tabbed = await scenario();
+  await tabbed.AD.openTaskForm(1); await flush();
+  assert.equal(tabbed.q('[data-form-panel="basic"]').classList.contains('hidden'), false);
+  for (const key of ['source', 'build', 'trigger', 'advanced', 'summary']) {
+    assert.equal(tabbed.q(`[data-form-panel="${key}"]`).classList.contains('hidden'), true,
+      `初始应隐藏面板 ${key}`);
+  }
+  assert.equal(tabbed.q('[data-form-tab="basic"]').classList.contains('active'), true);
+  assert.equal(tabbed.q('[data-form-tab="basic"]').getAttribute('aria-selected'), 'true');
+
+  // 2) 点击菜单切页：只切换可见性，字段节点不能被销毁。
+  const nameNode = tabbed.q('#f-name');
+  await tabbed.click('[data-form-tab="source"]');
+  assert.equal(tabbed.q('[data-form-panel="source"]').classList.contains('hidden'), false);
+  assert.equal(tabbed.q('[data-form-panel="basic"]').classList.contains('hidden'), true);
+  assert.equal(tabbed.q('[data-form-tab="source"]').classList.contains('active'), true);
+  assert.equal(tabbed.q('#f-repo_url').isConnected, true, '切页后隐藏页字段必须仍在文档中');
+  assert.equal(tabbed.q('#f-name').isConnected, true);
+  assert.equal(tabbed.q('#f-name'), nameNode, '切页不得重建字段节点');
+
+  // 3) 隐藏页里的字段照常参与提交（collectForm 读全部 id）。
+  tabbed.q('#f-repo_subdir').value = 'frontend/';
+  tabbed.enqueue('PUT', '/api/tasks/1', { task: { ...tabbed.task, repo_subdir: 'frontend/' } });
+  await tabbed.click('#form-save');
+  const submitted = tabbed.requests.filter(r => r.method === 'PUT').at(-1);
+  assert.equal(submitted.body.repo_subdir, 'frontend/', '隐藏页字段必须随表单提交');
+  tabbed.finish();
+
+  // 4) 跨页校验：停在「基础」页保存、仓库地址缺失时，必须自动切到
+  //    「代码源」页并把错误标到该菜单项，否则用户看不到出错字段。
+  const crossTab = await scenario([run(30)], { repo_url: '' });
+  await crossTab.AD.openTaskForm(1); await flush();
+  assert.equal(crossTab.q('[data-form-tab="basic"]').classList.contains('active'), true);
+  await crossTab.click('#form-save');
+  assert.equal(crossTab.q('[data-form-tab="source"]').classList.contains('active'), true,
+    '缺仓库地址时应自动跳转到代码源页');
+  assert.equal(crossTab.q('[data-form-tab="source"]').classList.contains('has-error'), true);
+  assert.match(crossTab.q('#form-error').textContent, /仓库地址/, '表单顶部应显示仓库地址必填提示');
+  assert.equal(crossTab.requests.filter(r => r.method === 'PUT').length, 0, '校验失败不得提交');
+  crossTab.finish();
+
+  // 5) 部署方式的必填项缺失时跳到「构建与发布」页。
+  const methodMissing = await scenario([run(30)], { deploy_method: 'systemd', service_name: '' });
+  await methodMissing.AD.openTaskForm(1); await flush();
+  await methodMissing.click('#form-save');
+  assert.equal(methodMissing.q('[data-form-tab="build"]').classList.contains('active'), true,
+    '缺 systemd 服务名时应跳到构建与发布页');
+  assert.match(methodMissing.q('#form-error').textContent, /systemd 服务名/);
+  methodMissing.finish();
+
+  // 6) 改过某页后该菜单项出现脏标记；摘要页不因自身输入而标记。
+  const dirtyTab = await scenario();
+  await dirtyTab.AD.openTaskForm(null); await flush();
+  dirtyTab.q('#f-name').value = 'Renamed_task';
+  dirtyTab.q('#f-name').fire('input');
+  await flush();
+  assert.equal(dirtyTab.q('[data-form-tab="basic"]').classList.contains('is-dirty'), true,
+    '修改基础页字段后应出现未保存标记');
+  assert.equal(dirtyTab.q('[data-form-tab="source"]').classList.contains('is-dirty'), false);
+  dirtyTab.finish();
+
   // 「创建后立即运行」派发失败时后端返回 warning，必须提示而不是只报成功。
   const warned = await scenario();
   await warned.AD.openTaskForm(null); await flush();
@@ -768,6 +868,114 @@ function styleChecks() {
   assert.ok(css.includes('input:checked + .switch-track'), '缺少 switch 选中态样式');
   assert.ok(source.includes('<td data-label="启用">'), '任务行缺少行首启用列');
   assert.ok(css.includes('td[data-label="启用"]'), '移动端缺少启用列对齐样式');
+
+  // 任务资源抽屉：面板必须从右侧滑入（默认右移出屏、关闭类负责移出），
+  // 并且当行有可见的点击提示，否则用户根本不知道表格行可点。
+  const panel = rule('.drawer-panel');
+  assert.match(panel, /transform:\s*translateX\(0\);/);
+  assert.match(panel, /transition:\s*transform/);
+  assert.match(rule('.drawer-root.drawer-closing .drawer-panel'), /translateX\(100%\)/);
+  assert.match(rule('.drawer-root.drawer-entering .drawer-panel'), /translateX\(100%\)/);
+  assert.match(rule('.mon-task-row'), /cursor:\s*pointer;/);
+  assert.match(rule('.drawer-root'), /position:\s*fixed;/);
+  assert.ok(source.includes('data-mon-task='), '监控任务行缺少点击标识');
+  assert.ok(source.includes('AD.openTaskDrawer'), '缺少打开任务抽屉的实现');
+  assert.ok(source.includes('data-drawer-log'), '抽屉缺少日志终端容器');
+
+  // 监控「存储占用」主指标必须是宿主机分区占用率，而不是应用自身数据目录：
+  // 后者在 Docker 虚拟盘环境下既不代表真实磁盘，也会让用户误读为整机容量。
+  const storageCard = source.slice(
+    source.indexOf('<h2>存储占用</h2>'),
+    source.indexOf('<h2>系统环境</h2>'),
+  );
+  assert.ok(storageCard, '缺少存储占用卡片');
+  assert.match(storageCard, /monitor-val[^>]*>\$\{host\.disk_percent\}%</,
+    '存储占用主数值应为宿主机分区占用率');
+  assert.match(storageCard, /host\.disk_used/, '存储卡片应展示分区已用量');
+  assert.match(storageCard, /host\.disk_free/, '存储卡片应展示分区剩余量');
+  assert.match(storageCard, /host\.app_data_bytes/, '存储卡片应保留应用数据体积作为副指标');
+
+  // 容器维度监控：宿主机四图之外再加一组容器四图（2×2），与主机图共用同一时间区间。
+  assert.ok(source.includes("id=\"mon-container-grid\""), '缺少容器图表网格');
+  assert.ok(source.includes('renderContainerChartCardsHtml'), '缺少容器图表渲染函数');
+  assert.ok(/\/api\/monitor\/containers\/history\?range=\$\{currentRange\}/.test(source),
+    '容器历史必须跟随时间区间请求');
+  for (const chartId of ['chart-container-cpu', 'chart-container-mem', 'chart-container-disk', 'chart-container-net']) {
+    assert.ok(source.includes(`'${chartId}'`), '缺少容器图表：' + chartId);
+  }
+  // 每组图表各 4 张卡：两端都要有，否则「再加 2 行」只剩一行。
+  assert.match(rule('.monitor-chart-grid'), /grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/,
+    '图表网格必须两列（每行 2 个）');
+  assert.match(rule('.chart-card-title'), /flex-wrap:\s*wrap;/,
+    '容器图例较多时卡片标题必须能换行');
+  // 容器曲线用多序列：面积填充只保留给单序列图，否则多容器互相遮挡。
+  assert.match(source, /const withFill = series\.length === 1;/, '多容器曲线不应叠面积填充');
+  assert.ok(source.includes('splitSegments'), '容器重启产生的数据空洞必须断线而不是连成斜线');
+  // 悬停浮层按序列生成，不再硬编码四张卡的字段。
+  assert.ok(source.includes('function bindChartGrid'), '缺少通用图表联动函数');
+  assert.ok(!/cardId === 'chart-cpu'/.test(source), '联动逻辑不应再按固定卡片 id 硬编码');
+  // 浮层宽度随容器名变化，必须按渲染后宽度收边，否则靠右悬停会被裁切。
+  assert.match(source, /tooltip\.offsetWidth/, '浮层定位必须按真实宽度收边');
+  // 24h / 7d 跨午夜时横轴只显示时分秒会看起来像时间倒流。
+  assert.ok(source.includes('timeLabelCrossesDay'), '跨天图表的时间标签必须带日期');
+
+  // 分页表单：左侧固定导航 + 右侧固定高度内容区；移动端改为顶部横滚胶囊。
+  assert.match(rule('.form-tabs'), /grid-template-columns:\s*148px/, '分页容器应为左导航+内容两列');
+  assert.match(rule('.form-tab-nav'), /flex-direction:\s*column;/, '桌面端导航应竖排');
+  assert.match(rule('.form-tab-panels'), /height:\s*390px;/, '内容区高度必须固定，避免切页跳动');
+  assert.match(rule('.form-tab-panels'), /overflow-y:\s*auto;/, '内容超高时应在面板内滚动');
+  assert.match(rule('.form-tab-btn.active'), /background:\s*var\(--accent-soft\);/);
+  assert.match(rule('.form-tab-btn.has-error'), /color:\s*var\(--danger\);/);
+  // 移动端：720px 断点内导航转横向（文件里有多个 720px 块，逐块找含 form-tab-nav 的那个）。
+  const mobileBlocks = [...css.matchAll(/@media\s*\(max-width:\s*720px\)\s*\{/g)];
+  const tabBlock = mobileBlocks
+    .map((m) => css.slice(m.index, css.indexOf('\n}', m.index) + 2))
+    .find((block) => block.includes('.form-tab-nav'));
+  assert.ok(tabBlock, '缺少分页移动端媒体查询（720px）');
+  assert.match(tabBlock, /\.form-tab-nav\s*\{[^}]*flex-direction:\s*row;/, '移动端导航应横排');
+  assert.match(tabBlock, /\.form-tab-panels\s*\{[^}]*height:\s*auto;/, '移动端不应固定高度');
+
+  // 开关：滑块必须是弹性曲线（果冻回弹），且按下时有宽度变化。
+  const trackAfter = rule('.switch-track::after');
+  assert.match(trackAfter, /transition:\s*transform \.34s cubic-bezier\(\.34,\s*1\.56/, 
+    '滑块过渡应使用带过冲的弹性曲线');
+  assert.match(rule('.switch:active input:not(:disabled) + .switch-track::after'), /width:\s*18px;/,
+    '按下时滑块应变宽（果冻挤压）');
+  assert.match(rule('.switch-row'), /display:\s*flex;/, '开关行应为文字+滑块一行');
+  assert.match(rule('.switch-row .switch-hint'), /color:\s*var\(--text-faint\);/,
+    '开关行应支持副标题说明');
+
+  // 远程主机视图：必须有主机管理入口，且指纹重置是显式的危险动作。
+  assert.ok(source.includes('AD.views.hosts'), '缺少主机管理视图');
+  assert.ok(source.includes('AD.openHostForm'), '缺少主机表单');
+  assert.ok(source.includes('data-host-test='), '主机行缺少测试连接按钮');
+  assert.ok(source.includes('data-host-fingerprint='), '主机行缺少指纹重置入口');
+  assert.ok(source.includes('reset-fingerprint'), '缺少重置指纹的 API 调用');
+  assert.ok(source.includes("c.kind === 'ssh_key'"), '主机表单应只列出 SSH 私钥凭据');
+
+  // 任务表单的目标主机下拉：空值代表本机；collectForm 必须把它提交出去
+  // （漏掉就会被后端按「本机」保存，任务静默改到控制机执行）。
+  assert.ok(source.includes('id="f-host_id"'), '任务表单缺少目标主机下拉');
+  assert.match(source, /host_id:\s*value\('#f-host_id'\)/, 'collectForm 必须提交 host_id');
+  assert.match(source, /<option value=""[^>]*>本机（控制机）<\/option>/, '下拉必须提供本机选项');
+  assert.ok(source.includes('当前绑定的主机已不存在'),
+    '已绑定但被删除的主机必须在选项里可见，不能静默退回本机');
+  // 远程任务的展示：任务行与运行详情都要标出目标主机。
+  assert.ok(source.includes('task.host_target || task.host_label'), '任务行应显示目标主机');
+  assert.ok(source.includes("run.host_name || '本机'"), '运行详情应显示目标主机');
+  assert.ok(source.includes('data.releases_remote'), '远程任务的发布列表应给出提示而不是空列表');
+
+  // 凭据页必须覆盖 SSH 私钥的「主机登录」用途，而不是只讲仓库 Deploy Keys。
+  assert.ok(source.includes('used_by_hosts'), '凭据页必须显示主机引用数（只算任务会让只绑主机的私钥显示未使用）');
+  assert.ok(source.includes('data-cred-kind='), '测试按钮必须带上凭据类型，才能给出仓库/主机两条路径');
+  assert.ok(source.includes('/test-host'), '缺少主机登录测试的 API 调用');
+  assert.ok(source.includes('主机可登录'), '主机登录结论必须与仓库可用性分开显示');
+  assert.ok(source.includes('authorized_keys'), '公钥面板必须说明主机侧登记到 authorized_keys');
+  assert.ok(source.includes('host_steps'), '凭据指引必须渲染主机登录步骤');
+  assert.ok(source.includes('仓库 + 主机'), 'SSH 私钥行必须标明它可用于两类用途');
+  assert.ok(source.includes('登录远程主机不支持口令'), '带口令私钥的限制必须在表单里写清');
+  // 删除确认要把主机侧的后果讲出来：外键置空后该主机无法登录。
+  assert.ok(source.includes('将无法登录'), '删除确认必须说明主机将失去登录能力');
 }
 
 (async () => {

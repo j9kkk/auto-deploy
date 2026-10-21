@@ -29,6 +29,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from . import config
 from .executor import CommandResult, command_exists, run_command, shell_command
+from .target import TargetError
 
 DEPLOY_METHODS = (
     "artifact",       # build + package only
@@ -86,6 +87,8 @@ class DeployContext:
     branch: str = ""
     env: dict[str, str] = field(default_factory=dict)
     log: Callable[[str], None] = lambda _message: None
+    # 批量日志回调（可选）：构建输出突发时整批递交，一次加锁一次落盘。
+    log_batch: Callable[[list[str]], None] | None = None
     check_cancelled: Callable[[], bool] = lambda: False
     kill_grace_seconds: int = 10
     # Live process handles, so a cancellation request can kill what is running.
@@ -93,6 +96,22 @@ class DeployContext:
     last_exit_code: int | None = None
     # 代理环境变量：注入到所有脚本，让构建过程也能联网。
     proxy: dict[str, str] = field(default_factory=dict)
+    # 命令与文件的执行位置。None 表示本机（保持既有调用方与测试的构造方式）。
+    target: Any = None
+    # 远程目标时的字符串路径；本机目标下为空，避免与 Path 语义混淆。
+    remote_workspace: str = ""
+    remote_release_dir: str = ""
+    remote_releases_root: str = ""
+    remote_current_link: str = ""
+    remote_artifact_path: str = ""
+
+    def _exec_target(self) -> Any:
+        """惰性取得执行目标：未显式注入时即本机。"""
+        if self.target is None:
+            from .target import LocalTarget
+
+            self.target = LocalTarget()
+        return self.target
 
     def exec(
         self,
@@ -108,12 +127,13 @@ class DeployContext:
         # 代理附加在最后：即使调用方传了自己的 env，也仍然带上代理设置。
         if self.proxy:
             resolved_env = {**resolved_env, **self.proxy}
-        result = run_command(
+        result = self._exec_target().run(
             args,
             cwd=cwd,
             env=resolved_env,
             timeout=_timeout_for(self, timeout),
             log=self.log,
+            log_batch=self.log_batch,
             label=label,
             handle_out=self.handles,
             check_cancelled=self.check_cancelled,
@@ -121,6 +141,74 @@ class DeployContext:
         )
         self.last_exit_code = result.exit_code
         return result
+
+    def exec_script(
+        self,
+        script: str,
+        *,
+        cwd: Path | str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int | None = None,
+        label: str | None = None,
+    ) -> CommandResult:
+        """在本上下文的目标上执行一段 shell 脚本。
+
+        远程目标的 shell 选择属于目标机（固定 bash）；本机沿用设置里的 shell。
+        """
+        resolved_env = env if env is not None else self.script_env()
+        if self.proxy:
+            resolved_env = {**resolved_env, **self.proxy}
+        result = self._exec_target().run_script(
+            script,
+            cwd=cwd,
+            env=resolved_env,
+            timeout=_timeout_for(self, timeout),
+            log=self.log,
+            log_batch=self.log_batch,
+            label=label,
+            handle_out=self.handles,
+            check_cancelled=self.check_cancelled,
+            kill_grace_seconds=self.kill_grace_seconds,
+        )
+        self.last_exit_code = result.exit_code
+        return result
+
+    @property
+    def is_remote(self) -> bool:
+        return bool(getattr(self._exec_target(), "is_remote", False))
+
+    @property
+    def work_dir(self) -> Any:
+        """工作目录：本机返回 Path，远程返回远端路径字符串。"""
+        return self.remote_workspace if self.is_remote else self.workspace
+
+    @property
+    def work_source_dir(self) -> Any:
+        """源码目录（含 repo_subdir）：本机 Path，远程字符串。"""
+        if not self.is_remote:
+            return self.source_root
+        subdir = (self.task.get("repo_subdir") or "").strip().strip("/")
+        if not subdir:
+            return self.remote_workspace
+        if ".." in Path(subdir).parts:
+            raise DeployError(f"仓库子目录越界: {subdir}")
+        return f"{self.remote_workspace.rstrip('/')}/{subdir}"
+
+    @property
+    def release_path(self) -> Any:
+        return self.remote_release_dir if self.is_remote else self.release_dir
+
+    @property
+    def releases_root_path(self) -> Any:
+        return self.remote_releases_root if self.is_remote else self.releases_root
+
+    @property
+    def current_link_path(self) -> Any:
+        return self.remote_current_link if self.is_remote else self.current_link
+
+    @property
+    def artifact_path_value(self) -> Any:
+        return self.remote_artifact_path if self.is_remote else self.artifact_path
 
     @property
     def source_root(self) -> Path:
@@ -141,20 +229,39 @@ class DeployContext:
         return (self.task.get("deploy_method") or "script").strip().lower()
 
     def script_env(self) -> dict[str, str]:
-        """Environment variables exported to every task script."""
+        """Environment variables exported to every task script.
+
+        路径类变量的取值取决于执行目标：远程部署时它们必须是目标机上的路径，
+        否则用户在 deploy 脚本里拿到的 ``AUTODEPLOY_RELEASE_DIR`` 会指向控制机
+        上一个目标机上并不存在的位置。
+        """
         base = dict(self.env)
+        if self.is_remote:
+            workspace = self.remote_workspace
+            source_dir = self.work_source_dir
+            release_dir = self.remote_release_dir
+            current_link = self.remote_current_link
+            releases_root = self.remote_releases_root
+            artifact = self.remote_artifact_path
+        else:
+            workspace = str(self.workspace)
+            source_dir = str(self.source_root)
+            release_dir = str(self.release_dir)
+            current_link = str(self.current_link)
+            releases_root = str(self.releases_root)
+            artifact = str(self.artifact_path)
         base.update(
             {
                 "AUTODEPLOY_TASK_ID": str(self.task.get("id", "")),
                 "AUTODEPLOY_TASK_NAME": str(self.task.get("name", "")),
                 "AUTODEPLOY_RUN_ID": str(self.run_id),
                 "AUTODEPLOY_DEPLOY_METHOD": self.deploy_method,
-                "AUTODEPLOY_WORKSPACE": str(self.workspace),
-                "AUTODEPLOY_SOURCE_DIR": str(self.source_root),
-                "AUTODEPLOY_RELEASE_DIR": str(self.release_dir),
-                "AUTODEPLOY_CURRENT_LINK": str(self.current_link),
-                "AUTODEPLOY_RELEASES_ROOT": str(self.releases_root),
-                "AUTODEPLOY_ARTIFACT": str(self.artifact_path),
+                "AUTODEPLOY_WORKSPACE": workspace,
+                "AUTODEPLOY_SOURCE_DIR": source_dir,
+                "AUTODEPLOY_RELEASE_DIR": release_dir,
+                "AUTODEPLOY_CURRENT_LINK": current_link,
+                "AUTODEPLOY_RELEASES_ROOT": releases_root,
+                "AUTODEPLOY_ARTIFACT": artifact,
                 "AUTODEPLOY_COMMIT": self.commit,
                 "AUTODEPLOY_SHORT_COMMIT": self.commit[:8],
                 "AUTODEPLOY_PREVIOUS_COMMIT": self.previous_commit,
@@ -470,10 +577,14 @@ def run_script_stage(
     env = ctx.script_env()
     env["AUTODEPLOY_STAGE"] = stage
     # Run from the source dir so relative paths in a script behave naturally.
-    cwd = ctx.source_root if ctx.source_root.exists() else ctx.workspace
+    # 远程目标没有本地 Path 概念，直接使用目标机上的源码目录字符串。
+    if ctx.is_remote:
+        cwd: Any = ctx.work_source_dir
+    else:
+        cwd = ctx.source_root if ctx.source_root.exists() else ctx.workspace
     ctx.log(f"--- 阶段: {stage} ---")
-    result = ctx.exec(
-        shell_command(body, shell=config.load_settings().shell),
+    result = ctx.exec_script(
+        body,
         cwd=cwd,
         env={**env, **ctx.proxy},
         timeout=_timeout_for(ctx, timeout),
@@ -499,10 +610,11 @@ def deploy_script(ctx: DeployContext) -> None:
 
 def deploy_release(ctx: DeployContext) -> None:
     """Stage the release and swap the symlink; no service action."""
-    if not ctx.release_dir.exists():
+    target = ctx._exec_target()
+    if not target.exists(ctx.release_path):
         raise DeployError("发布目录不存在，暂存阶段可能失败")
-    swap_symlink(ctx.current_link, ctx.release_dir)
-    ctx.log(f"已将 current 指向 {ctx.release_dir.name}")
+    target.swap_symlink(ctx.current_link_path, ctx.release_path)
+    ctx.log(f"已将 current 指向 {Path(str(ctx.release_path)).name}")
     script = ctx.task.get("deploy_script") or ""
     if script.strip():
         run_script_stage(ctx, script, stage="deploy")
@@ -510,13 +622,14 @@ def deploy_release(ctx: DeployContext) -> None:
 
 def deploy_systemd(ctx: DeployContext) -> None:
     """Swap the symlink then restart and verify the configured unit."""
+    target = ctx._exec_target()
     service = (ctx.task.get("service_name") or "").strip()
     if not service:
         raise DeployError("部署方式为 systemd，但未填写服务名称")
-    if not command_exists("systemctl"):
+    if not target.which("systemctl"):
         raise DeployError("未找到 systemctl，无法使用 systemd 部署方式")
-    swap_symlink(ctx.current_link, ctx.release_dir)
-    ctx.log(f"已将 current 指向 {ctx.release_dir.name}")
+    target.swap_symlink(ctx.current_link_path, ctx.release_path)
+    ctx.log(f"已将 current 指向 {Path(str(ctx.release_path)).name}")
 
     script = ctx.task.get("deploy_script") or ""
     if script.strip():
@@ -533,7 +646,7 @@ def deploy_systemd(ctx: DeployContext) -> None:
 
     # `is-active` failing means the unit restarted and immediately died, which
     # is exactly the case an operator needs to hear about.
-    status = run_command(
+    status = target.run(
         ["systemctl", "is-active", service],
         timeout=30,
         log=None,
@@ -546,25 +659,28 @@ def deploy_systemd(ctx: DeployContext) -> None:
 
 def deploy_docker(ctx: DeployContext) -> None:
     """Build the image, optionally refresh a container, and wait for health."""
-    if not command_exists("docker"):
+    target = ctx._exec_target()
+    if not target.which("docker"):
         raise DeployError("未找到 docker 命令，无法使用 Docker 部署方式")
     image = (ctx.task.get("docker_image") or "").strip()
     if not image:
         raise DeployError("部署方式为 Docker，但未填写镜像名称")
 
-    dockerfile = ctx.release_dir / "Dockerfile"
-    if not dockerfile.exists():
+    release_dir = ctx.release_path
+    dockerfile = f"{str(release_dir).rstrip('/')}/Dockerfile"
+    if not target.exists(dockerfile):
         # Fall back to the checkout root for repos whose Dockerfile sits beside
         # sources that the artifact filter excluded.
-        if (ctx.workspace / "Dockerfile").exists():
-            dockerfile = ctx.workspace / "Dockerfile"
+        workspace_dockerfile = f"{str(ctx.work_dir).rstrip('/')}/Dockerfile"
+        if target.exists(workspace_dockerfile):
+            dockerfile = workspace_dockerfile
         else:
             raise DeployError("未在发布目录中找到 Dockerfile")
 
-    build_context = dockerfile.parent
+    build_context = str(Path(str(dockerfile)).parent)
     ctx.log(f"--- 阶段: docker build ({image}) ---")
     result = ctx.exec(
-        ["docker", "build", "-t", image, "-f", str(dockerfile), str(build_context)],
+        ["docker", "build", "-t", image, "-f", str(dockerfile), build_context],
         timeout=_timeout_for(ctx),
         label="docker",
     )
@@ -579,7 +695,9 @@ def deploy_docker(ctx: DeployContext) -> None:
         ctx.log("未配置容器启动命令，仅完成镜像构建。")
 
 
-def _conflicting_stale_containers(output: str, project_name: str) -> list[str]:
+def _conflicting_stale_containers(
+    output: str, project_name: str, *, target: Any = None
+) -> list[str]:
     """从 compose 报错中解析容器名冲突，且只认旧 autodeploy 项目的容器。
 
     安全边界：绝不碰任何不带 autodeploy 项目标签的容器——那可能是用户
@@ -590,7 +708,8 @@ def _conflicting_stale_containers(output: str, project_name: str) -> list[str]:
     conflicts = _re.findall(r'The container name "/([^"]+)" is already in use', output or "")
     if not conflicts:
         return []
-    listing = run_command(
+    runner = target.run if target is not None else run_command
+    listing = runner(
         ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Labels}}"],
         timeout=30,
     )
@@ -654,21 +773,22 @@ def compose_project_name(task: dict[str, Any]) -> str:
 
 def deploy_docker_compose(ctx: DeployContext) -> None:
     """Bring up the compose project from the release directory."""
-    if not command_exists("docker"):
+    target = ctx._exec_target()
+    if not target.which("docker"):
         raise DeployError("未找到 docker 命令，无法使用 Docker Compose 部署方式")
     compose_file = (ctx.task.get("docker_compose_file") or "docker-compose.yml").strip()
     if validate_relative_path(compose_file, field_name="compose 文件"):
         raise DeployError(f"compose 文件必须是相对路径: {compose_file}")
 
-    cwd = ctx.release_dir
-    candidate = cwd / compose_file
-    if not candidate.exists():
+    cwd = ctx.release_path
+    candidate = f"{str(cwd).rstrip('/')}/{compose_file}"
+    if not target.exists(candidate):
         raise DeployError(f"发布目录中不存在 compose 文件: {compose_file}")
 
     env = ctx.script_env()
     ctx.log(f"--- 阶段: docker compose up ({compose_file}) ---")
     # `docker compose` (v2) is preferred; fall back to `docker-compose` (v1).
-    base = ["docker", "compose"] if _supports_compose_v2() else ["docker-compose"]
+    base = ["docker", "compose"] if _supports_compose_v2(target) else ["docker-compose"]
 
     # 固定 compose 项目名（按任务）。
     # 默认项目名取自目录名，而发布目录每次运行都不同（<时间戳>-<commit>），
@@ -688,7 +808,7 @@ def deploy_docker_compose(ctx: DeployContext) -> None:
     if not result.ok and not result.cancelled:
         # 从旧命名时代（项目名=发布目录）迁移过来时，旧项目的容器还占着
         # 服务的容器名；自动识别并清理同项目遗留容器后重试一次。
-        stale = _conflicting_stale_containers(result.output, project_name)
+        stale = _conflicting_stale_containers(result.output, project_name, target=target)
         if stale:
             ctx.log(f"! 检测到旧部署遗留容器占用容器名: {', '.join(stale)}")
             if _remove_stale_containers(ctx, stale):
@@ -706,30 +826,32 @@ def deploy_docker_compose(ctx: DeployContext) -> None:
         raise DeployError(f"docker compose 启动失败: {reason}")
 
 
-def _supports_compose_v2() -> bool:
-    probe = run_command(["docker", "compose", "version"], timeout=20, log=None)
+def _supports_compose_v2(target: Any = None) -> bool:
+    runner = target.run if target is not None else run_command
+    probe = runner(["docker", "compose", "version"], timeout=20, log=None)
     return probe.ok
 
 
 def deploy_rsync(ctx: DeployContext) -> None:
     """Push the release to a remote (or local) target with rsync."""
-    if not command_exists("rsync"):
+    executor_target = ctx._exec_target()
+    if not executor_target.which("rsync"):
         raise DeployError("未找到 rsync 命令")
-    target = (ctx.task.get("rsync_target") or "").strip()
-    if not target:
+    rsync_target = (ctx.task.get("rsync_target") or "").strip()
+    if not rsync_target:
         raise DeployError("部署方式为 rsync，但未填写目标地址")
-    if target.startswith("-"):
+    if rsync_target.startswith("-"):
         raise DeployError("rsync 目标不能以 - 开头")
 
     options_raw = (ctx.task.get("rsync_options") or "-az --delete").strip()
     options = options_raw.split() if options_raw else []
     # `/./` marks where the source subtree starts, so `-R`-style relative
     # layouts land correctly on the far side.
-    source = str(ctx.release_dir) + "/./"
+    source = str(ctx.release_path) + "/./"
 
-    ctx.log(f"--- 阶段: rsync → {target} ---")
+    ctx.log(f"--- 阶段: rsync → {rsync_target} ---")
     result = ctx.exec(
-        ["rsync", *options, source, target],
+        ["rsync", *options, source, rsync_target],
         timeout=_timeout_for(ctx),
         label="rsync",
     )
@@ -737,9 +859,9 @@ def deploy_rsync(ctx: DeployContext) -> None:
         reason = "已取消" if result.cancelled else (result.error or f"退出码 {result.exit_code}")
         raise DeployError(f"rsync 同步失败: {reason}")
 
-    # Refresh the local `current` link so the UI reflects what was published.
+    # Refresh the `current` link so the UI reflects what was published.
     if ctx.task.get("target_dir"):
-        swap_symlink(ctx.current_link, ctx.release_dir)
+        executor_target.swap_symlink(ctx.current_link_path, ctx.release_path)
 
 
 _DEPLOY_DISPATCH: dict[str, Callable[[DeployContext], None]] = {
@@ -835,24 +957,108 @@ def _rollback_target(
     return root, current_link, active, target
 
 
+def _remote_rollback_target(
+    task: dict[str, Any],
+    selected_run: dict[str, Any] | None,
+    target: Any,
+    layout: Any,
+) -> tuple[str, str, str | None, str]:
+    """远程回滚目标校验：只接受确实位于发布根下的历史发布目录。
+
+    与本地 ``_rollback_target`` 同等严格，只是用目标抽象代替本地 Path：
+    发布根必须是目录而非软链、目标必须直接位于根下、名字必须符合发布命名、
+    不能是软链，也不能等于当前版本。
+    """
+    if selected_run is not None:
+        if not selected_run:
+            raise DeployError("指定的运行记录不存在")
+        if selected_run.get("task_id") != task.get("id"):
+            raise DeployError("指定的运行记录不属于该任务")
+        if selected_run.get("status") != "success":
+            raise DeployError("只能回滚到部署成功的运行版本")
+        if not selected_run.get("release_dir"):
+            raise DeployError("该运行没有发布目录，无法回滚")
+        recorded_method = str(selected_run.get("deploy_method") or "").strip().lower()
+        current_method = str(task.get("deploy_method") or "script").strip().lower()
+        if recorded_method and recorded_method != current_method:
+            raise DeployError("任务部署方式已改变，不能使用当前配置回滚该运行版本")
+
+    root = str(layout.releases_root).rstrip("/")
+    current_link = str(layout.current_link)
+    if target.is_symlink(root):
+        raise DeployError("目标主机上的发布目录根路径是软链，无法安全回滚")
+    if not target.is_dir(root):
+        raise DeployError("目标主机上不存在发布目录，无法回滚")
+
+    active = None
+    link = target.readlink(current_link)
+    if link:
+        resolved = link.rstrip("/")
+        if not resolved.startswith(root + "/") and resolved != root:
+            raise DeployError("目标主机上的 current 指向发布目录之外，无法回滚")
+        if resolved != root and target.is_dir(resolved):
+            active = resolved
+
+    if selected_run is None:
+        names = target.list_dirs(root)
+        candidates = [n for n in names if f"{root}/{n}" != active]
+        if not candidates:
+            raise DeployError("目标主机上没有可回滚的历史版本")
+        chosen = f"{root}/{candidates[0]}"
+    else:
+        raw_path = str(selected_run.get("release_dir") or "")
+        if "\\" in raw_path or "\x00" in raw_path or ".." in Path(raw_path).parts:
+            raise DeployError("运行记录中的发布目录路径无效")
+        if not raw_path.startswith(root + "/"):
+            raise DeployError("运行记录中的发布目录不在该任务的发布根下，无法回滚")
+        if not re.fullmatch(
+            r"\d{8}-\d{6}-(?:[0-9a-fA-F]{1,8}|nogit)(?:-[0-9]+)?",
+            raw_path.rstrip("/").rsplit("/", 1)[-1],
+        ):
+            raise DeployError("运行记录未指向有效的版本发布目录")
+        chosen = raw_path.rstrip("/")
+
+    if target.is_symlink(chosen):
+        raise DeployError("发布目录不能是软链，无法回滚")
+    if not target.is_dir(chosen):
+        raise DeployError("该版本的发布目录在目标主机上不存在或已删除")
+    if active and chosen == active:
+        raise DeployError("指定版本已经是当前版本，无需回滚")
+    return root, current_link, active, chosen
+
+
 def rollback_task(
     task: dict[str, Any],
     *,
     log: Callable[[str], None],
+    log_batch: Callable[[list[str]], None] | None = None,
     timeout: int = 300,
     kill_grace_seconds: int = 10,
     selected_run: dict[str, Any] | None = None,
     handles: list[Any] | None = None,
     check_cancelled: Callable[[], bool] | None = None,
+    target: Any = None,
+    layout: Any = None,
 ) -> tuple[bool, str]:
     """Switch to a validated stored run, or retain the legacy previous selection.
 
     The caller holds the deployment admission lock throughout this operation.
     Scripts and systemd retain the original rollback semantics; other methods
     do not automatically redeploy containers or synchronize remote machines.
+
+    传入 ``target``（远程执行目标）与 ``layout`` 时走远程回滚：换链与脚本都在
+    目标主机上完成，本地路径逻辑完全不变。
     """
+    if target is not None and getattr(target, "is_remote", False) and layout is not None:
+        return _remote_rollback(
+            task, selected_run=selected_run, target=target, layout=layout,
+            log=log, log_batch=log_batch, timeout=timeout,
+            kill_grace_seconds=kill_grace_seconds, handles=handles,
+            check_cancelled=check_cancelled,
+        )
+
     try:
-        releases_root, current_link, active, target = _rollback_target(task, selected_run)
+        releases_root, current_link, active, target_path = _rollback_target(task, selected_run)
     except DeployError as exc:
         return False, str(exc)
     except (OSError, RuntimeError, ValueError):
@@ -861,10 +1067,11 @@ def rollback_task(
     if selected_run is not None:
         log("回滚使用任务当前配置的回滚脚本和服务名称；历史运行未保存这些配置的快照。")
     try:
-        swap_symlink(current_link, target)
+        swap_symlink(current_link, target_path)
     except OSError as exc:
         return False, f"切换软链失败: {exc}"
-    log(f"已回滚 current → {target.name}" + (f"（原 {active.name}）" if active else ""))
+    log(f"已回滚 current → {target_path.name}"
+        + (f"（原 {active.name}）" if active else ""))
 
     script = (task.get("rollback_script") or "").strip()
     ctx_env = {
@@ -872,7 +1079,7 @@ def rollback_task(
         "AUTODEPLOY_TASK_NAME": str(task.get("name", "")),
         "AUTODEPLOY_RUN_ID": str(selected_run.get("id", "")) if selected_run else "",
         "AUTODEPLOY_COMMIT": str(selected_run.get("commit_after") or "") if selected_run else "",
-        "AUTODEPLOY_RELEASE_DIR": str(target),
+        "AUTODEPLOY_RELEASE_DIR": str(target_path),
         "AUTODEPLOY_CURRENT_LINK": str(current_link),
         "AUTODEPLOY_RELEASES_ROOT": str(releases_root),
         "AUTODEPLOY_TARGET_DIR": str(task.get("target_dir") or ""),
@@ -882,10 +1089,11 @@ def rollback_task(
         log("--- 阶段: 回滚脚本 ---")
         result = run_command(
             shell_command(script, shell=config.load_settings().shell),
-            cwd=target,
+            cwd=target_path,
             env=ctx_env,
             timeout=timeout,
             log=log,
+            log_batch=log_batch,
             label="rollback",
             handle_out=handles if handles is not None else None,
             check_cancelled=check_cancelled,
@@ -915,13 +1123,103 @@ def rollback_task(
             if check_cancelled is not None and check_cancelled():
                 return False, "回滚已被取消"
             return False, f"重启服务失败: {result.error}"
-    message = f"已回滚到 {target.name}"
+    message = f"已回滚到 {target_path.name}"
     if task.get("deploy_method") in {"docker", "docker_compose", "rsync"}:
         message += "；仅切换本地 current 并执行已配置的回滚脚本，不会自动重新部署容器或同步远端"
         log(message)
     elif task.get("deploy_method") == "artifact":
         message += "；仅切换本地 current 并执行已配置的回滚脚本，不会自动重新打包、替换已有产物或执行部署"
         log(message)
+    return True, message
+
+
+def _remote_rollback(
+    task: dict[str, Any],
+    *,
+    selected_run: dict[str, Any] | None,
+    target: Any,
+    layout: Any,
+    log: Callable[[str], None],
+    log_batch: Callable[[list[str]], None] | None,
+    timeout: int,
+    kill_grace_seconds: int,
+    handles: list[Any] | None,
+    check_cancelled: Callable[[], bool] | None,
+) -> tuple[bool, str]:
+    """在目标主机上执行回滚：校验 → 换链 → 回滚脚本 → (systemd) 重启。"""
+    try:
+        root, current_link, active, chosen = _remote_rollback_target(
+            task, selected_run, target, layout
+        )
+    except (DeployError, TargetError) as exc:
+        return False, str(exc)
+    except (OSError, RuntimeError, ValueError):
+        return False, "目标主机上的发布目录或当前版本无效、已删除或无法访问"
+
+    if selected_run is not None:
+        log("回滚使用任务当前配置的回滚脚本和服务名称；历史运行未保存这些配置的快照。")
+    try:
+        target.swap_symlink(current_link, chosen)
+    except (TargetError, OSError) as exc:
+        return False, f"切换软链失败: {exc}"
+    log(f"已回滚 current → {Path(chosen).name}"
+        + (f"（原 {Path(active).name}）" if active else ""))
+
+    script = (task.get("rollback_script") or "").strip()
+    ctx_env = {
+        "AUTODEPLOY_TASK_ID": str(task.get("id", "")),
+        "AUTODEPLOY_TASK_NAME": str(task.get("name", "")),
+        "AUTODEPLOY_RUN_ID": str(selected_run.get("id", "")) if selected_run else "",
+        "AUTODEPLOY_COMMIT": str(selected_run.get("commit_after") or "") if selected_run else "",
+        "AUTODEPLOY_RELEASE_DIR": chosen,
+        "AUTODEPLOY_CURRENT_LINK": current_link,
+        "AUTODEPLOY_RELEASES_ROOT": root,
+        "AUTODEPLOY_TARGET_DIR": str(task.get("target_dir") or ""),
+        "AUTODEPLOY_STAGE": "rollback",
+    }
+    if script:
+        log("--- 阶段: 回滚脚本（目标主机） ---")
+        result = target.run_script(
+            script,
+            cwd=chosen,
+            env=ctx_env,
+            timeout=timeout,
+            log=log,
+            log_batch=log_batch,
+            label="rollback",
+            handle_out=handles if handles is not None else None,
+            check_cancelled=check_cancelled,
+            kill_grace_seconds=kill_grace_seconds,
+        )
+        if not result.ok:
+            if check_cancelled is not None and check_cancelled():
+                return False, "回滚已被取消"
+            return False, f"回滚脚本执行失败: {result.error}"
+
+    service = (task.get("service_name") or "").strip()
+    if service and task.get("deploy_method") == "systemd":
+        if not target.which("systemctl"):
+            return False, "目标主机上未找到 systemctl，无法重启服务"
+        log("--- 阶段: systemd 重启（目标主机） ---")
+        result = target.run(
+            ["systemctl", "restart", service],
+            env=ctx_env,
+            timeout=timeout,
+            log=log,
+            label="systemd",
+            handle_out=handles if handles is not None else None,
+            check_cancelled=check_cancelled,
+            kill_grace_seconds=kill_grace_seconds,
+        )
+        if not result.ok:
+            if check_cancelled is not None and check_cancelled():
+                return False, "回滚已被取消"
+            return False, f"重启服务失败: {result.error}"
+
+    message = f"已在目标主机回滚到 {Path(chosen).name}"
+    if task.get("deploy_method") in {"docker", "docker_compose", "rsync"}:
+        message += "；仅切换目标主机上的 current 并执行回滚脚本，不会自动重新部署容器或同步远端"
+    log(message)
     return True, message
 
 
@@ -942,24 +1240,66 @@ METHOD_BINARIES: dict[str, str] = {
 }
 
 
-def preflight(task: dict[str, Any]) -> list[dict[str, Any]]:
-    """Report missing tools for a task's method without failing the deploy."""
+def preflight(task: dict[str, Any], *, target: Any = None) -> list[dict[str, Any]]:
+    """Report missing tools for a task's method without failing the deploy.
+
+    传入 ``target`` 时检查的是**目标主机**上的工具（远程部署的构建与部署都在
+    目标机执行）；不传则检查控制器——控制器仍需 git 与 tar（拉取与打包源码）。
+
+    远程目标下 ``git`` 不是必需的：远端 workspace 由 rsync 镜像而来，目标机
+    不需要仓库凭据，也不需要 git 客户端。
+    """
     checks: list[dict[str, Any]] = []
+    remote = bool(target is not None and getattr(target, "is_remote", False))
+    which = target.which if target is not None else command_exists
     for binary, message in REQUIRED_BINARIES.items():
-        checks.append(
-            {"name": binary, "ok": command_exists(binary), "message": message}
-        )
+        if remote and binary == "git":
+            continue
+        checks.append({"name": binary, "ok": which(binary), "message": message})
+    if remote:
+        # rsync 是源码镜像的前提；缺了就没法把代码送过去。
+        checks.append({
+            "name": "rsync",
+            "ok": which("rsync"),
+            "message": "目标主机未安装 rsync，无法接收源码",
+        })
     method = (task.get("deploy_method") or "script").strip().lower()
     needed = METHOD_BINARIES.get(method)
     if needed:
         checks.append(
             {
                 "name": needed,
-                "ok": command_exists(needed),
+                "ok": which(needed),
                 "message": f"部署方式 {METHOD_LABELS.get(method, method)} 需要 {needed} 命令",
             }
         )
     return checks
+
+
+def _prune_remote_releases(target: Any, layout: Any, *, keep: int,
+                           log: Callable[[str], None] | None = None) -> list[str]:
+    """在目标主机上清理历史发布，永不删除 ``current`` 指向的那一份。
+
+    与本地 ``prune_releases`` 同语义：保留最新 ``keep`` 个 + 当前活跃版本。
+    """
+    names = target.list_dirs(layout.releases_root)
+    if len(names) <= keep:
+        return []
+    keepers = set(names[:keep])
+    active = target.readlink(layout.current_link)
+    if active:
+        active_name = str(active).rstrip("/").rsplit("/", 1)[-1]
+        if active_name:
+            keepers.add(active_name)
+    removed: list[str] = []
+    for name in names:
+        if name in keepers:
+            continue
+        target.remove_tree(f"{layout.releases_root.rstrip('/')}/{name}")
+        removed.append(name)
+        if log:
+            log(f"已清理历史发布: {name}")
+    return removed
 
 
 def disk_usage(path: Path) -> dict[str, int]:
@@ -1042,6 +1382,7 @@ def stop_task_containers(
     task: dict[str, Any],
     *,
     log: Callable[[str], None] | None = None,
+    log_batch: Callable[[list[str]], None] | None = None,
     timeout: int = CONTAINER_STOP_TIMEOUT_SECONDS,
 ) -> list[str]:
     """停止并移除该任务部署起来的容器，返回处理过的容器名。
@@ -1077,6 +1418,7 @@ def stop_task_containers(
             [*_compose_base(), "-p", project, "down", "--remove-orphans", "--timeout", "10"],
             timeout=max(30, timeout),
             log=log,
+            log_batch=log_batch,
         )
         if not result.ok:
             # compose down 依赖 compose 文件；文件已被删或项目未创建时会失败，
@@ -1107,6 +1449,7 @@ def stop_task_containers(
             env=env,
             timeout=max(30, timeout),
             log=log,
+            log_batch=log_batch,
             label="cleanup",
             kill_grace_seconds=config.load_settings().kill_grace_seconds,
         )

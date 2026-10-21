@@ -49,6 +49,8 @@ class Scheduler:
         self._wake_event = threading.Event()
         self._lock = threading.RLock()
         self._last_maintenance = 0.0
+        self._last_metrics_persist = 0.0
+        self._next_backup_time: Any | None = None
         self.deployment_blocked: Callable[[], bool] = lambda: False
         # Populated by the API layer; called after a run is dispatched so the
         # UI can be pushed an update.
@@ -112,8 +114,113 @@ class Scheduler:
             if self._dispatch(task, trigger="schedule"):
                 started += 1
 
+        self._maybe_run_scheduled_backup(now)
+        # 主机与容器指标环形缓冲由调度器喂养：不依赖有人打开监控页。
+        try:
+            from .monitor import get_monitor
+            monitor = get_monitor()
+            monitor.tick()
+            # 每 5 分钟持久化采样一次，供 24h / 7d 长周期回溯
+            if time.monotonic() - self._last_metrics_persist >= 300.0:
+                self._last_metrics_persist = time.monotonic()
+                self.store.metrics.record(monitor.get_host_now())
+                self.store.container_metrics.record_many(monitor.get_container_cycle())
+        except Exception:  # noqa: BLE001 - monitoring must never break scheduling
+            logger.debug("监控采样失败", exc_info=True)
         self._maybe_maintain(now)
         return started
+
+    def _maybe_run_scheduled_backup(self, now) -> None:
+        settings = config.load_settings()
+        if not settings.backup_enabled:
+            self._next_backup_time = None
+            return
+        if self._next_backup_time is None:
+            try:
+                self._next_backup_time = next_run_time(
+                    settings.backup_schedule_type,
+                    settings.backup_schedule_expression,
+                    reference=now,
+                    enabled=True,
+                )
+            except Exception as e:
+                logger.warning("定时备份表达式解析失败: %s", e)
+                return
+
+        if self._next_backup_time is not None and now >= self._next_backup_time:
+            try:
+                self._next_backup_time = next_run_time(
+                    settings.backup_schedule_type,
+                    settings.backup_schedule_expression,
+                    reference=now,
+                    enabled=True,
+                )
+            except Exception:
+                self._next_backup_time = None
+
+            threading.Thread(
+                target=self._run_backup_job,
+                args=(settings.backup_include_logs, settings.backup_include_artifacts,
+                      settings.backup_retention_count),
+                name="autodeploy-backup-job",
+                daemon=True,
+            ).start()
+
+    def invalidate_backup_schedule(self) -> None:
+        """设置变更后调用，使下一次 tick 重新计算备份触发时间。"""
+        self._next_backup_time = None
+
+    def _run_backup_job(
+        self, include_logs: bool, include_artifacts: bool, retention_count: int
+    ) -> None:
+        """定时备份线程入口。
+
+        直接面向 Store 执行热备；create_backup 内部持写锁，与部署写入串行，安全。
+        """
+        from .backup import create_backup
+
+        try:
+            bk = create_backup(
+                self.store,
+                trigger="schedule",
+                include_logs=include_logs,
+                include_artifacts=include_artifacts,
+                retention_count=retention_count,
+            )
+            self._notify_backup(True, bk.get("filename", ""), bk.get("size_bytes", 0))
+        except Exception as e:
+            logger.exception("定时自动备份执行失败")
+            self._notify_backup(False, "", 0, str(e))
+
+    def _notify_backup(
+        self, success: bool, filename: str, size_bytes: int, error: str = ""
+    ) -> None:
+        import json
+        import urllib.error
+        import urllib.request
+
+        url = (config.load_settings().notify_webhook or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            return
+        payload = {
+            "type": "backup",
+            "status": "success" if success else "failed",
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "error": error,
+            "finished_at": iso(utcnow()),
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "AutoDeploy/1.0"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                pass
+        except Exception:
+            pass
 
     def _dispatch(self, task: dict[str, Any], *, trigger: str) -> bool:
         with self._lock:
@@ -145,7 +252,11 @@ class Scheduler:
             baseline = ""
 
         self._advance(task)
-        run_id = self.store.runs.create(task, trigger=trigger, commit_before=baseline)
+        host_id, host_name = self._host_snapshot(task)
+        run_id = self.store.runs.create(
+            task, trigger=trigger, commit_before=baseline,
+            host_id=host_id, host_name=host_name,
+        )
         self.store.audit.record(
             "run_dispatched",
             actor="scheduler" if trigger == "schedule" else "system",
@@ -176,6 +287,10 @@ class Scheduler:
             logger.warning("任务 %s 的调度表达式无效: %s", task_id, exc)
             following = None
         self.store.tasks.set_next_run(task_id, iso(following))
+
+    def _host_snapshot(self, task: dict[str, Any]) -> tuple[int | None, str]:
+        """取任务目标主机的 (id, 名称) 快照，供运行记录留存。"""
+        return self.store.hosts.snapshot_for_run(task)
 
     # -- public helpers ----------------------------------------------------
     def reschedule(self, task_id: int) -> str | None:
@@ -208,7 +323,10 @@ class Scheduler:
         task = self.store.tasks.get(task_id)
         if task is None:
             return None
-        run_id = self.store.runs.create(task, trigger=trigger)
+        host_id, host_name = self._host_snapshot(task)
+        run_id = self.store.runs.create(
+            task, trigger=trigger, host_id=host_id, host_name=host_name,
+        )
         threading.Thread(
             target=self.runner.execute, args=(run_id,), name=f"deploy-{run_id}", daemon=True
         ).start()
@@ -270,6 +388,8 @@ class Scheduler:
 
         report["releases"] = self._prune_release_dirs(settings)
         report["audit"] = self.store.audit.purge_old(keep=2000)
+        report["metrics"] = self.store.metrics.prune_older_than(days=7)
+        report["container_metrics"] = self.store.container_metrics.prune_older_than(days=7)
         self._prune_orphan_workspaces()
         logger.info("维护完成: %s", report)
         return report

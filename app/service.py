@@ -185,6 +185,8 @@ class Service:
         self.throttle.lockout_seconds = settings.login_lockout_seconds
         # A changed poll interval should take effect without a restart.
         self.scheduler.poke()
+        # 备份调度时间缓存在下一次 tick 前失效，让新表达式立即生效。
+        self.scheduler.invalidate_backup_schedule()
 
     def export_settings(self) -> dict[str, Any]:
         """导出设置给界面。
@@ -195,6 +197,9 @@ class Service:
         data = config.load_settings().as_dict()
         password = data.pop("proxy_password", "") or ""
         data["proxy_password_set"] = bool(password)
+        # 云端 WebDAV 凭据同样不回显明文，只告知是否已设置。
+        dav_password = data.pop("cloud_webdav_password", "") or ""
+        data["cloud_webdav_password_set"] = bool(dav_password)
         return data
 
     # -- storage helpers ---------------------------------------------------
