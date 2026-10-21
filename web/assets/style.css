@@ -259,6 +259,81 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   border: 1px dashed var(--border-strong); border-radius: var(--radius-sm);
 }
 
+/* --------------------------------------------------- form tab shell ----- */
+/* 任务配置弹窗分页：左侧固定导航，右侧仅显示当前面板。
+ * 关键约束：所有面板始终留在 DOM 中，只用 .hidden 控制可见性。
+ * collectForm 按 id 读取全部字段、各 apply*UI 也要操作隐藏面板里的节点，
+ * 若切页时销毁子树，保存就会静默丢字段。 */
+.form-tabs {
+  display: grid;
+  grid-template-columns: 148px minmax(0, 1fr);
+  gap: 0;
+  min-height: 390px;
+}
+.form-tab-nav {
+  display: flex; flex-direction: column; gap: 2px;
+  padding-right: 12px; margin-right: 14px;
+  border-right: 1px solid var(--border);
+}
+.form-tab-btn {
+  display: flex; align-items: center; gap: 7px;
+  padding: 8px 10px; border: none; background: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim); font-size: 13px; font-family: inherit;
+  text-align: left; cursor: pointer; width: 100%;
+  transition: background .14s, color .14s;
+}
+.form-tab-btn:hover { background: var(--bg-panel); color: var(--text); }
+.form-tab-btn.active {
+  background: var(--accent-soft); color: var(--accent);
+  font-weight: 600;
+}
+.form-tab-btn .tab-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--warning); flex: none; display: none;
+}
+.form-tab-btn.is-dirty .tab-dot { display: block; }
+.form-tab-btn.has-error { color: var(--danger); }
+.form-tab-btn.has-error .tab-dot { display: block; background: var(--danger); }
+.form-tab-btn .tab-count {
+  margin-left: auto; font-size: 11px; color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.form-tab-panels {
+  min-width: 0;
+  /* 面板高度固定：各页字段数差异大（触发 7 项 vs 高级 3 项），
+     高度随内容跳动会让每次切页都抖动。内容超出时内部滚动。 */
+  height: 390px;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--bg-input);
+  color-scheme: dark;
+}
+.form-tab-panel:first-child > .section-title:first-child { margin-top: 0; }
+/* 面板内的分节标题：分页后每个面板已是独立上下文，标题作为组内小标题。 */
+.form-tab-panel .section-title {
+  margin: 16px 0 8px; font-size: 12px; color: var(--text-dim);
+  letter-spacing: .02em;
+}
+.form-tab-panel .section-title:first-of-type { margin-top: 0; }
+
+@media (max-width: 720px) {
+  .form-tabs { grid-template-columns: 1fr; min-height: 0; }
+  .form-tab-nav {
+    flex-direction: row; overflow-x: auto; gap: 4px;
+    padding: 0 0 10px; margin: 0 0 12px;
+    border-right: none; border-bottom: 1px solid var(--border);
+    scrollbar-width: none;
+  }
+  .form-tab-nav::-webkit-scrollbar { display: none; }
+  .form-tab-btn {
+    white-space: nowrap; width: auto; flex: none;
+    border: 1px solid var(--border); border-radius: 999px;
+  }
+  .form-tab-btn.active { border-color: var(--accent); }
+  .form-tab-panels { height: auto; max-height: 58vh; }
+}
+
 /* --------------------------------------------------------------- tables -- */
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th {
@@ -296,7 +371,9 @@ tbody tr:last-child td { border-bottom: none; }
 }
 
 /* 启用 switch：行首列，表示整个任务是否启用（含调度触发与自动部署）。
- * 开=绿色、关=灰色；禁用行整体压暗由 .row-disabled 负责。 */
+ * 开=绿色、关=灰色；禁用行整体压暗由 .row-disabled 负责。
+ * 滑块带"果冻"回弹：按下时滑块略微变宽，松开后弹性归位，用
+ * cubic-bezier 的过冲段实现，不依赖 JS 或动画帧（后台标签页也保持终态）。 */
 .switch {
   display: inline-flex;
   align-items: center;
@@ -317,7 +394,7 @@ tbody tr:last-child td { border-bottom: none; }
   border-radius: 999px;
   background: var(--border-strong);
   position: relative;
-  transition: background .18s ease;
+  transition: background .22s ease;
   flex: none;
 }
 .switch-track::after {
@@ -327,14 +404,46 @@ tbody tr:last-child td { border-bottom: none; }
   width: 15px; height: 15px;
   border-radius: 50%;
   background: #cfd5df;
-  transition: transform .18s cubic-bezier(.16,1,.3,1), background .18s ease;
+  /* 弹性曲线：末段轻微过冲后回落，形成果冻感 */
+  transition: transform .34s cubic-bezier(.34, 1.56, .64, 1), background .22s ease, width .16s ease;
 }
 .switch input:checked + .switch-track { background: rgba(62,207,142,0.55); }
 .switch input:checked + .switch-track::after { transform: translateX(15px); background: var(--success); }
+/* 按下时滑块横向微微拉长（果冻被挤压），松开后回弹到 15px 圆点 */
+.switch:active input:not(:disabled) + .switch-track::after { width: 18px; }
+.switch:active input:checked:not(:disabled) + .switch-track::after { transform: translateX(12px); }
 .switch input:focus-visible + .switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
 .switch:hover input:not(:disabled) + .switch-track { background: var(--border-strong); }
 .switch:hover input:checked:not(:disabled) + .switch-track { background: rgba(62,207,142,0.75); }
 .switch input:disabled + .switch-track { opacity: 0.5; cursor: wait; }
+
+/* 开关行：文字在左、switch 在右的表单行，替代裸 checkbox。
+ * 整行可点击（label 包裹），点击热区与视觉一致。 */
+.switch-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 2px; margin-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+.switch-row:last-child { border-bottom: none; }
+.switch-row .switch-text { flex: 1; min-width: 0; cursor: pointer; }
+.switch-row .switch-label { display: block; font-size: 13px; color: var(--text); }
+.switch-row .switch-hint {
+  display: block; font-size: 11.5px; color: var(--text-faint);
+  margin-top: 2px; line-height: 1.5;
+}
+.switch-row .switch { flex: none; }
+/* 兼容旧 class：checkbox-row 现在渲染为一行 switch，语义与样式统一。 */
+.checkbox-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 0; margin-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+}
+.checkbox-row:last-child { border-bottom: none; }
+.checkbox-row label {
+  margin: 0; color: var(--text); font-size: 13px; cursor: pointer;
+  flex: 1; min-width: 0;
+}
 
 .icon-btn.run { background: var(--success-soft); border-color: rgba(62,207,142,0.4); color: var(--success); }
 .icon-btn.run:hover:not(:disabled) { background: rgba(62,207,142,0.24); }
@@ -741,3 +850,366 @@ tr.row-disabled .row-actions { opacity: 1; }
   .task-table tbody tr.expand-row > td { display: block; width: auto; }
   .task-expand { padding: 12px 14px 14px; }
 }
+
+/* ------------------------------------------------------------- monitor view */
+.time-range-group {
+  display: inline-flex;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+.time-range-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.time-range-btn:hover {
+  color: var(--text);
+  background: var(--bg-panel);
+}
+.time-range-btn.active {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.monitor-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 120px;
+}
+.monitor-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 6px 0 8px;
+}
+.monitor-val {
+  font-size: 26px;
+  font-weight: 700;
+  font-family: var(--mono);
+  letter-spacing: -0.5px;
+}
+.monitor-unit {
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.monitor-bar {
+  height: 5px;
+  background: var(--bg-input);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+.monitor-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.monitor-bar-fill.warning { background: var(--warning); }
+.monitor-bar-fill.danger { background: var(--danger); }
+.monitor-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+}
+
+/* 2列时序图网格 (Beszel 风格) */
+.monitor-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+@media (max-width: 900px) {
+  .monitor-chart-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 宿主与容器两组图表的段落标题 */
+.monitor-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 4px 0 10px;
+}
+.monitor-section-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.chart-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px 10px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.chart-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.chart-card-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* 容器多时图例很长，允许换行而不是撑破卡片头部 */
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.chart-card-value {
+  font-size: 16px;
+  font-weight: 700;
+  font-family: var(--mono);
+  /* 「合计 680.7 MB」这类较长的读数必须单行：折行会把卡片头部撑高、
+     并让同一行的两张卡片高度不一致。 */
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.chart-box-wrap {
+  width: 100%;
+  height: 160px;
+  position: relative;
+  cursor: crosshair;
+  user-select: none;
+}
+.chart-svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  display: block;
+}
+
+/* 十字线与悬停浮层 Tooltip */
+.chart-crosshair-line {
+  stroke: rgba(255, 255, 255, 0.35);
+  stroke-width: 1;
+  stroke-dasharray: 3, 3;
+  pointer-events: none;
+}
+.chart-tooltip {
+  position: absolute;
+  top: 6px;
+  pointer-events: none;
+  background: rgba(18, 22, 32, 0.92);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--text);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 20;
+  white-space: nowrap;
+  transition: opacity 0.1s ease;
+}
+.chart-tooltip-time {
+  color: var(--text-dim);
+  margin-bottom: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.chart-tooltip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.4;
+}
+.chart-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.container-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  font-family: var(--mono);
+  margin-right: 4px;
+  margin-bottom: 4px;
+}
+
+/* 任务资源行：整行可点击，右侧箭头提示可以展开详情 */
+.mon-task-row { cursor: pointer; }
+.mon-task-row:hover { background: rgba(255,255,255,0.035); }
+.mon-task-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.mon-task-row .mon-row-arrow { color: var(--text-faint); font-size: 15px; line-height: 1; }
+.mon-task-row:hover .mon-row-arrow { color: var(--accent); }
+.mon-task-row.is-open { background: var(--accent-soft); }
+.mon-task-row.is-open .mon-row-arrow { color: var(--accent); }
+
+/* --------------------------------------- task detail drawer (slide-in) ---- */
+.drawer-root {
+  position: fixed; inset: 0; z-index: 70;
+  display: flex; justify-content: flex-end;
+  /* 关闭动画结束前保持可见；隐藏时才让根节点退出命中测试。 */
+  visibility: visible;
+}
+.drawer-root[hidden] { display: none; }
+.drawer-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,0.55);
+  opacity: 1;
+  transition: opacity 0.26s ease;
+}
+.drawer-panel {
+  position: relative;
+  width: min(620px, 94vw);
+  height: 100%;
+  background: var(--bg-elevated);
+  border-left: 1px solid var(--border-strong);
+  box-shadow: -18px 0 48px rgba(0,0,0,0.55);
+  display: flex; flex-direction: column;
+  transform: translateX(0);
+  transition: transform 0.28s cubic-bezier(0.22, 0.61, 0.36, 1);
+  will-change: transform;
+}
+/* 关闭态：面板整体右移出屏，遮罩淡出 */
+.drawer-root.drawer-closing .drawer-panel { transform: translateX(100%); }
+.drawer-root.drawer-closing .drawer-backdrop { opacity: 0; }
+/* 打开前先渲染在屏外，下一帧再移除关闭类，保证过渡从右向左滑入 */
+.drawer-root.drawer-entering .drawer-panel { transform: translateX(100%); }
+
+.drawer-head {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 16px 18px; border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.drawer-head-main { min-width: 0; flex: 1; }
+.drawer-title {
+  font-size: 16px; font-weight: 700; margin: 0 0 6px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.drawer-subtitle {
+  display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap;
+  font-size: 12px; color: var(--text-dim);
+}
+.drawer-close {
+  flex: none; width: 30px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 15px; line-height: 1; border-radius: var(--radius-sm);
+}
+.drawer-body {
+  flex: 1; min-height: 0;
+  overflow-y: auto; padding: 16px 18px 22px;
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--bg-input);
+  color-scheme: dark;
+}
+.drawer-section + .drawer-section { margin-top: 22px; }
+.drawer-section-head {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.drawer-section-head h3 {
+  margin: 0; font-size: 13px; font-weight: 600;
+  letter-spacing: 0.02em; text-transform: none;
+}
+.drawer-section-head .faint { margin-left: auto; }
+
+/* 抽屉顶部四个汇总指标 */
+.drawer-stat-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.drawer-stat {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  min-width: 0;
+}
+.drawer-stat-label {
+  font-size: 11.5px; color: var(--text-dim);
+  display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
+}
+.drawer-stat-value {
+  font-family: var(--mono); font-size: 19px; font-weight: 700;
+  letter-spacing: -0.3px; overflow-wrap: anywhere;
+}
+.drawer-stat-value small { font-size: 11.5px; font-weight: 500; color: var(--text-dim); margin-left: 3px; }
+.drawer-stat-bar {
+  height: 4px; margin-top: 7px; border-radius: 3px;
+  background: var(--bg-input); overflow: hidden;
+}
+.drawer-stat-bar > i {
+  display: block; height: 100%; border-radius: 3px;
+  background: var(--accent); transition: width 0.3s ease;
+}
+.drawer-stat-bar > i.warning { background: var(--warning); }
+.drawer-stat-bar > i.danger { background: var(--danger); }
+
+/* 每个容器的明细卡片 */
+.drawer-container {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  padding: 11px 13px;
+}
+.drawer-container + .drawer-container { margin-top: 10px; }
+.drawer-container-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 9px; min-width: 0;
+}
+.drawer-container-name {
+  font-family: var(--mono); font-size: 12.5px; font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.drawer-kv {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 8px 12px;
+}
+.drawer-kv > div { min-width: 0; }
+.drawer-kv dt { font-size: 11px; color: var(--text-faint); margin: 0 0 1px; }
+.drawer-kv dd {
+  margin: 0; font-family: var(--mono); font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+/* 抽屉内日志终端 */
+.drawer-log-meta {
+  font-size: 11.5px; color: var(--text-dim);
+  margin-bottom: 7px; min-height: 16px;
+  overflow-wrap: anywhere;
+}
+.drawer-log {
+  min-height: 180px; max-height: 46vh;
+  overflow: auto; overflow-anchor: none;
+  scrollbar-width: thin; scrollbar-color: var(--border-strong) var(--bg-input);
+  color-scheme: dark;
+}
+.drawer-log-toolbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.drawer-log-toolbar select { max-width: 240px; }
+
+@media (max-width: 620px) {
+  .drawer-panel { width: 100%; }
+  .drawer-stat-grid { grid-template-columns: 1fr; }
+}
+
+

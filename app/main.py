@@ -23,7 +23,10 @@ from . import config
 from . import __version__ as app_version
 from . import __version__ as VERSION
 from .api import auth as auth_routes
+from .api import backup as backup_routes
 from .api import credentials as credential_routes
+from .api import hosts as host_routes
+from .api import monitor as monitor_routes
 from .api import runs as run_routes
 from .api import settings as settings_routes
 from .api import stats as stats_routes
@@ -64,9 +67,12 @@ def create_app(service: Service | None = None) -> FastAPI:
     # --- API routes -----------------------------------------------------
     app.include_router(auth_routes.router)
     app.include_router(credential_routes.router)
+    app.include_router(host_routes.router)
     app.include_router(task_routes.router)
     app.include_router(webhook_routes.router)
     app.include_router(run_routes.router)
+    app.include_router(monitor_routes.router)
+    app.include_router(backup_routes.router)
     app.include_router(stats_routes.router)
     app.include_router(settings_routes.router)
 

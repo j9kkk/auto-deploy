@@ -119,6 +119,7 @@ def run_command(
     base_env: Mapping[str, str] | None = None,
     timeout: int = 600,
     log: Callable[[str], None] | None = None,
+    log_batch: Callable[[list[str]], None] | None = None,
     label: str | None = None,
     handle_out: list[ProcessHandle] | None = None,
     register: Callable[[Any, ProcessHandle], None] | None = None,
@@ -130,6 +131,8 @@ def run_command(
     ``log`` is called once per output line (without the trailing newline) and
     once with the exit summary.  ``check_cancelled`` is polled while reading, so
     a cancellation request stops the command promptly even mid-stream.
+    传入 ``log_batch`` 时（两者互斥使用，``log_batch`` 优先），突发输出按批
+    递交，让调用方一次加锁/一次落盘处理多行，摊薄逐行回调的开销。
 
     ``base_env`` replaces the inherited process environment entirely when given
     (compose interpolation must not see the image's own AUTODEPLOY_* defaults);
@@ -213,16 +216,22 @@ def run_command(
 
     def _drain_pending() -> None:
         """Move whatever the reader already queued into the log."""
+        batch: list[str] = []
         while True:
             try:
                 item = line_queue.get_nowait()
             except _queue.Empty:
-                return
+                break
             if item is None:
                 continue
             collected.append(item)
-            if log:
-                log(item)
+            batch.append(item)
+        if batch:
+            if log_batch:
+                log_batch(batch)
+            elif log:
+                for line in batch:
+                    log(line)
 
     try:
         while True:
@@ -242,9 +251,30 @@ def run_command(
                 continue
             if item is None:
                 break  # stream closed: the command has finished
+            # 尽量凑一批同到期的输出再递交：突发输出（构建工具、镜像拉取）
+            # 会连续排队多行，逐行回调每行各付一次锁与脱敏的成本。
             collected.append(item)
-            if log:
-                log(item)
+            batch = [item]
+            stream_closed = False
+            while True:
+                try:
+                    nxt = line_queue.get_nowait()
+                except _queue.Empty:
+                    break
+                if nxt is None:
+                    # 哨兵不能像普通行一样吞掉：它是“流已关闭”的唯一信号，
+                    # 丢掉会让主循环永远等不到结束，只能硬耗到超时。
+                    stream_closed = True
+                    break
+                collected.append(nxt)
+                batch.append(nxt)
+            if log_batch:
+                log_batch(batch)
+            elif log:
+                for line in batch:
+                    log(line)
+            if stream_closed:
+                break
 
         if cancelled or timed_out:
             handle.terminate(kill_grace_seconds)

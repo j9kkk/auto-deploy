@@ -27,6 +27,7 @@ TASK_INSERT_COLUMNS = (
     "artifact_paths", "target_dir", "keep_releases",
     "service_name", "docker_image", "docker_command", "docker_compose_file",
     "rsync_target", "rsync_options",
+    "host_id", "source_mode", "data_sources",
     "env_vars", "timeout_seconds", "notify_webhook", "skip_if_no_changes", "run_on_create",
 )
 
@@ -39,6 +40,7 @@ TASK_UPDATE_COLUMNS = (
     "artifact_paths", "target_dir", "keep_releases",
     "service_name", "docker_image", "docker_command", "docker_compose_file",
     "rsync_target", "rsync_options",
+    "host_id", "source_mode", "data_sources",
     "env_vars", "timeout_seconds", "notify_webhook", "skip_if_no_changes", "run_on_create",
 )
 
@@ -309,6 +311,41 @@ class CredentialRepository:
         )
         return {int(row["credential_id"]): int(row["n"]) for row in rows}
 
+    def host_usage_count(self, credential_id: int) -> int:
+        """有多少主机正在用该 SSH 私钥登录。
+
+        主机与任务是两类独立引用：一份私钥常常只用于登录服务器（不碰仓库），
+        漏掉这一边会让删除提示与删除保护都失真。
+        """
+        return int(
+            self.db.scalar(
+                "SELECT COUNT(*) FROM hosts WHERE credential_id = ?",
+                (credential_id,),
+                default=0,
+            )
+            or 0
+        )
+
+    def host_usage_counts(self) -> dict[int, int]:
+        """全部凭据被主机引用的数量，一条 GROUP BY 取回。"""
+        rows = self.db.query(
+            "SELECT credential_id, COUNT(*) AS n FROM hosts "
+            "WHERE credential_id IS NOT NULL GROUP BY credential_id"
+        )
+        return {int(row["credential_id"]): int(row["n"]) for row in rows}
+
+    def hosts_using(self, credential_id: int) -> list[dict[str, Any]]:
+        """引用该凭据的主机（删除确认里要点名，避免用户盲删）。
+
+        带上 port / username：凭据页的「测试主机登录」直接用它们回填表单，
+        用户不必手抄登录账号。
+        """
+        return self.db.query(
+            "SELECT id, name, address, port, username FROM hosts WHERE credential_id = ? "
+            "ORDER BY name COLLATE NOCASE",
+            (credential_id,),
+        )
+
     def record_test(self, credential_id: int, *, ok: bool, error: str = "") -> None:
         self.db.execute_rowcount(
             """
@@ -318,6 +355,147 @@ class CredentialRepository:
             """,
             (iso(utcnow()), 1 if ok else 0, error[:500], credential_id),
         )
+
+    def record_host_test(self, credential_id: int, *, ok: bool, error: str = "") -> None:
+        """记录「用该私钥登录主机」的结果。
+
+        与仓库测试分列存放：同一把钥匙可能只用于仓库（或只用于主机），
+        合并成一列会让另一侧的结论被覆盖掉。
+        """
+        self.db.execute_rowcount(
+            """
+            UPDATE credentials
+               SET last_host_test_at = ?, last_host_test_ok = ?, last_host_test_error = ?
+             WHERE id = ?
+            """,
+            (iso(utcnow()), 1 if ok else 0, error[:500], credential_id),
+        )
+
+    def clear_tests(self, credential_id: int) -> None:
+        """私钥/口令变更后两类测试结论都失效。"""
+        self.db.execute_rowcount(
+            """
+            UPDATE credentials
+               SET last_tested_at = NULL, last_test_ok = NULL,
+                   last_test_error = '凭据已修改，请重新测试',
+                   last_host_test_at = NULL, last_host_test_ok = NULL,
+                   last_host_test_error = '凭据已修改，请重新测试'
+             WHERE id = ?
+            """,
+            (credential_id,),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Hosts
+# ---------------------------------------------------------------------------
+
+HOST_STATUSES = ("unknown", "online", "offline", "error")
+
+
+class HostRepository:
+    """远程主机（SSH 目标）。
+
+    主机是「部署到哪里」的一等对象。凭据引用 credentials 表的 ssh_key 记录，
+    因此秘密只在一处落库；host_key 保存首次连接后钉住的主机指纹，用于检测
+    指纹变化（潜在的中间人替换）。
+    """
+
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    def create(self, data: dict[str, Any]) -> int:
+        now = iso(utcnow())
+        return self.db.execute(
+            """
+            INSERT INTO hosts
+                (name, address, port, username, credential_id, base_dir,
+                 host_key, status, last_check_at, last_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data.get("name", ""), data.get("address", ""),
+                int(data.get("port") or 22), data.get("username", ""),
+                data.get("credential_id"), data.get("base_dir") or "/opt/autodeploy",
+                data.get("host_key") or "", data.get("status") or "unknown",
+                data.get("last_check_at"), data.get("last_error") or "",
+                now, now,
+            ),
+        )
+
+    def update(self, host_id: int, data: dict[str, Any]) -> bool:
+        columns: list[str] = []
+        values: list[Any] = []
+        for key in ("name", "address", "port", "username", "credential_id", "base_dir"):
+            if key in data:
+                columns.append(f"{key} = ?")
+                values.append(data[key])
+        if not columns:
+            return False
+        values += [iso(utcnow()), host_id]
+        sql = f"UPDATE hosts SET {', '.join(columns)}, updated_at = ? WHERE id = ?"
+        return self.db.execute_rowcount(sql, values) > 0
+
+    def get(self, host_id: int) -> dict[str, Any] | None:
+        return self.db.query_one("SELECT * FROM hosts WHERE id = ?", (host_id,))
+
+    def list_all(self) -> list[dict[str, Any]]:
+        return self.db.query("SELECT * FROM hosts ORDER BY name COLLATE NOCASE")
+
+    def name_taken(self, name: str, *, exclude_id: int | None = None) -> bool:
+        if not str(name or "").strip():
+            return False
+        if exclude_id is None:
+            row = self.db.query_one(
+                "SELECT 1 FROM hosts WHERE name = ? COLLATE NOCASE", (str(name),)
+            )
+        else:
+            row = self.db.query_one(
+                "SELECT 1 FROM hosts WHERE name = ? COLLATE NOCASE AND id != ?",
+                (str(name), exclude_id),
+            )
+        return row is not None
+
+    def delete(self, host_id: int) -> bool:
+        return self.db.execute_rowcount("DELETE FROM hosts WHERE id = ?", (host_id,)) > 0
+
+    def usage_counts(self) -> dict[int, int]:
+        """每个主机被多少任务引用，一条 GROUP BY 取回供列表页避免 N+1。"""
+        rows = self.db.query(
+            "SELECT host_id, COUNT(*) AS n FROM tasks "
+            "WHERE host_id IS NOT NULL GROUP BY host_id"
+        )
+        return {int(row["host_id"]): int(row["n"]) for row in rows}
+
+    def record_check(
+        self, host_id: int, *, status: str, error: str = "", host_key: str | None = None
+    ) -> None:
+        """记录一次连通性检查。host_key 非空时同时钉住指纹。"""
+        if host_key is None:
+            self.db.execute_rowcount(
+                "UPDATE hosts SET status = ?, last_check_at = ?, last_error = ? WHERE id = ?",
+                (status, iso(utcnow()), error[:500], host_id),
+            )
+        else:
+            self.db.execute_rowcount(
+                "UPDATE hosts SET status = ?, last_check_at = ?, last_error = ?, host_key = ? "
+                "WHERE id = ?",
+                (status, iso(utcnow()), error[:500], host_key, host_id),
+            )
+
+    def snapshot_for_run(self, task: dict[str, Any]) -> tuple[int | None, str]:
+        """取任务目标主机的 (id, 名称) 快照，供运行记录留存。
+
+        主机可能在运行途中改名或被删除；名称在建立运行记录的瞬间写死，
+        历史才不会随之后的配置变更而失真。
+        """
+        host_id = task.get("host_id")
+        if not host_id:
+            return None, ""
+        row = self.get(int(host_id))
+        if row is None:
+            return int(host_id), f"（已删除的主机 #{host_id}）"
+        return int(host_id), str(row.get("name") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -499,13 +677,23 @@ class RunRepository:
         *,
         trigger: str = "manual",
         commit_before: str = "",
+        host_id: int | None = None,
+        host_name: str = "",
     ) -> int:
+        """建立一条排队中的运行记录。
+
+        ``host_name`` 是**快照**：主机之后改名或被删除，历史运行仍能显示
+        当时部署到了哪台机器。未显式给出时按 task 上的 host_id 补全。
+        """
         now = iso(utcnow())
+        if host_id is None and task.get("host_id"):
+            host_id = int(task["host_id"])
         return self.db.execute(
             """
             INSERT INTO runs (task_id, task_name, status, trigger, deploy_method,
-                              queued_at, commit_before, branch, log_path)
-            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+                              queued_at, commit_before, branch, log_path,
+                              host_id, host_name)
+            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task["id"],
@@ -516,6 +704,8 @@ class RunRepository:
                 commit_before,
                 task.get("repo_branch", ""),
                 "",
+                host_id,
+                host_name,
             ),
         )
 
@@ -882,6 +1072,252 @@ class AuditRepository:
 
 
 # ---------------------------------------------------------------------------
+# Backups
+# ---------------------------------------------------------------------------
+
+class BackupRepository:
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    def create(
+        self,
+        *,
+        filename: str,
+        filepath: str,
+        size_bytes: int = 0,
+        sha256: str = "",
+        trigger: str = "manual",
+        contains_logs: bool = False,
+        contains_artifacts: bool = False,
+        status: str = "success",
+        error: str = "",
+        created_at: str | None = None,
+    ) -> int:
+        return self.db.execute(
+            """
+            INSERT INTO backups (
+                filename, filepath, size_bytes, sha256, trigger,
+                contains_logs, contains_artifacts, status, error, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                filename,
+                filepath,
+                size_bytes,
+                sha256,
+                trigger,
+                1 if contains_logs else 0,
+                1 if contains_artifacts else 0,
+                status,
+                error,
+                created_at or iso(utcnow()),
+            ),
+        )
+
+    def update(
+        self,
+        backup_id: int,
+        *,
+        size_bytes: int | None = None,
+        sha256: str | None = None,
+        status: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        sets: list[str] = []
+        params: list[Any] = []
+        if size_bytes is not None:
+            sets.append("size_bytes = ?")
+            params.append(size_bytes)
+        if sha256 is not None:
+            sets.append("sha256 = ?")
+            params.append(sha256)
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if error is not None:
+            sets.append("error = ?")
+            params.append(error)
+        if not sets:
+            return False
+        params.append(backup_id)
+        return self.db.execute_rowcount(f"UPDATE backups SET {', '.join(sets)} WHERE id = ?", params) > 0
+
+    def get(self, backup_id: int) -> dict[str, Any] | None:
+        return self.db.query_one("SELECT * FROM backups WHERE id = ?", (backup_id,))
+
+    def get_by_filename(self, filename: str) -> dict[str, Any] | None:
+        return self.db.query_one("SELECT * FROM backups WHERE filename = ?", (filename,))
+
+    def list_all(self, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        return self.db.query(
+            "SELECT * FROM backups ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+        )
+
+    def count(self) -> int:
+        return int(self.db.scalar("SELECT COUNT(*) FROM backups", default=0) or 0)
+
+    def delete(self, backup_id: int) -> bool:
+        return self.db.execute_rowcount("DELETE FROM backups WHERE id = ?", (backup_id,)) > 0
+
+    def prune_older_than(self, keep_count: int) -> list[dict[str, Any]]:
+        """Find backups older than the newest `keep_count` items, delete them and return them."""
+        if keep_count <= 0:
+            return []
+        stale_rows = self.db.query(
+            """
+            SELECT * FROM backups
+            WHERE id NOT IN (SELECT id FROM backups ORDER BY id DESC LIMIT ?)
+            ORDER BY id ASC
+            """,
+            (keep_count,),
+        )
+        if not stale_rows:
+            return []
+        ids = [row["id"] for row in stale_rows]
+        placeholders = ",".join("?" for _ in ids)
+        self.db.execute_rowcount(f"DELETE FROM backups WHERE id IN ({placeholders})", ids)
+        return stale_rows
+
+
+# ---------------------------------------------------------------------------
+# Host Metrics (Lightweight Time Series)
+# ---------------------------------------------------------------------------
+
+class MetricsRepository:
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    def record(self, snapshot: dict[str, Any]) -> int:
+        return self.db.execute(
+            """
+            INSERT INTO host_metrics (
+                ts, cpu_percent, memory_percent,
+                disk_read_rate, disk_write_rate,
+                net_rx_rate, net_tx_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot.get("timestamp") or iso(utcnow()),
+                float(snapshot.get("cpu_percent") or 0.0),
+                float(snapshot.get("memory_percent") or 0.0),
+                float(snapshot.get("disk_read_rate") or 0.0),
+                float(snapshot.get("disk_write_rate") or 0.0),
+                float(snapshot.get("net_rx_rate") or 0.0),
+                float(snapshot.get("net_tx_rate") or 0.0),
+            ),
+        )
+
+    def query_range(self, since_iso: str, limit: int = 300) -> list[dict[str, Any]]:
+        """Query host metrics since a given timestamp, ordered chronologically.
+
+        The window is capped at its *newest* ``limit`` rows: ordering ascending
+        before the LIMIT would return the oldest samples of a 7-day window and
+        silently hide everything after the first few hours.
+        """
+        rows = self.db.query(
+            """
+            SELECT ts AS timestamp, cpu_percent, memory_percent,
+                   disk_read_rate, disk_write_rate, net_rx_rate, net_tx_rate
+            FROM host_metrics
+            WHERE ts >= ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (since_iso, limit),
+        )
+        rows.reverse()
+        return rows
+
+    def prune_older_than(self, days: int = 7) -> int:
+        """Purge time series samples older than N days."""
+        from datetime import timedelta
+        cutoff = iso(utcnow() - timedelta(days=days))
+        return self.db.execute_rowcount("DELETE FROM host_metrics WHERE ts < ?", (cutoff,))
+
+
+class ContainerMetricsRepository:
+    """Per-container time series, sampled on every docker stats refresh."""
+
+    def __init__(self, database: Database) -> None:
+        self.db = database
+
+    def record_many(self, samples: list[dict[str, Any]]) -> None:
+        if not samples:
+            return
+        self.db.execute_many(
+            """
+            INSERT INTO container_metrics (
+                ts, container_id, container_name, compose_project,
+                cpu_percent, memory_bytes, memory_percent,
+                disk_read_rate, disk_write_rate, net_rx_rate, net_tx_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    s.get("timestamp") or iso(utcnow()),
+                    s.get("container_id") or "",
+                    s.get("container_name") or "",
+                    s.get("compose_project") or "",
+                    float(s.get("cpu_percent") or 0.0),
+                    float(s.get("memory_bytes") or 0.0),
+                    float(s.get("memory_percent") or 0.0),
+                    float(s.get("disk_read_rate") or 0.0),
+                    float(s.get("disk_write_rate") or 0.0),
+                    float(s.get("net_rx_rate") or 0.0),
+                    float(s.get("net_tx_rate") or 0.0),
+                )
+                for s in samples
+            ],
+        )
+
+    def query_bucketed(self, since_iso: str, bucket_seconds: int) -> list[dict[str, Any]]:
+        """Average per-container samples into fixed buckets aligned to the epoch.
+
+        Buckets are computed in SQL so every container shares identical
+        timestamps; the chart crosshair looks points up by timestamp.
+        """
+        bucket = max(1, int(bucket_seconds))
+        rows = self.db.query(
+            """
+            SELECT CAST(strftime('%s', ts) / ? AS INTEGER) * ? AS bucket_ts,
+                   container_id,
+                   MAX(container_name)         AS container_name,
+                   MAX(compose_project)        AS compose_project,
+                   AVG(cpu_percent)            AS cpu_percent,
+                   AVG(memory_bytes)           AS memory_bytes,
+                   AVG(memory_percent)         AS memory_percent,
+                   AVG(disk_read_rate)         AS disk_read_rate,
+                   AVG(disk_write_rate)        AS disk_write_rate,
+                   AVG(net_rx_rate)            AS net_rx_rate,
+                   AVG(net_tx_rate)            AS net_tx_rate
+            FROM container_metrics
+            WHERE ts >= ?
+            GROUP BY bucket_ts, container_id
+            ORDER BY bucket_ts ASC
+            """,
+            (bucket, bucket, since_iso),
+        )
+        from datetime import datetime, timezone
+
+        for row in rows:
+            row["timestamp"] = datetime.fromtimestamp(
+                int(row.pop("bucket_ts")), tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for key in (
+                "cpu_percent", "memory_percent", "disk_read_rate",
+                "disk_write_rate", "net_rx_rate", "net_tx_rate",
+            ):
+                row[key] = round(float(row.get(key) or 0.0), 2)
+            row["memory_bytes"] = int(float(row.get("memory_bytes") or 0))
+        return rows
+
+    def prune_older_than(self, days: int = 7) -> int:
+        from datetime import timedelta
+        cutoff = iso(utcnow() - timedelta(days=days))
+        return self.db.execute_rowcount("DELETE FROM container_metrics WHERE ts < ?", (cutoff,))
+
+
+# ---------------------------------------------------------------------------
 # Date helpers for the charts
 # ---------------------------------------------------------------------------
 
@@ -895,9 +1331,13 @@ class Store:
         self.users = UserRepository(self.db)
         self.sessions = SessionRepository(self.db)
         self.credentials = CredentialRepository(self.db)
+        self.hosts = HostRepository(self.db)
         self.tasks = TaskRepository(self.db)
         self.runs = RunRepository(self.db)
         self.audit = AuditRepository(self.db)
+        self.backups = BackupRepository(self.db)
+        self.metrics = MetricsRepository(self.db)
+        self.container_metrics = ContainerMetricsRepository(self.db)
 
     def close(self) -> None:
         self.db.close()

@@ -3,11 +3,13 @@
 (function (AD) {
   'use strict';
 
-  const VIEWS = ['dashboard', 'tasks', 'runs', 'credentials', 'stats', 'settings'];
+  const VIEWS = ['dashboard', 'tasks', 'runs', 'credentials', 'hosts', 'monitor', 'backups', 'stats', 'settings'];
   const HASH_TO_VIEW = {
     '': 'dashboard', '#': 'dashboard',
     '#/dashboard': 'dashboard', '#/tasks': 'tasks',
     '#/runs': 'runs', '#/credentials': 'credentials',
+    '#/hosts': 'hosts',
+    '#/monitor': 'monitor', '#/backups': 'backups',
     '#/stats': 'stats', '#/settings': 'settings',
   };
 
@@ -81,6 +83,9 @@
       item.classList.toggle('active', item.dataset.view === view);
     });
     AD.stopLiveLog();
+    // 任务详情抽屉挂在 body 上，不属于视图容器；离开视图时必须显式拆除，
+    // 否则它的指标/日志定时器会在后台继续轮询。
+    AD.closeTaskDrawer?.();
     if (AD.stopAllInlineLogs) {
       AD.stopAllInlineLogs(); // 停掉行内日志轮询（任务页重绘后会按需重启）
       // 只在真正离开任务页时清除展开状态；任务页内部重绘需要保留它，

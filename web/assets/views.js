@@ -57,6 +57,24 @@ AD.views = {};
     rsync: '把发布目录同步到目标路径；只有配置了目标目录才会更新本地软链。',
   };
 
+  // 统一开关行：文字在左、switch 在右，整行可点（文字也能切换）。
+  // id 落在真实 checkbox 上，各表单按 id 读取的逻辑无需改动。
+  // hint 为 HTML（允许内嵌 code 等），调用方负责转义其中的用户数据。
+  function switchRow(id, checked, label, hint, attrs) {
+    return `
+      <div class="switch-row">
+        <label class="switch-text" for="${id}">
+          <span class="switch-label">${e(label)}</span>
+          ${hint ? `<span class="switch-hint">${hint}</span>` : ''}
+        </label>
+        <label class="switch">
+          <input type="checkbox" id="${id}"${checked ? ' checked' : ''}${attrs || ''}>
+          <span class="switch-track" aria-hidden="true"></span>
+        </label>
+      </div>`;
+  }
+  AD.switchRow = switchRow;
+
   // ---------------------------------------------------------------- icons
   // 全部为内联 SVG（stroke 继承 currentColor），无外部资源依赖。
   const ICONS = {
@@ -441,7 +459,12 @@ AD.views = {};
       </td>
       <td data-label="状态">${statusBadge}<div class="faint" style="margin-top:3px">${stats}</div></td>
       <td class="mono" data-label="调度" style="font-size:11.5px">${e(task.schedule_expression || '—')}</td>
-      <td data-label="部署方式"><span class="badge neutral">${e(methodLabel(task.deploy_method))}</span></td>
+      <td data-label="部署方式">
+        <span class="badge neutral">${e(methodLabel(task.deploy_method))}</span>
+        ${task.host_id
+          ? `<div class="faint truncate" style="margin-top:3px;max-width:160px" title="${a(task.host_target || task.host_label)}">🖥 ${e(task.host_label)}</div>`
+          : ''}
+      </td>
       <td class="nowrap" data-label="最近运行">${lastRun}</td>
       <td class="nowrap" data-label="下次执行">${nextRun}</td>
       <td data-label="操作">
@@ -524,20 +547,26 @@ AD.views = {};
       }
       const toggle = event.target.closest('[data-task-toggle]');
       if (toggle) {
-        // 现在是行首的 switch 复选框：请求期间保持新状态、失败时回滚勾选，
-        // 不能套用 setBusy（它会把 innerHTML 覆写成 spinner 文本）。
+        // 行首 switch 复选框：请求期间禁用避免重复提交，但**无论成功失败都必须
+        // 恢复可交互**——旧实现只在失败时恢复，成功后节点永久 disabled，
+        // 表现为「点了之后一直转圈、再也点不动」。
         if (toggle.disabled) return;
         const input = toggle;
+        const previous = input.checked;
         input.disabled = true;
-        const revert = () => { input.checked = !input.checked; input.disabled = false; };
         (async () => {
           try {
             const result = await AD.api.post(`/api/tasks/${input.dataset.taskToggle}/toggle`);
-            AD.toastSuccess(result.enabled ? '任务已启用' : '任务已禁用');
+            const enabled = Boolean(result.enabled);
+            // 以服务端返回为准回填勾选态与提示，再刷新整行（状态徽标等）。
+            syncToggleInput(input, enabled);
+            AD.toastSuccess(enabled ? '任务已启用' : '任务已禁用');
             await AD.refreshTaskRowsInPlace();
           } catch (err) {
-            revert();
+            syncToggleInput(input, previous);
             AD.toastError(err.message);
+          } finally {
+            input.disabled = false;
           }
         })();
         return;
@@ -1033,6 +1062,11 @@ AD.views = {};
           : '<span class="faint">—</span>';
       }
 
+      // 行首开关必须跟着状态走：只改徽标不改勾选态时，开关会停在旧位置
+      // （例如显示「已暂停」但滑块仍是绿色）。
+      const toggleInput = row.querySelector('[data-task-toggle]');
+      if (toggleInput) syncToggleInput(toggleInput, Boolean(found.enabled));
+
       // 禁用行样式
       row.classList.toggle('row-disabled', !found.enabled);
     };
@@ -1048,6 +1082,18 @@ AD.views = {};
 
   /** 就地刷新全表：一次请求更新所有任务行，供运行/启停等自身触发的动作使用，
    *  避免整表重绘丢滚动位置与展开状态。 */
+  /** 同步行首启用开关的勾选态、提示与可访问名。
+   *  开关的可见状态由 CSS（input:checked）驱动，因此必须改 checked；
+   *  只改外层 label 的属性会让滑块与真实状态不一致。 */
+  function syncToggleInput(input, enabled) {
+    if (!input) return;
+    input.checked = Boolean(enabled);
+    input.setAttribute('aria-label', enabled ? '禁用任务' : '启用任务');
+    const label = input.closest('.switch');
+    if (label) label.title = enabled ? '已启用，点击禁用' : '已禁用，点击启用';
+  }
+  AD.syncToggleInput = syncToggleInput;
+
   async function refreshTaskRowsInPlace() {
     const data = await AD.api.get('/api/tasks');
     AD.state.tasks = data.tasks || [];
@@ -1087,6 +1133,16 @@ AD.views = {};
       AD.state.credentials = AD.state.credentials || [];
       AD.state.credentialsError = true;
     }
+    // 目标主机下拉：拉取失败不阻断表单（本机始终可用），但已绑定的主机
+    // 必须出现在选项里，否则保存会把 host_id 静默改成本机。
+    let hostList = [];
+    let hostsError = false;
+    try {
+      hostList = (await AD.api.get('/api/hosts')).hosts || [];
+    } catch (err) {
+      hostList = [];
+      hostsError = true;
+    }
     const defaults = AD.state.defaults;
     const t = task || {};
     const isEdit = Boolean(taskId);
@@ -1096,7 +1152,24 @@ AD.views = {};
     // 认证方式初始值：绑定了集中凭据→凭据；有任务内令牌→令牌；否则无需认证。
     const initialAuth = boundCredentialId ? 'credential' : (t.has_token ? 'token' : 'none');
     const initialMethod = t.deploy_method || 'script';
-    // 高级参数默认展开的条件：已有任务且任一高级项偏离默认值。
+    // 目标主机下拉项；已绑定但不在列表里的主机（被删或列表拉取失败）注入占位，
+    // 让用户看到并主动处理，而不是保存时静默退回本机。
+    const boundHostId = t.host_id != null ? String(t.host_id) : '';
+    const hostOptions = hostList.map((h) => {
+      const target = h.host_target || h.target || '';
+      return `<option value="${h.id}"${boundHostId === String(h.id) ? ' selected' : ''}>`
+        + `${e(h.name)}${target ? `（${e(target)}）` : ''}</option>`;
+    }).join('');
+    const hostPlaceholder = boundHostId && !hostList.some((h) => String(h.id) === boundHostId)
+      ? `<option value="${a(boundHostId)}" selected>（主机 #${a(boundHostId)}）当前绑定的主机已不存在</option>`
+      : '';
+    const hostHint = hostsError
+      ? '主机列表加载失败；已保留当前绑定，可稍后重试。'
+      : (hostList.length
+        ? '选择主机后，代码拉取仍在控制机完成，构建与部署在目标主机执行（目标机需装 rsync 与构建工具）。'
+        : '还没有配置远程主机；任务将在本机执行。可到「主机」页添加。');
+    // 已有任务且高级项偏离默认值时，打开表单就把「高级」页标记为已修改：
+    // 原来靠 <details open> 提示这些配置存在，分页后改用标签页标记承载。
     const hasAdvanced = isEdit && (
       (t.git_depth !== undefined && t.git_depth !== 1)
       || (t.timeout_seconds !== undefined && t.timeout_seconds !== (defaults.timeout_seconds || 1800))
@@ -1116,216 +1189,277 @@ AD.views = {};
     const body = `
       <div id="form-error" class="alert error hidden"></div>
 
-      <div class="section-title">基础信息</div>
-      <div class="form-grid cols-2">
-        <div class="field">
-          <label for="f-name">任务名（唯一标识）<span class="req">*</span></label>
-          <input type="text" id="f-name" value="${a(t.name || '')}" placeholder="例如：blog_frontend" aria-describedby="task-name-hint" spellcheck="false">
-          <div id="task-name-hint" class="hint">全局唯一，不区分大小写；仅允许 1–80 个英文字母或下划线，不允许中文、数字、空格和连字符。任务名用于工作目录名称，中文说明请填写备注。${isEdit && !/^[A-Za-z_]{1,80}$/.test(t.name || '') ? ' 当前是旧版名称，可原样保留；修改名称时必须符合新规则。' : ''}</div>
-        </div>
-        <div class="field">
-          <label>备注</label>
-          <input type="text" id="f-description" value="${a(t.description || '')}" placeholder="可选">
-        </div>
-      </div>
+      <div class="form-tabs">
+        <nav class="form-tab-nav" role="tablist" aria-label="任务配置分类">
+          ${[
+            ['basic', '基础'],
+            ['source', '代码源'],
+            ['build', '构建与发布'],
+            ['trigger', '触发'],
+            ['advanced', '高级'],
+            ['summary', '摘要'],
+          ].map(([key, label], index) => `
+            <button type="button" class="form-tab-btn${index === 0 ? ' active' : ''}"
+                    role="tab" data-form-tab="${key}" id="tab-btn-${key}"
+                    aria-controls="tab-panel-${key}" aria-selected="${index === 0}"
+                    tabindex="${index === 0 ? '0' : '-1'}">
+              <span class="tab-dot" aria-hidden="true"></span>
+              <span>${label}</span>
+            </button>`).join('')}
+        </nav>
 
-      <div class="section-title">部署方式</div>
-      <div class="form-grid cols-2">
-        <div class="field span-2">
-          <select id="f-deploy_method">
-            ${STAGE_LABELS.map(([value, label, hint]) =>
-              `<option value="${a(value)}"${initialMethod === value ? ' selected' : ''}>${e(label)} — ${e(hint)}</option>`).join('')}
-          </select>
-          <div class="hint" id="method-desc"></div>
-        </div>
-      </div>
+        <div class="form-tab-panels">
+          <section class="form-tab-panel" role="tabpanel" id="tab-panel-basic" data-form-panel="basic" aria-labelledby="tab-btn-basic">
+            <div class="section-title">任务标识</div>
+            <div class="form-grid cols-2">
+              <div class="field">
+                <label for="f-name">任务名（唯一标识）<span class="req">*</span></label>
+                <input type="text" id="f-name" value="${a(t.name || '')}" placeholder="例如：blog_frontend" aria-describedby="task-name-hint" spellcheck="false">
+                <div id="task-name-hint" class="hint">全局唯一，不区分大小写；仅允许 1–80 个英文字母或下划线，不允许中文、数字、空格和连字符。任务名用于工作目录名称，中文说明请填写备注。${isEdit && !/^[A-Za-z_]{1,80}$/.test(t.name || '') ? ' 当前是旧版名称，可原样保留；修改名称时必须符合新规则。' : ''}</div>
+              </div>
+              <div class="field">
+                <label>备注</label>
+                <input type="text" id="f-description" value="${a(t.description || '')}" placeholder="可选">
+              </div>
+            </div>
 
-      <div class="section-title">代码与认证</div>
-      <div class="form-grid cols-2">
-        <div class="field span-2">
-          <label>仓库地址<span class="req">*</span></label>
-          <input type="text" id="f-repo_url" value="${a(t.repo_url || '')}"
-                 placeholder="https://github.com/owner/repo.git">
-          <div class="hint">支持 https / ssh / git 协议；公开仓库选择「无需认证」即可</div>
-        </div>
-        <div class="field">
-          <label>分支<span class="req">*</span></label>
-          <input type="text" id="f-repo_branch" value="${a(t.repo_branch || defaults.repo_branch || 'main')}">
-        </div>
-        <div class="field">
-          <label>仓库子目录</label>
-          <input type="text" id="f-repo_subdir" value="${a(t.repo_subdir || '')}" placeholder="例如 frontend/">
-          <div class="hint">留空表示仓库根目录</div>
-        </div>
-        <div class="field span-2">
-          <label>仓库认证</label>
-          <div class="auth-options">
-            <label><input type="radio" name="f-auth_mode" value="none"${initialAuth === 'none' ? ' checked' : ''}>无需认证（公开仓库）</label>
-            <label><input type="radio" name="f-auth_mode" value="credential"${initialAuth === 'credential' ? ' checked' : ''}>使用集中凭据</label>
-            <label><input type="radio" name="f-auth_mode" value="token"${initialAuth === 'token' ? ' checked' : ''}>任务内令牌</label>
-          </div>
-        </div>
-        <div class="field span-2${initialAuth === 'credential' ? '' : ' hidden'}" id="auth-credential-wrap">
-          <label>凭据</label>
-          <div style="display:flex;gap:8px;align-items:center">
-            <select id="f-credential_id" style="flex:1">
-              <option value="">不使用（公开仓库）</option>
-              ${boundPlaceholder}
-              ${credentialOptions}
-            </select>
-            <button type="button" class="sm" id="cred-create">新建凭据</button>
-            <button type="button" class="sm" id="cred-test">测试仓库访问</button>
-          </div>
-          <div class="hint">${credHint}</div>
-        </div>
-        <div class="field span-2${initialAuth === 'token' ? '' : ' hidden'}" id="auth-token-wrap">
-          <label>任务内访问令牌（可选）</label>
-          <input type="password" id="f-git_token" autocomplete="new-password"
-                 placeholder="${isEdit ? (t.has_token ? '已配置，留空表示不修改' : '未配置') : '私有仓库才需要'}">
-          <div class="hint">仅该任务使用；以 GIT_ASKPASS 传递，不会写入命令行或日志</div>
-          <div class="hint">GitHub 令牌在 Settings → Developer settings → Personal access tokens 生成，
-            勾选目标仓库并把 Contents 设为 Read-only 即可</div>
-          ${isEdit && t.has_token ? '<div class="checkbox-row" style="margin-top:6px"><input type="checkbox" id="f-clear_token"><label for="f-clear_token">清除已保存的令牌</label></div>' : ''}
-        </div>
-      </div>
+            <div class="section-title">部署方式</div>
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <select id="f-deploy_method">
+                  ${STAGE_LABELS.map(([value, label, hint]) =>
+                    `<option value="${a(value)}"${initialMethod === value ? ' selected' : ''}>${e(label)} — ${e(hint)}</option>`).join('')}
+                </select>
+                <div class="hint" id="method-desc"></div>
+              </div>
+            </div>
 
-      <div class="section-title">构建与发布</div>
-      <div class="form-grid cols-2">
-        <div class="field span-2">
-          <label>打包路径</label>
-          <textarea id="f-artifact_paths" rows="3" placeholder="dist&#10;package.json">${e(t.artifact_paths || '')}</textarea>
-          <div class="hint">每行一条，支持通配符（如 <code class="code-inline">dist/**</code>）。决定哪些文件进入发布包；留空则打包整个仓库</div>
-        </div>
-        <div class="field${initialMethod === 'artifact' ? ' hidden' : ''}" data-release-field>
-          <label>目标目录</label>
-          <input type="text" id="f-target_dir" value="${a(t.target_dir || '')}" placeholder="/var/www/myapp">
-          <div class="hint">发布目录与 current 软链会放在这里；留空使用数据目录</div>
-        </div>
-        <div class="field${initialMethod === 'artifact' ? ' hidden' : ''}" data-release-field>
-          <label>保留版本数</label>
-          <input type="number" id="f-keep_releases" min="0" max="1000" value="${a(t.keep_releases !== undefined ? t.keep_releases : 5)}">
-          <div class="hint">超出后自动清理最旧的发布</div>
-        </div>
-        <div class="field span-2">
-          <label>准备脚本</label>
-          <textarea id="f-prepare_script" rows="4" placeholder="# 构建命令，例如&#10;npm ci&#10;npm run build">${e(t.prepare_script || '')}</textarea>
-          <div class="hint">在源码目录执行，用于安装依赖与构建（对应 CI 的 build 阶段）</div>
-        </div>
-        <div class="field span-2" data-method-field="script release systemd">
-          <label>部署脚本<span class="req req-deploy_script hidden">*</span></label>
-          <textarea id="f-deploy_script" rows="4" placeholder="# 发布后动作，例如&#10;systemctl restart myapp">${e(t.deploy_script || '')}</textarea>
-          <div class="hint">在发布完成后执行；使用「自定义脚本」方式时必填</div>
-        </div>
-        <div class="field span-2">
-          <label>回滚脚本</label>
-          <textarea id="f-rollback_script" rows="3" placeholder="# 可选，回滚时执行">${e(t.rollback_script || '')}</textarea>
-          <div class="hint" id="rollback-hint">回滚时在目标发布目录执行</div>
-        </div>
-        <div class="field" data-method-field="systemd">
-          <label>systemd 服务名<span class="req req-service_name hidden">*</span></label>
-          <input type="text" id="f-service_name" value="${a(t.service_name || '')}" placeholder="myapp.service">
-        </div>
-        <div class="field" data-method-field="docker">
-          <label>镜像名称<span class="req req-docker_image hidden">*</span></label>
-          <input type="text" id="f-docker_image" value="${a(t.docker_image || '')}" placeholder="myapp:latest">
-        </div>
-        <div class="field span-2" data-method-field="docker_compose">
-          <label>Compose 文件</label>
-          <input type="text" id="f-docker_compose_file" value="${a(t.docker_compose_file || '')}" placeholder="docker-compose.yml">
-        </div>
-        <div class="field span-2" data-method-field="docker">
-          <label>容器启动命令</label>
-          <textarea id="f-docker_command" rows="3" placeholder="docker rm -f myapp || true&#10;docker run -d --name myapp -p 8080:80 myapp:latest">${e(t.docker_command || '')}</textarea>
-        </div>
-        <div class="field span-2" data-method-field="rsync">
-          <label>rsync 目标<span class="req req-rsync_target hidden">*</span></label>
-          <input type="text" id="f-rsync_target" value="${a(t.rsync_target || '')}" placeholder="user@host:/var/www/myapp/">
-        </div>
-        <div class="field" data-method-field="rsync">
-          <label>rsync 参数</label>
-          <input type="text" id="f-rsync_options" value="${a(t.rsync_options || '-az --delete')}">
-        </div>
-      </div>
+            <div class="section-title">目标主机</div>
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <select id="f-host_id">
+                  <option value=""${t.host_id ? '' : ' selected'}>本机（控制机）</option>
+                  ${hostPlaceholder}
+                  ${hostOptions}
+                </select>
+                <div class="hint" id="host-desc">${hostHint}</div>
+              </div>
+            </div>
+          </section>
 
-      <div class="section-title">触发与通知</div>
-      <div class="form-grid cols-2">
-        <div class="field">
-          <label>调度类型</label>
-          <select id="f-schedule_type">
-            <option value="interval"${(t.schedule_type || 'interval') === 'interval' ? ' selected' : ''}>固定间隔</option>
-            <option value="cron"${t.schedule_type === 'cron' ? ' selected' : ''}>Cron 表达式</option>
-            <option value="manual"${t.schedule_type === 'manual' ? ' selected' : ''}>仅手动触发</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>表达式</label>
-          <input type="text" id="f-schedule_expression"
-                 value="${a(t.schedule_expression || scheduleDefaults.interval || '1h')}"
-                 placeholder="1h 或 0 */6 * * *">
-          <div class="hint" id="schedule-hint">间隔格式：30s / 15m / 6h / 2d</div>
-        </div>
-        <div class="field span-2">
-          <div id="schedule-preview" class="faint" style="min-height:20px"></div>
-        </div>
-      </div>
-      <div class="checkbox-row">
-        <input type="checkbox" id="f-enabled"${(t.enabled === undefined ? true : t.enabled) ? ' checked' : ''}>
-        <label for="f-enabled">启用定时调度</label>
-      </div>
+          <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-source" data-form-panel="source" aria-labelledby="tab-btn-source">
+            <div class="section-title">仓库</div>
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <label>仓库地址<span class="req">*</span></label>
+                <input type="text" id="f-repo_url" value="${a(t.repo_url || '')}"
+                       placeholder="https://github.com/owner/repo.git">
+                <div class="hint">支持 https / ssh / git 协议；公开仓库选择「无需认证」即可</div>
+              </div>
+              <div class="field">
+                <label>分支<span class="req">*</span></label>
+                <input type="text" id="f-repo_branch" value="${a(t.repo_branch || defaults.repo_branch || 'main')}">
+              </div>
+              <div class="field">
+                <label>仓库子目录</label>
+                <input type="text" id="f-repo_subdir" value="${a(t.repo_subdir || '')}" placeholder="例如 frontend/">
+                <div class="hint">留空表示仓库根目录</div>
+              </div>
+            </div>
 
-      ${isEdit && t.webhook_url ? `
-      <div class="form-grid cols-2">
-        <div class="field span-2">
-          <label>触发地址</label>
-          <div style="display:flex;gap:8px;align-items:center">
-            <input type="text" id="f-webhook_url" readonly value="${a(t.webhook_url)}" spellcheck="false" style="flex:1">
-            <button type="button" class="ghost" id="webhook-copy">复制</button>
-            <button type="button" class="ghost" id="webhook-reset">重新生成</button>
-          </div>
-          <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。任务暂停期间该地址不可用，调用会被拒绝并记录在操作日志中。</div>
-        </div>
-      </div>` : `
-      <div class="hint" style="margin:-6px 0 12px">任务创建后自动生成 Webhook 触发地址（向它发请求即触发部署），可在编辑页复制使用。</div>`}
-      <div class="form-grid cols-2">
-        <div class="field span-2">
-          <label>结果通知 Webhook</label>
-          <input type="text" id="f-notify_webhook" value="${a(t.notify_webhook || '')}" placeholder="https://...">
-          <div class="hint">部署结束后把结果发送到该地址，留空使用全局设置；与上面的触发地址无关</div>
+            <div class="section-title">认证</div>
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <div class="auth-options">
+                  <label><input type="radio" name="f-auth_mode" value="none"${initialAuth === 'none' ? ' checked' : ''}>无需认证（公开仓库）</label>
+                  <label><input type="radio" name="f-auth_mode" value="credential"${initialAuth === 'credential' ? ' checked' : ''}>使用集中凭据</label>
+                  <label><input type="radio" name="f-auth_mode" value="token"${initialAuth === 'token' ? ' checked' : ''}>任务内令牌</label>
+                </div>
+              </div>
+              <div class="field span-2${initialAuth === 'credential' ? '' : ' hidden'}" id="auth-credential-wrap">
+                <label>凭据</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <select id="f-credential_id" style="flex:1">
+                    <option value="">不使用（公开仓库）</option>
+                    ${boundPlaceholder}
+                    ${credentialOptions}
+                  </select>
+                  <button type="button" class="sm" id="cred-create">新建凭据</button>
+                  <button type="button" class="sm" id="cred-test">测试仓库访问</button>
+                </div>
+                <div class="hint">${credHint}</div>
+              </div>
+              <div class="field span-2${initialAuth === 'token' ? '' : ' hidden'}" id="auth-token-wrap">
+                <label>任务内访问令牌（可选）</label>
+                <input type="password" id="f-git_token" autocomplete="new-password"
+                       placeholder="${isEdit ? (t.has_token ? '已配置，留空表示不修改' : '未配置') : '私有仓库才需要'}">
+                <div class="hint">仅该任务使用；以 GIT_ASKPASS 传递，不会写入命令行或日志</div>
+                <div class="hint">GitHub 令牌在 Settings → Developer settings → Personal access tokens 生成，
+                  勾选目标仓库并把 Contents 设为 Read-only 即可</div>
+                ${isEdit && t.has_token ? `${switchRow('f-clear_token', false, '清除已保存的令牌',
+                  '保存后该任务不再使用任务内令牌；如仍在用私有仓库请先切换到集中凭据')}` : ''}
+              </div>
+            </div>
+          </section>
+
+          <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-build" data-form-panel="build" aria-labelledby="tab-btn-build">
+            <div class="section-title">构建</div>
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <label>打包路径</label>
+                <textarea id="f-artifact_paths" rows="3" placeholder="dist&#10;package.json">${e(t.artifact_paths || '')}</textarea>
+                <div class="hint">每行一条，支持通配符（如 <code class="code-inline">dist/**</code>）。决定哪些文件进入发布包；留空则打包整个仓库</div>
+              </div>
+              <div class="field span-2">
+                <label>准备脚本</label>
+                <textarea id="f-prepare_script" rows="4" placeholder="# 构建命令，例如&#10;npm ci&#10;npm run build">${e(t.prepare_script || '')}</textarea>
+                <div class="hint">在源码目录执行，用于安装依赖与构建（对应 CI 的 build 阶段）</div>
+              </div>
+            </div>
+
+            <div class="section-title">发布</div>
+            <div class="form-grid cols-2">
+              <div class="field${initialMethod === 'artifact' ? ' hidden' : ''}" data-release-field>
+                <label>目标目录</label>
+                <input type="text" id="f-target_dir" value="${a(t.target_dir || '')}" placeholder="/var/www/myapp">
+                <div class="hint">发布目录与 current 软链会放在这里；留空使用数据目录</div>
+              </div>
+              <div class="field${initialMethod === 'artifact' ? ' hidden' : ''}" data-release-field>
+                <label>保留版本数</label>
+                <input type="number" id="f-keep_releases" min="0" max="1000" value="${a(t.keep_releases !== undefined ? t.keep_releases : 5)}">
+                <div class="hint">超出后自动清理最旧的发布</div>
+              </div>
+              <div class="field span-2" data-method-field="script release systemd">
+                <label>部署脚本<span class="req req-deploy_script hidden">*</span></label>
+                <textarea id="f-deploy_script" rows="4" placeholder="# 发布后动作，例如&#10;systemctl restart myapp">${e(t.deploy_script || '')}</textarea>
+                <div class="hint">在发布完成后执行；使用「自定义脚本」方式时必填</div>
+              </div>
+              <div class="field" data-method-field="systemd">
+                <label>systemd 服务名<span class="req req-service_name hidden">*</span></label>
+                <input type="text" id="f-service_name" value="${a(t.service_name || '')}" placeholder="myapp.service">
+              </div>
+              <div class="field" data-method-field="docker">
+                <label>镜像名称<span class="req req-docker_image hidden">*</span></label>
+                <input type="text" id="f-docker_image" value="${a(t.docker_image || '')}" placeholder="myapp:latest">
+              </div>
+              <div class="field span-2" data-method-field="docker_compose">
+                <label>Compose 文件</label>
+                <input type="text" id="f-docker_compose_file" value="${a(t.docker_compose_file || '')}" placeholder="docker-compose.yml">
+              </div>
+              <div class="field span-2" data-method-field="docker">
+                <label>容器启动命令</label>
+                <textarea id="f-docker_command" rows="3" placeholder="docker rm -f myapp || true&#10;docker run -d --name myapp -p 8080:80 myapp:latest">${e(t.docker_command || '')}</textarea>
+              </div>
+              <div class="field span-2" data-method-field="rsync">
+                <label>rsync 目标<span class="req req-rsync_target hidden">*</span></label>
+                <input type="text" id="f-rsync_target" value="${a(t.rsync_target || '')}" placeholder="user@host:/var/www/myapp/">
+              </div>
+              <div class="field" data-method-field="rsync">
+                <label>rsync 参数</label>
+                <input type="text" id="f-rsync_options" value="${a(t.rsync_options || '-az --delete')}">
+              </div>
+            </div>
+
+            <div class="section-title">回滚</div>
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <label>回滚脚本</label>
+                <textarea id="f-rollback_script" rows="3" placeholder="# 可选，回滚时执行">${e(t.rollback_script || '')}</textarea>
+                <div class="hint" id="rollback-hint">回滚时在目标发布目录执行</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-trigger" data-form-panel="trigger" aria-labelledby="tab-btn-trigger">
+            <div class="section-title">定时调度</div>
+            <div class="form-grid cols-2">
+              <div class="field">
+                <label>调度类型</label>
+                <select id="f-schedule_type">
+                  <option value="interval"${(t.schedule_type || 'interval') === 'interval' ? ' selected' : ''}>固定间隔</option>
+                  <option value="cron"${t.schedule_type === 'cron' ? ' selected' : ''}>Cron 表达式</option>
+                  <option value="manual"${t.schedule_type === 'manual' ? ' selected' : ''}>仅手动触发</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>表达式</label>
+                <input type="text" id="f-schedule_expression"
+                       value="${a(t.schedule_expression || scheduleDefaults.interval || '1h')}"
+                       placeholder="1h 或 0 */6 * * *">
+                <div class="hint" id="schedule-hint">间隔格式：30s / 15m / 6h / 2d</div>
+              </div>
+              <div class="field span-2">
+                <div id="schedule-preview" class="faint" style="min-height:20px"></div>
+              </div>
+            </div>
+            ${switchRow('f-enabled', (t.enabled === undefined ? true : t.enabled), '启用定时调度',
+              '关闭后仅手动或 Webhook 触发，不会按调度自动执行')}
+
+            <div class="section-title">Webhook 触发</div>
+            ${isEdit && t.webhook_url ? `
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <label>触发地址</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                  <input type="text" id="f-webhook_url" readonly value="${a(t.webhook_url)}" spellcheck="false" style="flex:1">
+                  <button type="button" class="ghost" id="webhook-copy">复制</button>
+                  <button type="button" class="ghost" id="webhook-reset">重新生成</button>
+                </div>
+                <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。任务暂停期间该地址不可用，调用会被拒绝并记录在操作日志中。</div>
+              </div>
+            </div>` : `
+            <div class="hint" style="margin:0 0 12px">任务创建后自动生成 Webhook 触发地址（向它发请求即触发部署），可在编辑页复制使用。</div>`}
+
+            <div class="section-title">通知与执行策略</div>
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <label>结果通知 Webhook</label>
+                <input type="text" id="f-notify_webhook" value="${a(t.notify_webhook || '')}" placeholder="https://...">
+                <div class="hint">部署结束后把结果发送到该地址，留空使用全局设置；与上面的触发地址无关</div>
+              </div>
+            </div>
+            ${switchRow('f-skip_if_no_changes', (t.skip_if_no_changes === undefined ? true : t.skip_if_no_changes),
+              '代码无变化时跳过部署', '提交哈希未变化时直接标记为「已跳过」，不执行构建与发布')}
+            ${isEdit ? '' : switchRow('f-run_on_create', false,
+              '创建后立即运行一次', '保存成功后马上排队执行，便于验证配置是否正确')}
+          </section>
+
+          <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-advanced" data-form-panel="advanced" aria-labelledby="tab-btn-advanced">
+            <div class="section-title">拉取与超时</div>
+            <div class="form-grid cols-2">
+              <div class="field">
+                <label>拉取深度</label>
+                <input type="number" id="f-git_depth" min="0" max="10000" value="${a(t.git_depth !== undefined ? t.git_depth : 1)}">
+                <div class="hint">1 = 浅克隆（最快）；0 = 完整历史</div>
+              </div>
+              <div class="field">
+                <label>阶段超时（秒）</label>
+                <input type="number" id="f-timeout_seconds" min="10" max="86400"
+                       value="${a(t.timeout_seconds !== undefined ? t.timeout_seconds : (defaults.timeout_seconds || 1800))}">
+                <div class="hint">单个执行命令/阶段的超时，不是整条流水线的总时限</div>
+              </div>
+            </div>
+
+            <div class="section-title">环境变量</div>
+            <div class="form-grid cols-2">
+              <div class="field span-2">
+                <label>环境变量</label>
+                <textarea id="f-env_vars" rows="6" placeholder="NODE_ENV=production&#10;API_BASE=https://api.example.com">${e(envToText(t.env_vars))}</textarea>
+                <div class="hint">每行一条 <code class="code-inline">KEY=value</code>，会导出到准备与部署脚本（回滚脚本不注入这些变量）</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-summary" data-form-panel="summary" aria-labelledby="tab-btn-summary">
+            <div class="section-title">配置摘要</div>
+            <div id="config-summary" class="config-summary"></div>
+            <div class="hint" style="margin-top:10px">
+              摘要随输入实时更新，用于保存前确认「这个任务到底会做什么」。
+              带橙色圆点的标签页表示该页存在与默认值不同的配置。
+            </div>
+          </section>
         </div>
       </div>
-      <div class="checkbox-row">
-        <input type="checkbox" id="f-skip_if_no_changes"${(t.skip_if_no_changes === undefined ? true : t.skip_if_no_changes) ? ' checked' : ''}>
-        <label for="f-skip_if_no_changes">代码无变化时跳过部署</label>
-      </div>
-      ${isEdit ? '' : `<div class="checkbox-row">
-        <input type="checkbox" id="f-run_on_create">
-        <label for="f-run_on_create">创建后立即运行一次</label>
-      </div>`}
-
-      <details class="adv-details"${hasAdvanced ? ' open' : ''}>
-        <summary>高级参数（拉取深度、超时、环境变量）</summary>
-        <div class="form-grid cols-2">
-          <div class="field">
-            <label>拉取深度</label>
-            <input type="number" id="f-git_depth" min="0" max="10000" value="${a(t.git_depth !== undefined ? t.git_depth : 1)}">
-            <div class="hint">1 = 浅克隆（最快）；0 = 完整历史</div>
-          </div>
-          <div class="field">
-            <label>阶段超时（秒）</label>
-            <input type="number" id="f-timeout_seconds" min="10" max="86400"
-                   value="${a(t.timeout_seconds !== undefined ? t.timeout_seconds : (defaults.timeout_seconds || 1800))}">
-            <div class="hint">单个执行命令/阶段的超时，不是整条流水线的总时限</div>
-          </div>
-          <div class="field span-2">
-            <label>环境变量</label>
-            <textarea id="f-env_vars" rows="3" placeholder="NODE_ENV=production&#10;API_BASE=https://api.example.com">${e(envToText(t.env_vars))}</textarea>
-            <div class="hint">每行一条 <code class="code-inline">KEY=value</code>，会导出到准备与部署脚本（回滚脚本不注入这些变量）</div>
-          </div>
-        </div>
-      </details>
-
-      <div class="section-title">配置摘要</div>
-      <div id="config-summary" class="config-summary"></div>
     `;
 
     const backdrop = AD.Modal.open({
@@ -1352,6 +1486,81 @@ AD.views = {};
     const markDirty = () => { formDirty = true; };
     backdrop.addEventListener('input', markDirty, true);
     backdrop.addEventListener('change', markDirty, true);
+
+    // ---- 分页导航 ------------------------------------------------------
+    // 面板始终留在 DOM 里（只用 .hidden 切换）：collectForm 与各 apply*UI
+    // 都按 id 读取全部字段，销毁子树会导致保存静默丢字段。
+    const TAB_KEYS = ['basic', 'source', 'build', 'trigger', 'advanced', 'summary'];
+    const tabButtons = Array.from(backdrop.querySelectorAll('[data-form-tab]'));
+    const tabPanels = Array.from(backdrop.querySelectorAll('[data-form-panel]'));
+    const panelOf = (key) => backdrop.querySelector(`[data-form-panel="${key}"]`);
+    let activeTab = 'basic';
+
+    const activateTab = (key, options) => {
+      const target = TAB_KEYS.includes(key) ? key : 'basic';
+      activeTab = target;
+      tabButtons.forEach((button) => {
+        const current = button.dataset.formTab === target;
+        button.classList.toggle('active', current);
+        button.setAttribute('aria-selected', String(current));
+        button.tabIndex = current ? 0 : -1;
+      });
+      tabPanels.forEach((panel) => {
+        panel.classList.toggle('hidden', panel.dataset.formPanel !== target);
+      });
+      const panels = backdrop.querySelector('.form-tab-panels');
+      if (panels && !(options && options.keepScroll)) panels.scrollTop = 0;
+      const node = panelOf(target);
+      if (node && options && options.focus) {
+        const first = node.querySelector('input:not([type="hidden"]), select, textarea');
+        if (first && typeof first.focus === 'function') first.focus();
+      }
+    };
+
+    tabButtons.forEach((button) => {
+      button.addEventListener('click', () => activateTab(button.dataset.formTab));
+      // 键盘左右方向键在标签间移动，符合 tablist 的可访问性约定。
+      button.addEventListener('keydown', (event) => {
+        if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp'
+          && event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+        event.preventDefault();
+        const index = TAB_KEYS.indexOf(button.dataset.formTab);
+        const step = event.key === 'ArrowDown' || event.key === 'ArrowRight' ? 1 : -1;
+        const nextKey = TAB_KEYS[(index + step + TAB_KEYS.length) % TAB_KEYS.length];
+        activateTab(nextKey, { focus: true });
+      });
+    });
+
+    // 菜单项状态点：dirtyKey 记录用户实际改过哪一页；hasError 由保存校验回填。
+    const tabDirty = hasAdvanced ? { advanced: true } : {};
+    const tabError = {};
+    const paintTabBadges = () => {
+      tabButtons.forEach((button) => {
+        const key = button.dataset.formTab;
+        button.classList.toggle('is-dirty', Boolean(tabDirty[key]) && !tabError[key]);
+        button.classList.toggle('has-error', Boolean(tabError[key]));
+      });
+    };
+    // 把改动归到它所在的面板：事件目标向上找最近的 data-form-panel。
+    backdrop.addEventListener('input', (event) => {
+      const panel = event.target && event.target.closest
+        ? event.target.closest('[data-form-panel]') : null;
+      const key = panel ? panel.dataset.formPanel : activeTab;
+      if (key && key !== 'summary') {
+        tabDirty[key] = true;
+        paintTabBadges();
+      }
+    }, true);
+
+    // 聚焦到某个字段所在页：跨页校验失败时把用户送到出错的位置。
+    const revealField = (fieldId) => {
+      const field = backdrop.querySelector('#' + fieldId);
+      if (!field) return null;
+      const panel = field.closest ? field.closest('[data-form-panel]') : null;
+      if (panel) activateTab(panel.dataset.formPanel);
+      if (typeof field.focus === 'function') field.focus();
+      return field;
+    };
 
     const methodSelect = backdrop.querySelector('#f-deploy_method');
     const summaryNode = backdrop.querySelector('#config-summary');
@@ -1406,7 +1615,22 @@ AD.views = {};
       else if (scheduleType === 'manual') lines.push('触发：仅手动触发');
       else if (scheduleType === 'interval') lines.push('触发：固定间隔 ' + (expression || '（未填写）'));
       else lines.push('触发：Cron ' + (expression || '（未填写）') + '（按 UTC 计算）');
+      // 高级项偏离默认值时在摘要里点出来：分页后这些字段藏在「高级」页，
+      // 不提示就等于悄悄生效。
+      const advancedBits = [];
+      const depthRaw = value('#f-git_depth');
+      if (depthRaw !== '' && Number(depthRaw) !== 1) {
+        advancedBits.push(Number(depthRaw) === 0 ? '完整历史' : '拉取深度 ' + depthRaw);
+      }
+      const timeoutRaw = value('#f-timeout_seconds');
+      const defaultTimeout = Number(defaults.timeout_seconds || 1800);
+      if (timeoutRaw !== '' && Number(timeoutRaw) !== defaultTimeout) {
+        advancedBits.push('阶段超时 ' + timeoutRaw + 's');
+      }
+      if (value('#f-env_vars')) advancedBits.push('自定义环境变量');
+      if (advancedBits.length) lines.push('高级：' + advancedBits.join('；'));
       summaryNode.innerHTML = lines.map((line) => '<div>' + e(line) + '</div>').join('');
+      paintTabBadges();
     };
     const refreshSummary = AD.debounce(renderSummary, 200);
     backdrop.addEventListener('input', refreshSummary, true);
@@ -1585,15 +1809,40 @@ AD.views = {};
     applyScheduleVisibility();
     refreshPreview();
     renderSummary();
+    // 初始化分页：默认停在「基础」，且带上「高级」页的既有配置标记。
+    activateTab('basic');
+    paintTabBadges();
 
     backdrop.querySelector('#form-save').addEventListener('click', async (event) => {
       const button = event.currentTarget;
+      // 校验覆盖所有标签页：collectForm 读的是全部字段（含隐藏页），
+      // 任何一处不合法都要拦住；随后把用户送到出错的那一页，
+      // 否则分页后会出现“提示有错却看不到错误字段”的死角。
+      Object.keys(tabError).forEach((key) => { delete tabError[key]; });
+      const failOn = (message, fieldId, tabKey) => {
+        if (tabKey) tabError[tabKey] = true;
+        paintTabBadges();
+        showFormError(backdrop, message);
+        if (fieldId) {
+          const input = revealField(fieldId);
+          if (input) {
+            input.classList.toggle('input-error', true);
+            input.addEventListener('input', () => input.classList.remove('input-error'), { once: true });
+          }
+        }
+        return true;
+      };
+
       const payload = collectForm(backdrop, { isEdit, hasToken: Boolean(t.has_token) });
       if ((!isEdit || payload.name !== t.name) && !/^[A-Za-z_]{1,80}$/.test(payload.name)) {
-        showFormError(backdrop, '任务名只能包含 1–80 个英文字母或下划线，且必须全局唯一；中文说明请填写备注。');
+        failOn('任务名只能包含 1–80 个英文字母或下划线，且必须全局唯一；中文说明请填写备注。',
+          'f-name', 'basic');
         return;
       }
-      if (!payload.repo_url) { showFormError(backdrop, '请填写仓库地址'); return; }
+      if (!payload.repo_url) {
+        failOn('请填写仓库地址', 'f-repo_url', 'source');
+        return;
+      }
 
       // 方式专属必填项前置校验（与后端 _check_method_requirements 一致），
       // 让错误就地出现在对应字段而不是提交后才弹后端报错。
@@ -1602,13 +1851,8 @@ AD.views = {};
         if (!String(payload[id] || '').trim()) {
           const labels = { deploy_script: '部署脚本', service_name: 'systemd 服务名',
             docker_image: '镜像名称', rsync_target: 'rsync 目标' };
-          showFormError(backdrop, `部署方式为「${methodLabel(payload.deploy_method)}」时必须填写「${labels[id] || id}」`);
-          const input = backdrop.querySelector('#f-' + id);
-          if (input) {
-            if (typeof input.focus === 'function') input.focus();
-            input.classList.toggle('input-error', true);
-            input.addEventListener('input', () => input.classList.remove('input-error'), { once: true });
-          }
+          failOn(`部署方式为「${methodLabel(payload.deploy_method)}」时必须填写「${labels[id] || id}」`,
+            'f-' + id, 'build');
           return;
         }
       }
@@ -1635,6 +1879,10 @@ AD.views = {};
         AD.Modal.close();
         AD.render('tasks');
       } catch (err) {
+        // 后端拒绝（含唯一性冲突）时错误属于整体提交，不指向具体页面：
+        // 留在当前页展示原因，同时不污染任何标签页的错误标记。
+        Object.keys(tabError).forEach((key) => { delete tabError[key]; });
+        paintTabBadges();
         showFormError(backdrop, err.message);
         AD.setBusy(button, false);
       }
@@ -1684,6 +1932,7 @@ AD.views = {};
       schedule_expression: value('#f-schedule_expression'),
       enabled: checked('#f-enabled'),
       deploy_method: value('#f-deploy_method'),
+      host_id: value('#f-host_id') ? Number(value('#f-host_id')) : null,
       artifact_paths: value('#f-artifact_paths'),
       target_dir: value('#f-target_dir'),
       keep_releases: Number(value('#f-keep_releases') || 0),
@@ -1775,8 +2024,10 @@ AD.views = {};
             `<span class="badge ${c.ok ? 'on' : 'failed'}" title="${a(c.message)}">${c.ok ? '✓' : '✗'} ${e(c.name)}</span>`).join(' ') || '<span class="faint">—</span>'}</dd>
       </dl>
 
-      <div class="section-title">发布版本（${releases.length}）</div>
-      ${releases.length ? `<ul class="release-list">${releases.map((r) => `
+      <div class="section-title">发布版本（${data.releases_remote ? '远程' : releases.length}）</div>
+      ${data.releases_remote
+        ? `<p class="faint">${e(data.releases_note || '发布版本位于目标主机上')}</p>`
+        : releases.length ? `<ul class="release-list">${releases.map((r) => `
         <li>
           <span class="mono truncate" style="flex:1">${e(r.name)}</span>
           ${r.is_current ? '<span class="badge on">当前</span>' : ''}
@@ -2032,7 +2283,9 @@ AD.views = {};
           </tr></thead>
           <tbody>${data.runs.map((run) => `<tr data-run-row="${run.id}">
             <td class="mono dim">${run.id}</td>
-            <td class="truncate" style="max-width:170px" title="${a(run.task_name)}">${e(run.task_name)}</td>
+            <td class="truncate" style="max-width:170px" title="${a(run.task_name)}">${e(run.task_name)}
+              ${run.host_name ? `<div class="faint truncate" title="${a(run.host_name)}">🖥 ${e(run.host_name)}</div>` : ''}
+            </td>
             <td data-run-status>${runBadgeHtml(run)}</td>
             <td class="dim nowrap">${e(AD.triggerLabel(run.trigger))}</td>
             <td class="mono dim truncate" style="max-width:230px" title="${a(run.commit_message || '')}">
@@ -2155,6 +2408,7 @@ AD.views = {};
           <span><span class="dim">结束：</span>${e(AD.formatTime(run.finished_at, true) || '—')}</span>
           <span><span class="dim">作者：</span>${e(run.commit_author || '—')}</span>
           <span><span class="dim">变更文件：</span>${run.changed_files || 0}</span>
+          <span><span class="dim">目标主机：</span>${e(run.host_name || '本机')}</span>
         </div>
         ${run.commit_message ? `<div class="faint" style="margin-top:8px">提交信息：${e(run.commit_message)}</div>` : ''}
         ${run.release_dir ? `<div class="faint mono" style="margin-top:6px">发布目录：${e(run.release_dir)}</div>` : ''}
@@ -2164,9 +2418,11 @@ AD.views = {};
         <strong style="font-size:13px">执行日志</strong>
         <span class="faint" id="rd-log-meta"></span>
         <div class="spacer"></div>
-        <label class="row" style="gap:5px;font-size:12px;color:var(--text-dim)">
-          <input type="checkbox" id="rd-follow" checked> 自动滚动
+        <label class="switch" title="日志滚动时自动跟随最新输出">
+          <input type="checkbox" id="rd-follow" checked aria-label="自动滚动">
+          <span class="switch-track" aria-hidden="true"></span>
         </label>
+        <span class="faint" style="font-size:12px">自动滚动</span>
         <button class="ghost sm" id="rd-copy">复制</button>
         <button class="ghost sm" id="rd-download">下载</button>
       </div>
@@ -2303,6 +2559,261 @@ AD.views = {};
     if (/^结果: /.test(line)) return '<span class="l-ok">' + escaped + '</span>';
     return escaped;
   }
+
+  // ======================================================================
+  // 远程主机
+  // ======================================================================
+  const HOST_STATUS_TONE = {
+    online: 'on', offline: 'failed', error: 'failed', unknown: 'neutral',
+  };
+
+  AD.views.hosts = async function (container) {
+    let data;
+    try {
+      data = await AD.api.get('/api/hosts');
+    } catch (err) {
+      container.innerHTML = `<div class="panel"><div class="alert error">加载主机列表失败：${e(err.message)}</div></div>`;
+      return;
+    }
+    const hosts = data.hosts || [];
+
+    container.innerHTML = `
+      <div class="view-header">
+        <h1>主机</h1>
+        <span class="badge neutral">${hosts.length} 台</span>
+        <div class="spacer"></div>
+        <button class="primary" id="host-new">+ 添加主机</button>
+      </div>
+
+      <div class="alert info">
+        主机通过 SSH 连接，任务可指定部署到其中一台；未指定的任务仍在本机执行。
+        仅支持免口令的密钥认证，私钥在每次连接时写入临时文件并在结束后删除。
+      </div>
+
+      ${hosts.length ? `<div class="panel"><div class="table-wrap"><table>
+        <thead><tr>
+          <th>名称</th><th>连接地址</th><th>状态</th><th>指纹</th><th>被引用</th><th class="right">操作</th>
+        </tr></thead>
+        <tbody>${hosts.map(hostRow).join('')}</tbody>
+      </table></div></div>`
+      : `<div class="panel"><div class="empty">
+           <div class="big">🖥</div>
+           <h3>还没有远程主机</h3>
+           <p class="faint">添加一台主机后，即可把任务部署到它上面，或把任务快照迁移过去</p>
+           <button class="primary" id="host-new-empty">+ 添加主机</button>
+         </div></div>`}
+    `;
+
+    container.querySelector('#host-new')?.addEventListener('click', () => AD.openHostForm(null));
+    container.querySelector('#host-new-empty')?.addEventListener('click', () => AD.openHostForm(null));
+    container.querySelectorAll('[data-host-test]').forEach((b) =>
+      b.addEventListener('click', () => AD.testHost(Number(b.dataset.hostTest))));
+    container.querySelectorAll('[data-host-edit]').forEach((b) =>
+      b.addEventListener('click', () => AD.openHostForm(Number(b.dataset.hostEdit))));
+    container.querySelectorAll('[data-host-delete]').forEach((b) =>
+      b.addEventListener('click', () => AD.deleteHost(Number(b.dataset.hostDelete))));
+    container.querySelectorAll('[data-host-fingerprint]').forEach((b) =>
+      b.addEventListener('click', () => AD.resetHostFingerprint(Number(b.dataset.hostFingerprint))));
+  };
+
+  function hostRow(item) {
+    const tone = HOST_STATUS_TONE[item.status] || 'neutral';
+    const checked = item.last_check_at
+      ? `<div class="faint">${e(AD.formatRelative(item.last_check_at))}</div>` : '';
+    const errorLine = item.last_error
+      ? `<div class="faint" style="color:var(--danger)" title="${a(item.last_error)}">${e(item.last_error.slice(0, 60))}${item.last_error.length > 60 ? '…' : ''}</div>`
+      : '';
+    const fingerprint = item.fingerprint
+      ? `<span class="mono" style="font-size:11px" title="${a(item.fingerprint)}">${e(item.fingerprint.slice(0, 34))}…</span>`
+      : '<span class="faint">未钉住</span>';
+    return `<tr>
+      <td>
+        <div style="font-weight:500">${e(item.name)}</div>
+        ${item.credential_missing ? '<div class="faint" style="color:var(--danger)">绑定的凭据已被删除</div>' : ''}
+      </td>
+      <td><span class="mono">${e(item.target)}</span>
+        <div class="faint">基础目录 ${e(item.base_dir)}</div>
+      </td>
+      <td><span class="badge ${tone}">${e(item.status_label)}</span>${checked}${errorLine}</td>
+      <td>${fingerprint}</td>
+      <td>${item.used_by ? `<span class="badge neutral">${item.used_by} 个任务</span>` : '<span class="faint">未使用</span>'}</td>
+      <td>
+        <div class="table-actions">
+          <button class="sm" data-host-test="${item.id}">测试连接</button>
+          ${item.fingerprint ? `<button class="sm" data-host-fingerprint="${item.id}" title="目标机重装后需要重置">重置指纹</button>` : ''}
+          <button class="sm" data-host-edit="${item.id}">编辑</button>
+          <button class="sm danger" data-host-delete="${item.id}">删除</button>
+        </div>
+      </td>
+    </tr>`;
+  }
+
+  AD.testHost = async function (hostId) {
+    const toast = AD.toast('正在连接测试，请稍候…', 'info', 40000);
+    try {
+      const result = await AD.api.post(`/api/hosts/${hostId}/test`);
+      if (result.ok) {
+        const probe = result.probe || {};
+        const bits = [
+          probe.uname && `系统 ${probe.uname}`,
+          probe.rsync_version && `rsync 可用`,
+          probe.docker_version ? 'docker 可用' : 'docker 不可用',
+        ].filter(Boolean);
+        AD.toastSuccess(`连接成功${bits.length ? '：' + bits.join('，') : ''}`);
+      } else {
+        AD.toastError(result.message || '连接失败');
+      }
+      AD.render('hosts');
+    } catch (err) {
+      AD.toastError(err.message);
+    }
+  };
+
+  AD.resetHostFingerprint = async function (hostId) {
+    const ok = await AD.confirm({
+      title: '重置主机指纹',
+      message: '重置后下一次连接将信任新的主机公钥。',
+      detail: '仅在确认目标机重装系统或更换过 SSH 主机密钥时才这样做。若无法解释指纹变化，可能是中间人攻击。',
+      confirmText: '确认重置',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const result = await AD.api.post(`/api/hosts/${hostId}/reset-fingerprint`);
+      AD.toastSuccess(result.message || '指纹已重置');
+      AD.render('hosts');
+    } catch (err) {
+      AD.toastError(err.message);
+    }
+  };
+
+  AD.deleteHost = async function (hostId) {
+    const ok = await AD.confirm({
+      title: '删除主机',
+      message: '该主机将从列表中移除。',
+      detail: '若仍有任务指向该主机，删除会被拒绝——请先在这些任务里改回本机或其它目标主机。',
+      confirmText: '确认删除',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await AD.api.del(`/api/hosts/${hostId}`);
+      AD.toastSuccess('主机已删除');
+      AD.render('hosts');
+    } catch (err) {
+      AD.toastError(err.message);
+    }
+  };
+
+  AD.openHostForm = async function (hostId) {
+    const isEdit = Boolean(hostId);
+    let item = {};
+    if (isEdit) {
+      const data = await AD.api.get(`/api/hosts/${hostId}`);
+      item = data.host || {};
+    }
+    // 只列出 ssh_key 类型凭据：其它类型无法用于 SSH 登录。
+    let credentials = [];
+    try {
+      const data = await AD.api.get('/api/credentials');
+      credentials = (data.credentials || []).filter((c) => c.kind === 'ssh_key');
+    } catch (err) {
+      credentials = [];
+    }
+    const options = credentials.map((c) =>
+      `<option value="${c.id}"${String(item.credential_id) === String(c.id) ? ' selected' : ''}>${e(c.name)}${c.fingerprint ? `（${e(String(c.fingerprint).slice(0, 24))}…）` : ''}</option>`).join('');
+
+    const backdrop = AD.Modal.open({
+      title: isEdit ? `编辑主机：${item.name}` : '添加主机',
+      body: `
+        <div id="host-error" class="alert error hidden"></div>
+        <div class="form-grid cols-2">
+          <div class="field">
+            <label>名称<span class="req">*</span></label>
+            <input type="text" id="h-name" value="${a(item.name || '')}" placeholder="例如：生产环境 web-1">
+            <div class="hint">仅用于在任务里辨认，全局唯一</div>
+          </div>
+          <div class="field">
+            <label>地址<span class="req">*</span></label>
+            <input type="text" id="h-address" value="${a(item.address || '')}" placeholder="10.0.0.5 或 web1.example.com">
+          </div>
+          <div class="field">
+            <label>SSH 端口</label>
+            <input type="number" id="h-port" min="1" max="65535" value="${a(item.port || 22)}">
+          </div>
+          <div class="field">
+            <label>SSH 用户名<span class="req">*</span></label>
+            <input type="text" id="h-username" value="${a(item.username || '')}" placeholder="deploy">
+          </div>
+          <div class="field span-2">
+            <label>SSH 私钥凭据<span class="req">*</span></label>
+            <select id="h-credential">
+              <option value="">请选择…</option>
+              ${options}
+            </select>
+            <div class="hint">
+              ${credentials.length
+                ? '只列出 ssh_key 类型的凭据（登录主机与拉取仓库共用同一份私钥）。'
+                  + '需要新建时到「凭据」页生成密钥对，再把公钥添加到目标机的 ~/.ssh/authorized_keys；'
+                  + '可先在凭据行点「测试」→「主机登录」验证能否登录。'
+                : '还没有 SSH 私钥凭据。请先到「凭据」页新建一个 ssh_key 类型凭据并生成密钥对，'
+                  + '把公钥加到目标机 authorized_keys 后再回来绑定。'}
+            </div>
+          </div>
+          <div class="field span-2">
+            <label>远端基础目录</label>
+            <input type="text" id="h-base_dir" value="${a(item.base_dir || '/opt/autodeploy')}">
+            <div class="hint">该主机上存放工作副本与发布目录的根路径，必须是绝对路径</div>
+          </div>
+        </div>
+        ${isEdit && item.fingerprint ? `
+          <div class="alert neutral" style="margin-top:6px">
+            已钉住主机指纹：<span class="mono">${e(item.fingerprint)}</span>。
+            修改地址、端口、用户名或凭据后指纹会被清空，需要重新测试连接。
+          </div>` : ''}
+      `,
+      footer: '<button data-close>取消</button>'
+        + `<button class="primary" id="host-save">${isEdit ? '保存修改' : '添加主机'}</button>`,
+    });
+
+    backdrop.querySelector('#host-save').addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      const value = (id) => (backdrop.querySelector(id)?.value || '').trim();
+      const payload = {
+        name: value('#h-name'),
+        address: value('#h-address'),
+        port: Number(value('#h-port') || 22),
+        username: value('#h-username'),
+        base_dir: value('#h-base_dir') || '/opt/autodeploy',
+        credential_id: value('#h-credential') ? Number(value('#h-credential')) : null,
+      };
+      const errorBox = backdrop.querySelector('#host-error');
+      const showError = (message) => {
+        errorBox.textContent = message;
+        errorBox.classList.remove('hidden');
+      };
+      if (!payload.name) return showError('请填写主机名称');
+      if (!payload.address) return showError('请填写主机地址');
+      if (!payload.username) return showError('请填写 SSH 用户名');
+      if (!payload.credential_id) return showError('请选择 SSH 私钥凭据');
+
+      AD.setBusy(button, true, isEdit ? '保存中…' : '添加中…');
+      try {
+        const result = isEdit
+          ? await AD.api.put(`/api/hosts/${hostId}`, payload)
+          : await AD.api.post('/api/hosts', payload);
+        AD.toastSuccess(isEdit ? '主机已保存' : '主机已添加');
+        if (result.fingerprint_reset) {
+          AD.toast('连接信息已变更，指纹已清空；建议立即测试连接', 'warning', 6000);
+        }
+        AD.Modal.close();
+        AD.render('hosts');
+      } catch (err) {
+        showError(err.message);
+        AD.setBusy(button, false);
+      }
+    });
+  };
 
   // ======================================================================
   // Statistics
@@ -2449,11 +2960,9 @@ AD.views = {};
           <div class="panel-head"><h2>调度与并发</h2></div>
           ${num('poll_interval_seconds', '调度轮询间隔（秒）', '调度器检查到期任务的频率')}
           ${num('max_global_workers', '并发部署上限', '同时运行的部署数量，超出后排队')}
-          <div class="checkbox-row">
-            <input type="checkbox" id="s-queue_while_running"${s.queue_while_running ? ' checked' : ''}>
-            <label for="s-queue_while_running">任务运行中仍排队下一次触发</label>
-          </div>
-          <div class="hint">不勾选时，任务运行期间到达的调度点会被跳过（推荐）</div>
+          ${switchRow('s-queue_while_running', s.queue_while_running,
+            '任务运行中仍排队下一次触发',
+            '不勾选时，任务运行期间到达的调度点会被跳过（推荐）')}
         </div>
 
         <div class="panel">
@@ -2475,6 +2984,33 @@ AD.views = {};
         </div>
 
         <div class="panel">
+          <div class="panel-head"><h2>定时自动备份</h2></div>
+          ${switchRow('s-backup_enabled', s.backup_enabled, '启用定时自动备份',
+            '按下面的调度自动生成快照，失败时通过通知 Webhook 告警')}
+          <div class="grid cols-2">
+            <div class="field">
+              <label>调度方式</label>
+              <select id="s-backup_schedule_type">
+                <option value="cron"${s.backup_schedule_type === 'cron' ? ' selected' : ''}>Cron 表达式</option>
+                <option value="interval"${s.backup_schedule_type === 'interval' ? ' selected' : ''}>固定间隔</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>调度表达式</label>
+              <input type="text" id="s-backup_schedule_expression" value="${a(s.backup_schedule_expression || '0 3 * * *')}">
+            </div>
+          </div>
+          <div class="hint" style="margin-bottom:10px">默认为每日凌晨 3:00（0 3 * * *），或填 1d、12h 等间隔</div>
+          ${num('backup_retention_count', '自动保留份数', '超出后自动清理最旧的历史备份')}
+          ${switchRow('s-backup_include_logs', s.backup_include_logs, '备份中包含运行日志',
+            '日志体积较大；只备份配置与数据时可关闭')}
+          ${switchRow('s-backup_include_artifacts', s.backup_include_artifacts, '备份中包含构建产物',
+            '包含各任务历史打包生成的压缩包')}
+        </div>
+      </div>
+
+      <div class="grid cols-2">
+        <div class="panel">
           <div class="panel-head"><h2>安全与通知</h2></div>
           ${num('session_ttl_hours', '登录有效期（小时）', '会话过期后需要重新登录')}
           ${num('login_max_attempts', '登录失败上限', '超过后临时锁定')}
@@ -2485,15 +3021,58 @@ AD.views = {};
                    placeholder="https://hooks.example.com/deploy">
             <div class="hint">任务未单独配置时使用；每次运行结束 POST 一条 JSON</div>
           </div>
-          <div class="checkbox-row">
-            <input type="checkbox" id="s-trust_proxy_headers"${s.trust_proxy_headers ? ' checked' : ''}>
-            <label for="s-trust_proxy_headers">信任反向代理的 X-Forwarded-For</label>
+          ${switchRow('s-trust_proxy_headers', s.trust_proxy_headers,
+            '信任反向代理的 X-Forwarded-For',
+            '仅在应用确实位于可信反向代理之后时开启，否则客户端可伪造来源 IP')}
+          ${switchRow('s-secure_cookies', s.secure_cookies, '仅通过 HTTPS 发送会话 Cookie',
+            '仅在使用 HTTPS 时勾选；纯 HTTP 环境开启后将无法登录')}
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>云端存储与网盘同步</h2>
+            <div class="spacer"></div>
+            <button class="ghost sm" id="s-cloud-test-btn">测试连接</button>
           </div>
-          <div class="checkbox-row">
-            <input type="checkbox" id="s-secure_cookies"${s.secure_cookies ? ' checked' : ''}>
-            <label for="s-secure_cookies">仅通过 HTTPS 发送会话 Cookie</label>
+          ${switchRow('s-cloud_backup_enabled', s.cloud_backup_enabled, '启用云端备份同步',
+            '本地备份生成后自动异步上传到云端；上传失败不影响本地备份')}
+          <div class="field">
+            <label>存储驱动</label>
+            <select id="s-cloud_provider">
+              <option value="webdav"${s.cloud_provider === 'webdav' ? ' selected' : ''}>WebDAV / AList 网关（支持百度/阿里/115等全部网盘）</option>
+              <option value="rclone"${s.cloud_provider === 'rclone' ? ' selected' : ''}>Rclone 原生驱动（需系统安装 rclone）</option>
+            </select>
           </div>
-          <div class="hint">仅在使用 HTTPS 时勾选，否则将无法登录</div>
+          <div id="cloud-webdav-fields">
+            <div class="field">
+              <label>WebDAV 服务器地址</label>
+              <input type="url" id="s-cloud_webdav_url" value="${a(s.cloud_webdav_url || '')}" placeholder="https://dav.jianguoyun.com/dav/ 或 http://ip:5244/dav/pan">
+              <div class="hint">支持坚果云、Nextcloud，或通过 AList 挂载的各类网盘</div>
+            </div>
+            <div class="grid cols-2">
+              <div class="field">
+                <label>用户名</label>
+                <input type="text" id="s-cloud_webdav_username" value="${a(s.cloud_webdav_username || '')}">
+              </div>
+              <div class="field">
+                <label>密码 / Token</label>
+                <input type="password" id="s-cloud_webdav_password" autocomplete="new-password"
+                       placeholder="${s.cloud_webdav_password_set ? '已设置，留空表示不修改' : '必填'}">
+              </div>
+            </div>
+            <div class="field">
+              <label>备份根目录名</label>
+              <input type="text" id="s-cloud_webdav_root" value="${a(s.cloud_webdav_root || 'autodeploy-backups')}">
+            </div>
+          </div>
+          <div id="cloud-rclone-fields" class="hidden">
+            <div class="field">
+              <label>Rclone 远端目标（Remote:Path）</label>
+              <input type="text" id="s-cloud_rclone_remote" value="${a(s.cloud_rclone_remote || '')}" placeholder="例如 baidu:autodeploy 或 aliyun:backups">
+            </div>
+          </div>
+          ${num('cloud_retention_count', '云端保留份数', '云端同步完成后自动清理超期的旧备份')}
+          <div id="cloud-test-result" style="margin-top:8px"></div>
         </div>
       </div>
 
@@ -2502,14 +3081,8 @@ AD.views = {};
           <div class="spacer"></div>
           <span class="faint">当前：${e(data.proxy_description || '未启用')}</span>
         </div>
-        <div class="checkbox-row">
-          <input type="checkbox" id="s-proxy_enabled"${s.proxy_enabled ? ' checked' : ''}>
-          <label for="s-proxy_enabled">为 Git 操作启用代理</label>
-        </div>
-        <div class="hint" style="margin-bottom:12px">
-          内网或跨境访问 GitHub 不稳定时启用。代理以环境变量下发给 git，
-          不会写入进程命令行，日志中的密码亦会被脱敏。
-        </div>
+        ${switchRow('s-proxy_enabled', s.proxy_enabled, '为 Git 操作启用代理',
+          '内网或跨境访问 GitHub 不稳定时启用。代理以环境变量下发给 git，不会写入进程命令行，日志中的密码亦会被脱敏')}
         <div class="grid cols-2">
           <div class="field">
             <label>代理地址</label>
@@ -2533,11 +3106,8 @@ AD.views = {};
                    placeholder="${s.proxy_password_set ? '已设置，留空表示不修改' : '可选'}">
           </div>
         </div>
-        <div class="checkbox-row">
-          <input type="checkbox" id="s-proxy_for_scripts"${s.proxy_for_scripts ? ' checked' : ''}>
-          <label for="s-proxy_for_scripts">构建脚本也使用该代理</label>
-        </div>
-        <div class="hint">勾选后 prepare/deploy 脚本中的 npm、pip 等也能联网；内网构建源通常不需要</div>
+        ${switchRow('s-proxy_for_scripts', s.proxy_for_scripts, '构建脚本也使用该代理',
+          '开启后 prepare/deploy 脚本中的 npm、pip 等也能联网；内网构建源通常不需要')}
       </div>
 
       <div class="panel">
@@ -2570,6 +3140,20 @@ AD.views = {};
         session_ttl_hours: read('#s-session_ttl_hours'),
         login_max_attempts: read('#s-login_max_attempts'),
         login_lockout_seconds: read('#s-login_lockout_seconds'),
+        backup_enabled: panel.querySelector('#s-backup_enabled').checked,
+        backup_schedule_type: panel.querySelector('#s-backup_schedule_type').value,
+        backup_schedule_expression: panel.querySelector('#s-backup_schedule_expression').value.trim(),
+        backup_retention_count: read('#s-backup_retention_count'),
+        backup_include_logs: panel.querySelector('#s-backup_include_logs').checked,
+        backup_include_artifacts: panel.querySelector('#s-backup_include_artifacts').checked,
+        cloud_backup_enabled: panel.querySelector('#s-cloud_backup_enabled').checked,
+        cloud_provider: panel.querySelector('#s-cloud_provider').value,
+        cloud_webdav_url: panel.querySelector('#s-cloud_webdav_url').value.trim(),
+        cloud_webdav_username: panel.querySelector('#s-cloud_webdav_username').value.trim(),
+        cloud_webdav_password: panel.querySelector('#s-cloud_webdav_password').value,
+        cloud_webdav_root: panel.querySelector('#s-cloud_webdav_root').value.trim(),
+        cloud_rclone_remote: panel.querySelector('#s-cloud_rclone_remote').value.trim(),
+        cloud_retention_count: read('#s-cloud_retention_count'),
         notify_webhook: panel.querySelector('#s-notify_webhook').value.trim(),
         queue_while_running: panel.querySelector('#s-queue_while_running').checked,
         trust_proxy_headers: panel.querySelector('#s-trust_proxy_headers').checked,
@@ -2599,6 +3183,48 @@ AD.views = {};
         AD.setBusy(event.currentTarget, false);
       }
     });
+
+    const providerSelect = panel.querySelector('#s-cloud_provider');
+    const davBox = panel.querySelector('#cloud-webdav-fields');
+    const rcloneBox = panel.querySelector('#cloud-rclone-fields');
+    if (providerSelect && davBox && rcloneBox) {
+      const syncProviderUI = () => {
+        const isDav = providerSelect.value === 'webdav';
+        davBox.classList.toggle('hidden', !isDav);
+        rcloneBox.classList.toggle('hidden', isDav);
+      };
+      providerSelect.addEventListener('change', syncProviderUI);
+      syncProviderUI();
+    }
+
+    const cloudTestBtn = panel.querySelector('#s-cloud-test-btn');
+    if (cloudTestBtn) {
+      cloudTestBtn.addEventListener('click', async (event) => {
+        const resultBox = panel.querySelector('#cloud-test-result');
+        const payload = {
+          provider: providerSelect.value,
+          webdav_url: panel.querySelector('#s-cloud_webdav_url').value.trim(),
+          webdav_username: panel.querySelector('#s-cloud_webdav_username').value.trim(),
+          webdav_password: panel.querySelector('#s-cloud_webdav_password').value
+            || (s.cloud_webdav_password_set ? '__SAVED__' : ''),
+          webdav_root: panel.querySelector('#s-cloud_webdav_root').value.trim(),
+          rclone_remote: panel.querySelector('#s-cloud_rclone_remote').value.trim(),
+        };
+        AD.setBusy(event.currentTarget, true, '正在测试连接…');
+        try {
+          const res = await AD.api.post('/api/backups/cloud/test', payload);
+          if (res.ok) {
+            resultBox.innerHTML = '<div class="alert success">✓ ' + e(res.message) + '</div>';
+          } else {
+            resultBox.innerHTML = '<div class="alert error">' + e(res.message) + '</div>';
+          }
+        } catch (err) {
+          resultBox.innerHTML = '<div class="alert error">测试请求失败: ' + e(err.message) + '</div>';
+        } finally {
+          AD.setBusy(event.currentTarget, false);
+        }
+      });
+    }
 
     panel.querySelector('#settings-reload').addEventListener('click', () => AD.render('settings'));
   }
@@ -2797,9 +3423,13 @@ AD.views = {};
   // ======================================================================
   // 凭据管理
   // ======================================================================
+  // 页面同时服务两种用途：拉取私有仓库（HTTPS 令牌 / Deploy Key）与登录
+  // 远程主机（authorized_keys）。SSH 私钥一钥两用，因此「被引用」列同时
+  // 统计任务与主机，「测试」按钮也按类型给出两条路径（仓库 / 主机登录）。
   AD.views.credentials = async function (container) {
     const data = await AD.api.get('/api/credentials');
     const items = data.credentials || [];
+    const sshCount = items.filter((c) => c.kind === 'ssh_key').length;
 
     container.innerHTML = `
       <div class="view-header">
@@ -2813,19 +3443,29 @@ AD.views = {};
       <div class="alert info">
         凭据集中管理后，多个任务可复用同一份令牌，轮换时只需改一处。
         密钥内容仅在保存时提交，之后不会再回传到浏览器。
+        <br>
+        <strong>HTTPS 访问令牌</strong>只用于拉取私有仓库；
+        <strong>SSH 私钥</strong>有两种互不影响的用途——登记为仓库 Deploy Key 拉取代码，
+        或加入远程主机的 <span class="code-inline">~/.ssh/authorized_keys</span> 用于登录部署。
+        同一把钥匙可以只用其中一种，也可以两种都用。
       </div>
 
       ${items.length ? `<div class="panel"><div class="table-wrap"><table>
         <thead><tr>
-          <th>名称</th><th>类型</th><th>账号 / 指纹</th><th>可用性</th><th>被引用</th><th class="right">操作</th>
+          <th>名称</th><th>类型</th><th>账号 / 指纹</th><th>仓库测试</th><th>被引用</th><th class="right">操作</th>
         </tr></thead>
         <tbody>${items.map(credentialRow).join('')}</tbody>
       </table></div></div>`
       : `<div class="panel"><div class="empty">
            <div class="big">🔑</div><h3>还没有凭据</h3>
-           <p class="faint">私有仓库或 SSH 地址需要凭据；公开仓库可以跳过</p>
+           <p class="faint">私有仓库需要访问令牌或 Deploy Key；部署到远程主机则需要 SSH 私钥。公开仓库与本机部署可以跳过</p>
            <button class="primary" id="cred-new-empty">+ 新建凭据</button>
          </div></div>`}
+
+      ${sshCount ? `<div class="alert neutral" style="margin-top:12px">
+        提示：SSH 私钥的点「测试」会先问你要测哪种用途——测仓库填仓库地址，测主机登录填地址、端口与用户名。
+        两种结论分开记录：只用于登录服务器时，仓库测试留空不影响使用。
+      </div>` : ''}
     `;
 
     container.querySelector('#cred-new')?.addEventListener('click', () => AD.openCredentialForm(null));
@@ -2838,38 +3478,66 @@ AD.views = {};
     container.querySelectorAll('[data-cred-edit]').forEach((b) =>
       b.addEventListener('click', () => AD.openCredentialForm(Number(b.dataset.credEdit))));
     container.querySelectorAll('[data-cred-test]').forEach((b) =>
-      b.addEventListener('click', () => AD.testCredential(Number(b.dataset.credTest))));
+      b.addEventListener('click', () => AD.testCredential(
+        Number(b.dataset.credTest), b.dataset.credKind || 'https_token')));
     container.querySelectorAll('[data-cred-delete]').forEach((b) =>
       b.addEventListener('click', () => AD.deleteCredential(Number(b.dataset.credDelete))));
   };
 
-  function credentialRow(item) {
-    const tested = item.last_tested_at
-      ? (item.last_test_ok
-          ? `<span class="badge on">可用</span>`
-          : `<span class="badge failed">不可用</span>`)
-        + `<div class="faint" title="${a(item.last_test_error || '')}">${e(AD.formatRelative(item.last_tested_at))}</div>`
-      : '<span class="faint">未测试</span>';
+  /** 一条测试结论徽标：at 为空显示未测，error 为空时不带 title 以免空 tooltip。 */
+  function testBadge(at, ok, error, labels) {
+    const text = labels || { ok: '可用', fail: '不可用', none: '未测试' };
+    if (!at) return `<span class="faint">${e(text.none)}</span>`;
+    const badge = ok
+      ? `<span class="badge on">${e(text.ok)}</span>`
+      : `<span class="badge failed">${e(text.fail)}</span>`;
+    const title = error ? ` title="${a(error)}"` : '';
+    return badge + `<div class="faint"${title}>${e(AD.formatRelative(at))}</div>`;
+  }
 
-    const identity = item.kind === 'ssh_key'
+  const REPO_TEST_LABELS = { ok: '可用', fail: '不可用', none: '仓库未测' };
+  const HOST_TEST_LABELS = { ok: '主机可登录', fail: '主机登录失败', none: '主机未测' };
+
+  function credentialRow(item) {
+    const isSsh = item.kind === 'ssh_key';
+    const repoTest = testBadge(item.last_tested_at, item.last_test_ok,
+      item.last_test_error, REPO_TEST_LABELS);
+    // 主机登录结论只对 SSH 私钥有意义，且不参与「仓库可用性」的判断。
+    const hostTest = isSsh
+      ? `<div style="margin-top:4px">` +
+        testBadge(item.last_host_test_at, item.last_host_test_ok,
+          item.last_host_test_error, HOST_TEST_LABELS) +
+        '</div>'
+      : '';
+
+    const identity = isSsh
       ? `<span class="mono" style="font-size:11px">${e(item.fingerprint || '（无指纹）')}</span>
          <div class="faint">用户 ${e(item.username || 'git')}</div>`
       : `<span class="mono">${e(item.username || '未指定')}</span>
          <div class="faint">令牌 ${item.secret_length || 0} 字符</div>`;
+
+    // 任务与主机两类引用都要显示：只显示任务会让「只绑主机」的私钥看起来没人用。
+    const usages = [];
+    if (item.used_by) usages.push(`<span class="badge neutral">${item.used_by} 个任务</span>`);
+    if (item.used_by_hosts) usages.push(`<span class="badge neutral">${item.used_by_hosts} 台主机</span>`);
+    const usage = usages.length ? usages.join(' ') : '<span class="faint">未使用</span>';
 
     return `<tr>
       <td>
         <div style="font-weight:500">${e(item.name)}</div>
         ${item.description ? `<div class="faint truncate" style="max-width:240px">${e(item.description)}</div>` : ''}
       </td>
-      <td><span class="badge neutral">${e(item.kind_label || item.kind)}</span></td>
+      <td>
+        <span class="badge neutral">${e(item.kind_label || item.kind)}</span>
+        <div class="faint">${isSsh ? '仓库 + 主机' : '仅仓库'}</div>
+      </td>
       <td>${identity}</td>
-      <td>${tested}</td>
-      <td>${item.used_by ? `<span class="badge neutral">${item.used_by} 个任务</span>` : '<span class="faint">未使用</span>'}</td>
+      <td>${repoTest}${hostTest}</td>
+      <td>${usage}</td>
       <td>
         <div class="table-actions">
-          ${item.kind === 'ssh_key' ? `<button class="sm" data-cred-pubkey="${item.id}">公钥</button>` : ''}
-          <button class="sm" data-cred-test="${item.id}">测试</button>
+          ${isSsh ? `<button class="sm" data-cred-pubkey="${item.id}" title="复制公钥，用于仓库 Deploy Keys 或主机 authorized_keys">公钥</button>` : ''}
+          <button class="sm" data-cred-test="${item.id}" data-cred-kind="${e(item.kind)}">测试</button>
           <button class="sm" data-cred-edit="${item.id}">编辑</button>
           <button class="sm danger" data-cred-delete="${item.id}">删除</button>
         </div>
@@ -2877,19 +3545,148 @@ AD.views = {};
     </tr>`;
   }
 
-  AD.testCredential = async function (credentialId) {
-    const repoUrl = await AD.prompt({
-      title: '测试凭据',
-      label: '用于测试的仓库地址',
-      placeholder: 'https://github.com/owner/repo.git 或 git@github.com:owner/repo.git',
-      hint: '同一个令牌对不同仓库的权限可能不同，请用真实地址测试。测试不会修改任何仓库内容。',
+  /** 查询表单化：一次问清「测仓库还是测主机」，而不是只给一个仓库地址。 */
+  function credentialTestTarget(kind, data) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let backdrop;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (backdrop) AD.Modal.remove(backdrop);
+        resolve(value);
+      };
+      const isSsh = kind === 'ssh_key';
+      // 已绑定主机的 SSH 凭据直接列出候选，避免让用户手抄地址。
+      const boundHosts = data.hosts || [];
+      const hostOptions = boundHosts.map((h, index) =>
+        `<option value="${index}"${index === 0 ? ' selected' : ''}>${e(h.name)}（${e(h.address)}）</option>`).join('');
+      backdrop = AD.Modal.open({
+        title: '测试凭据：' + (data.name || ''),
+        stack: true,
+        body: `
+          ${isSsh ? `
+          <div class="field">
+            <label>测试目标</label>
+            <select id="ct-mode">
+              <option value="repo">仓库访问（Deploy Key）</option>
+              <option value="host"${boundHosts.length ? ' selected' : ''}>主机登录（authorized_keys）</option>
+            </select>
+            <div class="hint">两者互不影响：主机登录失败不代表仓库不能用，反之亦然。</div>
+          </div>` : ''}
+          <div id="ct-repo">
+            <div class="field">
+              <label>仓库地址<span class="req">*</span></label>
+              <input type="text" id="ct-repo_url" placeholder="https://github.com/owner/repo.git 或 git@github.com:owner/repo.git">
+              <div class="hint">同一个令牌对不同仓库的权限可能不同，请用真实地址测试。测试不会修改任何仓库内容。</div>
+            </div>
+          </div>
+          ${isSsh ? `<div id="ct-host" class="hidden">
+            ${boundHosts.length ? `<div class="field">
+              <label>已绑定的主机</label>
+              <select id="ct-host-pick">${hostOptions}</select>
+              <div class="hint">选中后会自动填入下方地址，也可以手动改成别的主机。</div>
+            </div>` : ''}
+            <div class="form-grid cols-2">
+              <div class="field">
+                <label>主机地址<span class="req">*</span></label>
+                <input type="text" id="ct-address" placeholder="10.0.0.5 或 web1.example.com">
+              </div>
+              <div class="field">
+                <label>SSH 端口</label>
+                <input type="number" id="ct-port" min="1" max="65535" value="22">
+              </div>
+            </div>
+            <div class="field">
+              <label>SSH 用户名<span class="req">*</span></label>
+              <input type="text" id="ct-username" placeholder="deploy">
+              <div class="hint">必须是目标机上已存在、且 authorized_keys 里加了本凭据公钥的账号。</div>
+            </div>
+          </div>` : ''}
+          <div id="ct-error" class="alert error hidden"></div>
+        `,
+        footer: '<button data-close>取消</button><button class="primary" id="ct-run">开始测试</button>',
+        onMount(node) {
+          const modeSelect = node.querySelector('#ct-mode');
+          const applyMode = () => {
+            const mode = modeSelect ? modeSelect.value : 'repo';
+            node.querySelector('#ct-repo')?.classList.toggle('hidden', mode !== 'repo');
+            node.querySelector('#ct-host')?.classList.toggle('hidden', mode !== 'host');
+          };
+          modeSelect?.addEventListener('change', applyMode);
+          applyMode();
+
+          // 选中已绑定主机时回填地址/端口/用户名；用户手改后不再覆盖
+          // （只有下拉变更才回填）。
+          const pick = node.querySelector('#ct-host-pick');
+          const fillFromHost = () => {
+            const host = boundHosts[Number(pick ? pick.value : 0)];
+            if (!host) return;
+            node.querySelector('#ct-address').value = host.address || '';
+            node.querySelector('#ct-port').value = String(host.port || 22);
+            node.querySelector('#ct-username').value = host.username || '';
+          };
+          pick?.addEventListener('change', fillFromHost);
+          // 默认选中的是第一台已绑定主机，必须立即回填，否则用户看到空表单。
+          fillFromHost();
+
+          node.querySelector('[data-close]')?.addEventListener('click', () => finish(null));
+          node.querySelector('#ct-run')?.addEventListener('click', (event) => {
+            const mode = modeSelect ? modeSelect.value : 'repo';
+            const showError = (message) => {
+              const box = node.querySelector('#ct-error');
+              box.textContent = message;
+              box.classList.remove('hidden');
+            };
+            if (mode === 'repo') {
+              const repoUrl = node.querySelector('#ct-repo_url').value.trim();
+              if (!repoUrl) return showError('请填写仓库地址');
+              finish({ mode: 'repo', repo_url: repoUrl, button: event.currentTarget });
+              return;
+            }
+            const address = node.querySelector('#ct-address').value.trim();
+            const username = node.querySelector('#ct-username').value.trim();
+            if (!address) return showError('请填写主机地址');
+            if (!username) return showError('请填写 SSH 用户名');
+            finish({
+              mode: 'host', address,
+              port: Number(node.querySelector('#ct-port').value || 22),
+              username, button: event.currentTarget,
+            });
+          });
+        },
+      });
+      const observer = new MutationObserver(() => {
+        if (!backdrop.isConnected) { finish(null); observer.disconnect(); }
+      });
+      observer.observe(document.getElementById('modal-root'), { childList: true });
     });
-    if (!repoUrl) return;
-    const toast = AD.toast('正在测试，请稍候…', 'info', 30000);
+  }
+
+  AD.testCredential = async function (credentialId, kind) {
+    // 取详情是为了知道它绑定了哪些主机（可直接选，不用手抄地址）。
+    let data = { name: '' };
     try {
-      const result = await AD.api.post(`/api/credentials/${credentialId}/test`, { repo_url: repoUrl });
-      if (result.ok) AD.toastSuccess(result.message);
-      else AD.toastError(result.message);
+      const info = await AD.api.get(`/api/credentials/${credentialId}`);
+      data = { ...(info.credential || {}), name: (info.credential || {}).name || '' };
+    } catch (err) { /* 拿不到详情仍可手工填地址 */ }
+
+    const target = await credentialTestTarget(kind || data.kind || 'https_token', data);
+    if (!target) return;
+    const toast = AD.toast('正在测试，请稍候…', 'info', 40000);
+    try {
+      const result = target.mode === 'host'
+        ? await AD.api.post(`/api/credentials/${credentialId}/test-host`, {
+            address: target.address, port: target.port, username: target.username,
+          })
+        : await AD.api.post(`/api/credentials/${credentialId}/test`, { repo_url: target.repo_url });
+      if (result.ok) {
+        AD.toastSuccess(target.mode === 'host'
+          ? `主机登录成功：${result.target || target.address}`
+          : result.message);
+      } else {
+        AD.toastError((target.mode === 'host' ? '主机登录失败：' : '仓库测试失败：') + result.message);
+      }
       AD.render('credentials');
     } catch (err) {
       AD.toastError(err.message);
@@ -2902,10 +3699,21 @@ AD.views = {};
     try {
       const info = await AD.api.get(`/api/credentials/${credentialId}`);
       const used = info.credential.used_by || 0;
+      const usedHosts = info.credential.used_by_hosts || 0;
+      const parts = [];
       if (used > 0) {
         // 有任务在引用时，删除会让这些任务静默失去凭据，必须明确告知。
         const names = (info.credential.tasks || []).map((t) => t.name).join('、');
-        detail = `仍有 ${used} 个任务在使用该凭据（${names}）。删除后这些任务将回退使用任务内配置的令牌，可能导致部署失败。`;
+        parts.push(`${used} 个任务（${names}）将回退使用任务内配置的令牌，可能导致部署失败`);
+      }
+      if (usedHosts > 0) {
+        // 主机侧更严重：外键置空后该主机无法再登录，任务直接部署失败。
+        const hostNames = (info.credential.hosts || [])
+          .map((h) => `${h.name}（${h.address}）`).join('、');
+        parts.push(`${usedHosts} 台主机（${hostNames}）将无法登录，指向它们的部署会失败`);
+      }
+      if (parts.length) {
+        detail = `删除后：${parts.join('；')}。`;
         force = true;
       }
     } catch (err) { /* 拿不到详情就直接问 */ }
@@ -2991,7 +3799,10 @@ AD.views = {};
       <div class="field hidden" id="c-passphrase-wrap">
         <label>私钥口令</label>
         <input type="password" id="c-passphrase" autocomplete="new-password">
-        <div class="hint">私钥没有口令时留空</div>
+        <div class="hint">
+          私钥没有口令时留空。仓库拉取支持带口令的私钥；
+          <strong>登录远程主机不支持口令</strong>（容器内无法交互输入），用于主机请使用免口令密钥。
+        </div>
       </div>
       <div class="field">
         <label>备注</label>
@@ -3011,14 +3822,21 @@ AD.views = {};
     const applyKind = () => {
       const kind = kindSelect.value;
       const meta = kinds.kinds.find((k) => k.value === kind) || {};
-      backdrop.querySelector('#c-kind-hint').textContent = meta.hint || '';
+      // 类型提示带上「能用在哪些地方」：SSH 私钥一钥两用，这一点必须在
+      // 选类型的当下就可见，否则用户会以为它只服务于仓库。
+      const usages = (meta.usages || []).join('；');
+      backdrop.querySelector('#c-kind-hint').textContent =
+        (meta.hint || '') + (usages ? `（可用于：${usages}）` : '');
       const secretLabel = backdrop.querySelector('#c-secret-label');
       const secretInput = backdrop.querySelector('#c-secret');
       secretLabel.innerHTML = e(meta.secret_label || '密钥') + '<span class="req">*</span>';
       secretInput.placeholder = meta.secret_placeholder || '';
       secretInput.rows = kind === 'ssh_key' ? 6 : 2;
+      // 这个用户名只用于 git 连接（SSH 方式下固定 git）；登录主机的账号
+      // 属于主机自己的配置，写在这里会被误解成通用账号。
       backdrop.querySelector('#c-username-hint').textContent = kind === 'ssh_key'
-        ? 'SSH 地址通常使用 git，留空则默认 git' : 'GitHub 使用 x-access-token；留空则使用默认值';
+        ? '仅用于 git 连接：SSH 地址通常用 git，留空默认 git。登录主机的账号请在「主机」页按主机填写'
+        : 'GitHub 使用 x-access-token；留空则使用默认值';
       // HTTPS 令牌的内联生成指引；SSH 有自己的「自动生成密钥对」，不需要它。
       const tokenHelp = backdrop.querySelector('#c-token-help');
       tokenHelp.classList.toggle('hidden', kind !== 'https_token' || !tokenGuide);
@@ -3058,13 +3876,14 @@ AD.views = {};
         backdrop.querySelector('#c-pubkey-body').innerHTML =
           publicKeyPanel(result.public_key, result.fingerprint, {
             intro: '密钥已生成，私钥已填入下方输入框（保存后不再回传）。'
-                 + '现在请把公钥添加到 GitHub 的 Deploy Keys：',
+                 + '接下来按用途把公钥登记到对应位置——拉取私有仓库加到仓库的 Deploy Keys，'
+                 + '部署到远程主机加到目标机的 authorized_keys：',
           });
         bindPublicKeyPanel(backdrop, result.public_key);
         backdrop.querySelector('#c-username').value =
           backdrop.querySelector('#c-username').value.trim() || 'git';
         backdrop.querySelector('#c-generate-hint').textContent = '已生成，可直接保存';
-        AD.toastSuccess('密钥已生成，请复制公钥到 GitHub');
+        AD.toastSuccess('密钥已生成，请复制公钥到仓库 Deploy Keys 或目标机 authorized_keys');
       } catch (err) {
         credError(backdrop, err.message);
       }
@@ -3106,12 +3925,19 @@ AD.views = {};
   // ----------------------------------------------------------------------
   // 公钥展示：生成密钥或查看已有 SSH 凭据时复用同一块 UI。
   // 公钥不是机密，可以放心显示与复制；私钥永不进入这里。
+  //
+  // 公钥有两个落脚点，界面必须同时讲清：仓库的 Deploy Keys（拉代码）与
+  // 目标机的 authorized_keys（登录部署）。只讲前者会让「部署到远程主机」
+  // 的用户以为凭据页与主机无关。
   // ----------------------------------------------------------------------
   function publicKeyPanel(publicKey, fingerprint, options) {
     const opts = options || {};
+    const showHost = opts.showHostSteps !== false;
+    const hostTarget = opts.hostTarget || '部署账号';
     return `
       <div class="alert info">
-        ${opts.intro || '把下面这行公钥添加到 GitHub 的 Deploy Keys，私钥会安全保存在服务端。'}
+        ${opts.intro || '这行公钥要登记到使用它的地方：拉取私有仓库加到仓库的 Deploy Keys，'
+          + '登录远程主机加到目标机的 authorized_keys。私钥始终只保存在服务端。'}
       </div>
       <div class="field">
         <label>公钥（复制这一整行）</label>
@@ -3124,15 +3950,25 @@ AD.views = {};
       ${fingerprint ? `<div class="field">
         <label>指纹</label>
         <div class="mono">${e(fingerprint)}</div>
-        <div class="hint">指纹只是用来核对：与 GitHub 上显示的一致即表示两处是同一把钥匙。</div>
+        <div class="hint">指纹只是用来核对：与 GitHub / 目标机 <span class="code-inline">ssh-keygen -lf</span> 的结果一致，即表示是同一把钥匙。</div>
       </div>` : ''}
-      <div class="section-title">接下来这样配置</div>
+      <div class="section-title">用途一：拉取私有仓库</div>
       <ol class="cred-steps">
         <li>打开仓库的 <span class="code-inline">Settings → Deploy Keys → Add deploy key</span></li>
         <li>把公钥粘贴到 <span class="code-inline">Key</span> 输入框。</li>
         <li><strong>不要勾选</strong> <span class="code-inline">Allow write access</span>——部署只需要读取权限。</li>
-        <li>保存后回到本页点「测试」验证是否能连上仓库。</li>
+        <li>保存后在凭据行点「测试」→ 选「仓库访问」验证能否连上。</li>
       </ol>
+      ${showHost ? `
+      <div class="section-title">用途二：登录远程主机</div>
+      <ol class="cred-steps">
+        <li>把公钥追加到${e(hostTarget)}的 <span class="code-inline">~/.ssh/authorized_keys</span>：
+          可先保存为本地文件再执行 <span class="code-inline">ssh-copy-id -i 公钥文件 ${e(opts.copyIdTarget || 'deploy@目标地址')}</span>，
+          或直接登录目标机把这一整行粘贴进 <span class="code-inline">~/.ssh/authorized_keys</span>。</li>
+        <li>确认目标机 <span class="code-inline">/etc/ssh/sshd_config</span> 中 <span class="code-inline">PubkeyAuthentication yes</span>，改过则 reload sshd。</li>
+        <li>到「主机」页添加主机并绑定本凭据，或直接在凭据行点「测试」→ 选「主机登录」先验证。</li>
+      </ol>
+      <div class="hint">两种用途互不影响：只加了 Deploy Keys 就只测仓库；只加了 authorized_keys 就只测主机登录。</div>` : ''}
     `;
   }
 
@@ -3140,11 +3976,11 @@ AD.views = {};
     backdrop.querySelector('#pk-copy')?.addEventListener('click', async () => {
       await AD.copyToClipboard(publicKey);
       const note = backdrop.querySelector('#pk-copied');
-      if (note) note.textContent = '已复制，去 GitHub 粘贴即可';
+      if (note) note.textContent = '已复制，粘到仓库 Deploy Keys 或目标机 authorized_keys 即可';
     });
   }
 
-  /** 查看已有 SSH 凭据的公钥，便于重新添加 Deploy Key 或核对指纹。 */
+  /** 查看已有 SSH 凭据的公钥，便于重新添加 Deploy Key / authorized_keys 或核对指纹。 */
   AD.showCredentialPublicKey = async function (credentialId) {
     let data;
     try {
@@ -3153,37 +3989,47 @@ AD.views = {};
     const backdrop = AD.Modal.open({
       title: 'SSH 公钥',
       body: '<div id="pk-body">' + publicKeyPanel(data.public_key, data.fingerprint, {
-        intro: '这是该凭据对应的公钥。如果服务器已重装或 GitHub 上的 Deploy Key 被删除，'
-             + '可以重新复制这行公钥添加回去，无需更换凭据。',
+        intro: '这是该凭据对应的公钥。服务器已重装、GitHub 上的 Deploy Key 被删除、'
+             + '或目标机 authorized_keys 丢失时，都可以重新复制这行公钥添加回去，无需更换凭据。',
       }) + '</div>',
       footer: '<button data-close>关闭</button>',
     });
     bindPublicKeyPanel(backdrop, data.public_key);
   };
 
-  /** 凭据获取指引：把「去哪点、要什么权限」讲清楚。 */
+  /** 凭据获取指引：把「去哪点、要什么权限、用在哪」讲清楚。 */
   AD.openCredentialGuide = async function () {
     let guide;
     try { guide = await AD.api.get('/api/credentials/guide'); }
     catch (err) { AD.toastError(err.message); return; }
 
+    // usages：这种凭据能用在哪些地方；host_steps：SSH 私钥登录主机的步骤。
+    // 两者都由后端提供，界面不重复维护这些会随平台改版的说明。
     const section = (item) => `
       <div class="cred-guide-block">
         <h3>${e(item.label)}<span class="badge neutral" style="margin-left:8px">${e(item.best_for)}</span></h3>
+        ${item.usages && item.usages.length ? `<div class="hint" style="margin-bottom:10px">
+          <div><strong>可用于：</strong>${item.usages.map((u) => e(u)).join('；')}</div>
+        </div>` : ''}
         <div class="field">
           <label>在 GitHub 上操作</label>
           <div><a class="code-inline" href="${a(item.create_url)}" target="_blank" rel="noopener noreferrer">${e(item.create_url)}</a></div>
           <div class="hint">在新标签页打开。${item.create_url.includes('REPO_OWNER')
             ? '把链接里的 REPO_OWNER/REPO_NAME 换成你自己的仓库路径。' : ''}</div>
         </div>
+        <div class="section-title" style="margin-top:4px">用于拉取私有仓库</div>
         <ol class="cred-steps">${item.steps.map((s) => `<li>${e(s)}</li>`).join('')}</ol>
+        ${item.host_steps && item.host_steps.length ? `
+          <div class="section-title" style="margin-top:14px">用于登录远程主机（不碰仓库也能这样用）</div>
+          <ol class="cred-steps">${item.host_steps.map((s) => `<li>${e(s)}</li>`).join('')}</ol>
+        ` : ''}
         <div class="hint" style="margin-top:8px">
           ${item.notes.map((n) => `<div>· ${e(n)}</div>`).join('')}
         </div>
       </div>`;
 
     const backdrop = AD.Modal.open({
-      title: '如何获取仓库凭据',
+      title: '如何获取与登记凭据',
       size: 'wide',
       body: `<div class="alert info">${e(guide.intro)}</div>
              ${guide.kinds.map(section).join('<div class="divider"></div>')}`,
@@ -3852,4 +4698,1579 @@ AD.views = {};
     });
   }
 
+  // ======================================================================
+  // 监控中心：主机与任务资源监控 (Beszel 风格现代设计)
+  // ======================================================================
+  AD.views.monitor = async function (container) {
+    let currentRange = '1h';
+    let host = null;
+    let tasks = [];
+    let history = [];
+    let containerHistory = { timestamps: [], containers: [] };
+
+    try {
+      [host, tasks, history, containerHistory] = await Promise.all([
+        AD.api.get('/api/monitor/host'),
+        AD.api.get('/api/monitor/tasks'),
+        AD.api.get('/api/monitor/history?range=1h&limit=360'),
+        AD.api.get('/api/monitor/containers/history?range=1h'),
+      ]);
+    } catch (err) {
+      container.innerHTML = `<div class="panel"><div class="alert error">加载监控数据失败：${e(err.message)}</div></div>`;
+      return;
+    }
+
+    container.innerHTML = `
+      <div class="view-header">
+        <h1>系统与任务监控</h1>
+        <div class="spacer"></div>
+        <div class="time-range-group" id="mon-time-ranges">
+          <button class="time-range-btn active" data-range="1h">1小时</button>
+          <button class="time-range-btn" data-range="24h">24小时</button>
+          <button class="time-range-btn" data-range="7d">7天</button>
+        </div>
+        <span class="faint" id="mon-uptime">运行时间：${formatDuration(host.uptime_seconds)}</span>
+        <button class="ghost sm" id="mon-refresh-btn">刷新</button>
+      </div>
+
+      <div class="grid cols-4" id="mon-cards" style="margin-bottom:16px">
+        ${renderHostCardsHtml(host)}
+      </div>
+
+      <!-- Beszel 风格 2 列核心指标时序图卡片阵列 -->
+      <div class="monitor-chart-grid" id="mon-chart-grid">
+        ${renderBeszelChartCardsHtml(history, host)}
+      </div>
+
+      <!-- 容器维度时序：与宿主机图表同一套时间区间与交互 -->
+      <div class="monitor-section-head">
+        <h2>容器资源监控</h2>
+        <span class="faint" id="mon-container-hint">按 Docker 容器统计 CPU、内存、磁盘 I/O 与带宽</span>
+      </div>
+      <div class="monitor-chart-grid" id="mon-container-grid">
+        ${renderContainerChartCardsHtml(containerHistory)}
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>任务资源占用</h2>
+          <div class="spacer"></div>
+          <span class="faint" id="mon-task-count">共 ${tasks.length} 个任务</span>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>任务名称</th>
+                <th>部署方式</th>
+                <th>容器状态</th>
+                <th>CPU 占比</th>
+                <th>内存占用</th>
+                <th>网络 I/O</th>
+                <th>容器明细</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="mon-tasks-body">
+              ${renderTaskRowsHtml(tasks)}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+
+    // 绑定多图十字游标交互（宿主机与容器两组图表各自独立联动）
+    bindChartGrid(container.querySelector('#mon-chart-grid'), hostChartSpecs(history, host));
+    bindChartGrid(container.querySelector('#mon-container-grid'), containerChartSpecs(containerHistory));
+
+    // 任务行点击：从右侧滑出资源与日志抽屉。
+    const bindTaskRows = () => {
+      container.querySelectorAll('tr.mon-task-row').forEach((row) => {
+        const open = () => {
+          const taskId = Number(row.dataset.monTask);
+          const mon = tasks.find((t) => Number(t.task_id) === taskId);
+          if (!mon) return;
+          // 先开抽屉：它会清掉旧抽屉所占行的 is-open，之后再标记当前行，
+          // 否则重复点击同一行时标记会被立刻擦掉。
+          AD.openTaskDrawer(mon);
+          container.querySelectorAll('tr.mon-task-row.is-open')
+            .forEach((r) => r.classList.remove('is-open'));
+          row.classList.add('is-open');
+        };
+        row.addEventListener('click', open);
+        row.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            open();
+          }
+        });
+      });
+    };
+    bindTaskRows();
+
+    // 时间范围切换
+    container.querySelectorAll('.time-range-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const range = btn.dataset.range;
+        if (range === currentRange) return;
+        currentRange = range;
+        container.querySelectorAll('.time-range-btn').forEach((b) => {
+          b.classList.toggle('active', b.dataset.range === currentRange);
+        });
+        await reloadHistory();
+      });
+    });
+
+    async function reloadHistory() {
+      try {
+        const [nextHistory, nextContainers] = await Promise.all([
+          AD.api.get(`/api/monitor/history?range=${currentRange}&limit=360`),
+          AD.api.get(`/api/monitor/containers/history?range=${currentRange}`),
+        ]);
+        history = nextHistory;
+        containerHistory = nextContainers;
+        paintChartGrids();
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    // 两组图表都按同一时间区间重绘：时间选择器只应有一个，行为自然一致。
+    function paintChartGrids() {
+      const grid = container.querySelector('#mon-chart-grid');
+      if (grid) {
+        grid.innerHTML = renderBeszelChartCardsHtml(history, host);
+        bindChartGrid(grid, hostChartSpecs(history, host));
+      }
+      const containerGrid = container.querySelector('#mon-container-grid');
+      if (containerGrid) {
+        containerGrid.innerHTML = renderContainerChartCardsHtml(containerHistory);
+        bindChartGrid(containerGrid, containerChartSpecs(containerHistory));
+      }
+      const hint = container.querySelector('#mon-container-hint');
+      if (hint) {
+        const total = ((containerHistory && containerHistory.containers) || []).length;
+        hint.textContent = total
+          ? `按 Docker 容器统计 CPU、内存、磁盘 I/O 与带宽，共 ${total} 个容器`
+          : '按 Docker 容器统计 CPU、内存、磁盘 I/O 与带宽（暂无容器）';
+      }
+    }
+
+    async function poll() {
+      if (AD.state.currentView !== 'monitor') return;
+      try {
+        const [h, t] = await Promise.all([
+          AD.api.get('/api/monitor/host'),
+          AD.api.get('/api/monitor/tasks'),
+        ]);
+        host = h;
+        tasks = t;
+
+        const cards = container.querySelector('#mon-cards');
+        if (cards) cards.innerHTML = renderHostCardsHtml(host);
+
+        const uptimeEl = container.querySelector('#mon-uptime');
+        if (uptimeEl) uptimeEl.textContent = `运行时间：${formatDuration(host.uptime_seconds)}`;
+
+        const tasksBody = container.querySelector('#mon-tasks-body');
+        if (tasksBody) {
+          // 优先就地更新：整表重建会销毁用户正在点击/阅读的行节点。
+          if (!updateTaskRowsInPlace(tasksBody, tasks)) {
+            tasksBody.innerHTML = renderTaskRowsHtml(tasks);
+            // 只有整表重建才需要重新绑定（行节点换了）。
+            bindTaskRows();
+          }
+          if (taskDrawer && taskDrawer.alive) {
+            const openRow = container.querySelector(`tr[data-mon-task="${taskDrawer.taskId}"]`);
+            if (openRow) openRow.classList.add('is-open');
+          }
+        }
+
+        const taskCount = container.querySelector('#mon-task-count');
+        if (taskCount) taskCount.textContent = `共 ${tasks.length} 个任务`;
+
+        // 若当前在 1 小时视图，定期刷新历史图表以滚动展示最新时序。
+        // 24h / 7d 的落库粒度是 5 分钟以上，4 秒轮询重拉没有新点，只按需刷新。
+        if (currentRange === '1h') {
+          const [nextHistory, nextContainers] = await Promise.all([
+            AD.api.get('/api/monitor/history?range=1h&limit=360'),
+            AD.api.get('/api/monitor/containers/history?range=1h'),
+          ]);
+          history = nextHistory;
+          containerHistory = nextContainers;
+          paintChartGrids();
+        }
+      } catch (e) {
+        /* background polling error ignored */
+      }
+    }
+
+    let pollTimer = setInterval(poll, 4000);
+    AD.state.viewRefresh = async () => {
+      await poll();
+    };
+
+    const refreshBtn = container.querySelector('#mon-refresh-btn');
+    if (refreshBtn) {
+      refreshBtn.addEventListener('click', async () => {
+        AD.setBusy(refreshBtn, true, '刷新中…');
+        await Promise.all([poll(), reloadHistory()]);
+        AD.setBusy(refreshBtn, false);
+      });
+    }
+
+    // 视图切换时注销定时器
+    const origRefresh = AD.state.viewRefresh;
+    AD.state.viewRefresh = async () => {
+      if (AD.state.currentView !== 'monitor') {
+        clearInterval(pollTimer);
+        return;
+      }
+      if (origRefresh) await origRefresh();
+    };
+  };
+
+  function toneForPercent(p) {
+    if (p >= 85) return 'danger';
+    if (p >= 70) return 'warning';
+    return '';
+  }
+
+  function formatDuration(sec) {
+    sec = Math.floor(sec || 0);
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return `${d}天 ${h}小时 ${m}分`;
+    if (h > 0) return `${h}小时 ${m}分`;
+    return `${m}分钟`;
+  }
+
+  function renderHostCardsHtml(host) {
+    const cpuTone = toneForPercent(host.cpu_percent);
+    const memTone = toneForPercent(host.memory_percent);
+    const diskTone = toneForPercent(host.disk_percent);
+
+    return `
+      <div class="panel monitor-card">
+        <div class="panel-head"><h2>CPU 概况</h2></div>
+        <div class="monitor-metric">
+          <span class="monitor-val ${cpuTone}">${host.cpu_percent}%</span>
+          <span class="monitor-unit">${host.cpu_cores} 核</span>
+        </div>
+        <div class="monitor-bar">
+          <div class="monitor-bar-fill ${cpuTone}" style="width:${Math.min(100, host.cpu_percent)}%"></div>
+        </div>
+        <div class="monitor-sub">
+          <span>负载: ${host.load_avg.join(', ')}</span>
+        </div>
+      </div>
+
+      <div class="panel monitor-card">
+        <div class="panel-head"><h2>内存概况</h2></div>
+        <div class="monitor-metric">
+          <span class="monitor-val ${memTone}">${host.memory_percent}%</span>
+          <span class="monitor-unit">${AD.formatBytes(host.memory_used)} / ${AD.formatBytes(host.memory_total)}</span>
+        </div>
+        <div class="monitor-bar">
+          <div class="monitor-bar-fill ${memTone}" style="width:${Math.min(100, host.memory_percent)}%"></div>
+        </div>
+        <div class="monitor-sub">
+          <span>可用: ${AD.formatBytes(host.memory_free)}</span>
+          ${host.swap_total > 0 ? `<span>Swap: ${host.swap_percent}%</span>` : ''}
+        </div>
+      </div>
+
+      <div class="panel monitor-card">
+        <div class="panel-head"><h2>存储占用</h2></div>
+        <div class="monitor-metric">
+          <span class="monitor-val ${diskTone}">${host.disk_percent}%</span>
+          <span class="monitor-unit">${AD.formatBytes(host.disk_used)} / ${AD.formatBytes(host.disk_total)}</span>
+        </div>
+        <div class="monitor-bar">
+          <div class="monitor-bar-fill ${diskTone}" style="width:${Math.min(100, host.disk_percent)}%"></div>
+        </div>
+        <div class="monitor-sub">
+          <span>剩余: ${AD.formatBytes(host.disk_free)}</span>
+          <span title="AutoDeploy 自身数据目录（数据库、日志、发布产物）">应用数据: ${AD.formatBytes(host.app_data_bytes || 0)}</span>
+        </div>
+      </div>
+
+      <div class="panel monitor-card">
+        <div class="panel-head"><h2>系统环境</h2></div>
+        <div class="monitor-metric">
+          <span class="monitor-val" style="font-size:18px;font-family:inherit" title="${a(host.hostname)}">${e(host.hostname)}</span>
+        </div>
+        <div class="monitor-sub" style="margin-top:auto">
+          <span class="truncate faint" title="${a(host.os_name)}">${e(host.os_name)}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  // ----------------------------------------------------------------------
+  // Beszel 风格现代时序图渲染引擎
+  // ----------------------------------------------------------------------
+
+  // 容器曲线配色：同一容器在所有容器图表里保持同色，便于横向对照。
+  const CONTAINER_COLORS = [
+    '#4c8dff', '#ffaa33', '#3fb950', '#bc8cff', '#f85149', '#58a6ff',
+    '#d29922', '#39c5cf', '#ff7b72', '#a5d6ff', '#8ddb8c', '#d2a8ff',
+  ];
+
+  // 宿主机四张卡的规格。series 的 values 与 timestamps 一一对应。
+  function hostChartSpecs(history, host) {
+    const timestamps = (history || []).map((pt) => pt.timestamp);
+    const pick = (key) => (history || []).map((pt) => Number(pt[key] || 0));
+    return [
+      {
+        id: 'chart-cpu',
+        title: 'CPU 使用率',
+        currentDisplay: `${host.cpu_percent}%`,
+        subInfo: `负载: ${host.load_avg.join(', ')}`,
+        timestamps,
+        series: [{ name: 'CPU 使用率', color: '#4c8dff', unit: '%', values: pick('cpu_percent') }],
+        fixedMax: 100,
+        yTickFormatter: (v) => `${Math.round(v)}%`,
+      },
+      {
+        id: 'chart-mem',
+        title: '内存使用',
+        currentDisplay: `${host.memory_percent}%`,
+        subInfo: `${AD.formatBytes(host.memory_used)} / ${AD.formatBytes(host.memory_total)}`,
+        timestamps,
+        series: [{ name: '内存使用', color: '#ffaa33', unit: '%', values: pick('memory_percent') }],
+        fixedMax: 100,
+        yTickFormatter: (v) => `${Math.round(v)}%`,
+      },
+      {
+        id: 'chart-disk-io',
+        title: '磁盘 I/O 吞吐',
+        currentDisplay: `R: ${formatRate(host.disk_read_rate || 0)} / W: ${formatRate(host.disk_write_rate || 0)}`,
+        subInfo: '系统级块设备实时吞吐',
+        timestamps,
+        series: [
+          { name: '读取速度', color: '#3fb950', unit: 'KB/s', values: pick('disk_read_rate') },
+          { name: '写入速度', color: '#f85149', unit: 'KB/s', values: pick('disk_write_rate') },
+        ],
+        yTickFormatter: (v) => formatRate(v),
+      },
+      {
+        id: 'chart-net-io',
+        title: '网络带宽',
+        currentDisplay: `↓ ${formatRate(host.net_rx_rate || 0)} / ↑ ${formatRate(host.net_tx_rate || 0)}`,
+        subInfo: '网卡实时收发流量速率',
+        timestamps,
+        series: [
+          { name: '接收 (下载)', color: '#58a6ff', unit: 'KB/s', values: pick('net_rx_rate') },
+          { name: '发送 (上传)', color: '#bc8cff', unit: 'KB/s', values: pick('net_tx_rate') },
+        ],
+        yTickFormatter: (v) => formatRate(v),
+      },
+    ];
+  }
+
+  // 容器四张卡：每个容器一条线。磁盘/带宽按「读+写」「收+发」合计成一条线，
+  // 悬停明细里再拆开显示，避免同一容器出现两条容易被误读的曲线。
+  function containerChartSpecs(data) {
+    const timestamps = (data && data.timestamps) || [];
+    const containers = (data && data.containers) || [];
+    const column = (c, keys) => timestamps.map((_, i) => {
+      const values = keys.map((key) => c[key] && c[key][i]);
+      if (values.every((v) => v === null || v === undefined)) return null;
+      return values.reduce((sum, v) => sum + Number(v || 0), 0);
+    });
+    const latest = (c, keys) => {
+      for (let i = timestamps.length - 1; i >= 0; i -= 1) {
+        const values = keys.map((key) => c[key] && c[key][i]);
+        if (values.some((v) => v !== null && v !== undefined)) {
+          return values.reduce((sum, v) => sum + Number(v || 0), 0);
+        }
+      }
+      return 0;
+    };
+    const seriesFor = (keys) => containers.map((c, index) => ({
+      name: c.name || c.id.slice(0, 12),
+      color: CONTAINER_COLORS[index % CONTAINER_COLORS.length],
+      values: column(c, keys),
+    }));
+
+    return [
+      {
+        id: 'chart-container-cpu',
+        title: '容器 CPU 使用',
+        currentDisplay: `合计 ${(containers.reduce((s, c) => s + latest(c, ['cpu_percent']), 0)).toFixed(1)}%`,
+        subInfo: `${containers.length} 个容器`,
+        timestamps,
+        series: seriesFor(['cpu_percent']),
+        yTickFormatter: (v) => `${Math.round(v)}%`,
+        emptyText: '暂无容器数据（未查询到 Docker 容器或 Docker 不可用）',
+      },
+      {
+        id: 'chart-container-mem',
+        title: '容器内存占用',
+        currentDisplay: `合计 ${AD.formatBytes(containers.reduce((s, c) => s + latest(c, ['memory_bytes']), 0))}`,
+        subInfo: `${containers.length} 个容器`,
+        timestamps,
+        series: seriesFor(['memory_bytes']),
+        yTickFormatter: (v) => AD.formatBytes(v),
+        emptyText: '暂无容器数据（未查询到 Docker 容器或 Docker 不可用）',
+      },
+      {
+        id: 'chart-container-disk',
+        title: '容器磁盘 I/O',
+        currentDisplay: `合计 ${formatRate(containers.reduce((s, c) => s + latest(c, ['disk_read_rate', 'disk_write_rate']), 0))}`,
+        subInfo: '读 + 写吞吐，悬停查看明细',
+        timestamps,
+        series: seriesFor(['disk_read_rate', 'disk_write_rate']),
+        yTickFormatter: (v) => formatRate(v),
+        emptyText: '暂无容器数据（未查询到 Docker 容器或 Docker 不可用）',
+      },
+      {
+        id: 'chart-container-net',
+        title: '容器网络带宽',
+        currentDisplay: `合计 ${formatRate(containers.reduce((s, c) => s + latest(c, ['net_rx_rate', 'net_tx_rate']), 0))}`,
+        subInfo: '接收 + 发送，悬停查看明细',
+        timestamps,
+        series: seriesFor(['net_rx_rate', 'net_tx_rate']),
+        yTickFormatter: (v) => formatRate(v),
+        emptyText: '暂无容器数据（未查询到 Docker 容器或 Docker 不可用）',
+      },
+    ];
+  }
+
+  function renderChartCardsHtml(specs) {
+    return specs.map(renderSingleChartCard).join('');
+  }
+
+  // 兼容旧调用点：宿主机图表曾经直接用 history 渲染。
+  function renderBeszelChartCardsHtml(history, host) {
+    return renderChartCardsHtml(hostChartSpecs(history, host));
+  }
+
+  function renderContainerChartCardsHtml(data) {
+    return renderChartCardsHtml(containerChartSpecs(data));
+  }
+
+
+  function formatRate(kbps) {
+    kbps = Number(kbps || 0);
+    if (kbps >= 1024 * 1024) return (kbps / 1024 / 1024).toFixed(1) + ' GB/s';
+    if (kbps >= 1024) return (kbps / 1024).toFixed(1) + ' MB/s';
+    return kbps.toFixed(1) + ' KB/s';
+  }
+
+  // 把 values 数组切成连续的非空片段：容器中途重启会留下 null 空洞，
+  // 直接连线会把空白时间伪装成一条陡峭的斜线。
+  function splitSegments(points) {
+    const segments = [];
+    let current = [];
+    points.forEach((point) => {
+      if (point === null) {
+        if (current.length > 1) segments.push(current);
+        current = [];
+      } else {
+        current.push(point);
+      }
+    });
+    if (current.length > 1) segments.push(current);
+    return segments;
+  }
+
+  function renderSingleChartCard(cfg) {
+    const { id, title, currentDisplay, subInfo, timestamps, series, fixedMax, yTickFormatter, emptyText } = cfg;
+
+    if (!timestamps || timestamps.length < 2) {
+      return `
+        <div class="chart-card" id="${id}" data-chart-id="${id}">
+          <div class="chart-card-head">
+            <span class="chart-card-title">${e(title)}</span>
+            <span class="chart-card-value">${e(currentDisplay)}</span>
+          </div>
+          <div class="chart-box-wrap" style="display:flex;align-items:center;justify-content:center">
+            <span class="faint">${e(emptyText || '正在积累时序采样数据…')}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    const width = 600;
+    const height = 150;
+    const paddingLeft = 40;
+    const paddingRight = 15;
+    const paddingTop = 12;
+    const paddingBottom = 22;
+
+    const plotW = width - paddingLeft - paddingRight;
+    const plotH = height - paddingTop - paddingBottom;
+    const count = timestamps.length;
+
+    // 计算 Y 轴最大值
+    let maxVal = fixedMax || 1;
+    if (!fixedMax) {
+      maxVal = 0;
+      series.forEach((s) => {
+        (s.values || []).forEach((v) => {
+          const value = Number(v || 0);
+          if (value > maxVal) maxVal = value;
+        });
+      });
+      if (maxVal <= 0) maxVal = 1;
+      maxVal = maxVal * 1.15; // 留 15% 顶部余量
+    }
+
+    const getX = (i) => paddingLeft + (i / (count - 1)) * plotW;
+    const getY = (val) => paddingTop + plotH - (Math.min(maxVal, Math.max(0, val)) / maxVal) * plotH;
+    const yBase = paddingTop + plotH;
+
+    // 构建各 Series 的平滑三次贝塞尔曲线及面积渐变
+    let gradientsHtml = '';
+    let pathsHtml = '';
+    // 多序列（容器）叠面积会互相遮挡，只有单序列图保留填充。
+    const withFill = series.length === 1;
+
+    series.forEach((s, sIdx) => {
+      const gradId = `${id}-grad-${sIdx}`;
+      if (withFill) {
+        gradientsHtml += `
+          <linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="${s.color}" stop-opacity="0.32" />
+            <stop offset="100%" stop-color="${s.color}" stop-opacity="0.02" />
+          </linearGradient>
+        `;
+      }
+
+      const points = (s.values || []).map((value, i) => (
+        value === null || value === undefined ? null : { x: getX(i), y: getY(Number(value) || 0) }
+      ));
+      splitSegments(points).forEach((segment) => {
+        const splinePath = buildSmoothSplinePath(segment);
+        if (!splinePath) return;
+        if (withFill) {
+          const areaPath = `${splinePath} L ${segment[segment.length - 1].x} ${yBase} L ${segment[0].x} ${yBase} Z`;
+          pathsHtml += `<path d="${areaPath}" fill="url(#${gradId})" />`;
+        }
+        pathsHtml += `
+          <path d="${splinePath}" fill="none" stroke="${s.color}" stroke-width="${series.length > 2 ? 1.6 : 2}" stroke-linecap="round" stroke-linejoin="round" />
+        `;
+      });
+    });
+
+    // 刻度标签
+    const tickMidVal = maxVal / 2;
+    const tickTopLabel = yTickFormatter ? yTickFormatter(maxVal) : Math.round(maxVal);
+    const tickMidLabel = yTickFormatter ? yTickFormatter(tickMidVal) : Math.round(tickMidVal);
+
+    // X 轴起始与结束时间标签（跨天时带日期）
+    const crossesDay = timeLabelCrossesDay(timestamps);
+    const startTimeStr = formatTimeLabel(timestamps[0], crossesDay);
+    const endTimeStr = formatTimeLabel(timestamps[timestamps.length - 1], crossesDay);
+
+    // 容器图例可能长长一串，最多列 6 个，其余折叠成计数。
+    const legendItems = series.length > 6 ? series.slice(0, 6) : series;
+    const legendHtml = legendItems.map((s) => `
+      <span style="display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--text-dim)">
+        <span class="chart-dot" style="background:${s.color}"></span> ${e(s.name)}
+      </span>
+    `).join(' ');
+    const moreHtml = series.length > 6
+      ? `<span class="faint" style="font-size:11.5px">+${series.length - 6}</span>`
+      : '';
+
+    return `
+      <div class="chart-card" id="${id}" data-chart-id="${id}">
+        <div class="chart-card-head">
+          <div>
+            <div class="chart-card-title">
+              <span>${e(title)}</span>
+              ${legendHtml}
+              ${moreHtml}
+            </div>
+            ${subInfo ? `<div class="faint" style="font-size:11.5px;margin-top:2px">${e(subInfo)}</div>` : ''}
+          </div>
+          <span class="chart-card-value">${e(currentDisplay)}</span>
+        </div>
+        <div class="chart-box-wrap" data-wrap-id="${id}">
+          <svg class="chart-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+            <defs>
+              ${gradientsHtml}
+            </defs>
+
+            <!-- 水平刻度参考线 -->
+            <line x1="${paddingLeft}" y1="${paddingTop}" x2="${width - paddingRight}" y2="${paddingTop}" stroke="rgba(255,255,255,0.06)" stroke-dasharray="3,3" />
+            <line x1="${paddingLeft}" y1="${getY(tickMidVal)}" x2="${width - paddingRight}" y2="${getY(tickMidVal)}" stroke="rgba(255,255,255,0.06)" stroke-dasharray="3,3" />
+            <line x1="${paddingLeft}" y1="${yBase}" x2="${width - paddingRight}" y2="${yBase}" stroke="rgba(255,255,255,0.08)" />
+
+            <!-- Y 轴文字标签 -->
+            <text x="${paddingLeft - 6}" y="${paddingTop + 4}" fill="#6b7280" font-size="9.5" text-anchor="end">${e(tickTopLabel)}</text>
+            <text x="${paddingLeft - 6}" y="${getY(tickMidVal) + 3}" fill="#6b7280" font-size="9.5" text-anchor="end">${e(tickMidLabel)}</text>
+            <text x="${paddingLeft - 6}" y="${yBase + 3}" fill="#6b7280" font-size="9.5" text-anchor="end">0</text>
+
+            <!-- X 轴时间标签 -->
+            <text x="${paddingLeft}" y="${height - 6}" fill="#6b7280" font-size="9.5" text-anchor="start">${e(startTimeStr)}</text>
+            <text x="${width - paddingRight}" y="${height - 6}" fill="#6b7280" font-size="9.5" text-anchor="end">${e(endTimeStr)}</text>
+
+            <!-- 数据路径渲染 -->
+            ${pathsHtml}
+
+            <!-- 交互十字光标虚线与高亮圆点（初始隐藏） -->
+            <line class="chart-crosshair-line" x1="-100" y1="${paddingTop}" x2="-100" y2="${yBase}" style="display:none" />
+            ${series.map((s, idx) => `<circle class="chart-indicator-dot dot-${idx}" cx="-100" cy="-100" r="4" fill="${s.color}" stroke="#161b22" stroke-width="2" style="display:none" />`).join('')}
+          </svg>
+          <div class="chart-tooltip" style="display:none"></div>
+        </div>
+      </div>
+    `;
+  }
+
+  function formatTimeLabel(isoStr, withDate = false) {
+    if (!isoStr) return '';
+    try {
+      const d = new Date(isoStr);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      if (withDate) {
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${month}-${day} ${hh}:${mm}`;
+      }
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      return `${hh}:${mm}:${ss}`;
+    } catch {
+      return '';
+    }
+  }
+
+  // 跨越午夜时必须带日期：只显示时分秒会让 24h / 7d 的横轴看起来「时间倒流」
+  //（左端 12:40、右端 12:35），实际是跨了两天。
+  function timeLabelCrossesDay(timestamps) {
+    if (!timestamps || timestamps.length < 2) return false;
+    const first = new Date(timestamps[0]);
+    const last = new Date(timestamps[timestamps.length - 1]);
+    return first.toDateString() !== last.toDateString();
+  }
+
+  // 三次贝塞尔曲线平滑算法 (Cubic Spline Smoothing)
+  function buildSmoothSplinePath(pts) {
+    if (pts.length <= 1) return '';
+    if (pts.length === 2) {
+      return `M ${pts[0].x} ${pts[0].y} L ${pts[1].x} ${pts[1].y}`;
+    }
+    let d = `M ${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = i > 0 ? pts[i - 1] : pts[i];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = i < pts.length - 2 ? pts[i + 2] : p2;
+
+      const cp1x = p1.x + (p2.x - p0.x) / 6;
+      const cp1y = p1.y + (p2.y - p0.y) / 6;
+      const cp2x = p2.x - (p3.x - p1.x) / 6;
+      const cp2y = p2.y - (p3.y - p1.y) / 6;
+
+      d += ` C ${cp1x.toFixed(1)} ${cp1y.toFixed(1)}, ${cp2x.toFixed(1)} ${cp2y.toFixed(1)}, ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
+    }
+    return d;
+  }
+
+  // 跨图表悬停十字联动引擎 (Crosshair Sync)
+  // 图表联动：同一网格内的所有卡片共享一个时间索引。
+  // 规格（series 值数组 + 格式化）挂在每个 wrap 元素上，宿主与容器图
+  // 只是 spec 不同，交互逻辑完全一致。
+  function bindChartGrid(gridEl, specs) {
+    if (!gridEl || !specs || !specs.length) return;
+    const usable = specs.filter((s) => s.timestamps && s.timestamps.length >= 2);
+    if (!usable.length) return;
+
+    const specById = new Map(usable.map((spec) => [spec.id, spec]));
+    const wraps = Array.from(gridEl.querySelectorAll('.chart-box-wrap'))
+      .filter((wrap) => specById.has(wrap.dataset.wrapId));
+    if (!wraps.length) return;
+
+    const width = 600;
+    const height = 150;
+    const paddingLeft = 40;
+    const paddingRight = 15;
+    const paddingTop = 12;
+    const paddingBottom = 22;
+    const plotW = width - paddingLeft - paddingRight;
+    const plotH = height - paddingTop - paddingBottom;
+
+    const specOf = (wrap) => specById.get(wrap.dataset.wrapId);
+
+    // 各图时间轴长度可能不同（容器采样更疏），按归一化比例映射到同一索引。
+    function entryAt(spec, ratio, refTimestamps, refIndex) {
+      const count = spec.timestamps.length;
+      if (refTimestamps && refTimestamps.length === count) return refIndex;
+      const wanted = refTimestamps ? refTimestamps[refIndex] : null;
+      if (wanted) {
+        let best = -1;
+        for (let i = 0; i < count; i += 1) {
+          if (spec.timestamps[i] <= wanted) best = i;
+          else break;
+        }
+        if (best >= 0) return best;
+      }
+      return Math.min(count - 1, Math.max(0, Math.round(ratio * (count - 1))));
+    }
+
+    function maxOf(spec) {
+      if (spec.fixedMax) return spec.fixedMax;
+      let max = 0;
+      spec.series.forEach((s) => {
+        (s.values || []).forEach((v) => {
+          if (v !== null && v !== undefined && Number(v) > max) max = Number(v);
+        });
+      });
+      return max > 0 ? max * 1.15 : 1;
+    }
+
+    function yOf(spec, value) {
+      const max = maxOf(spec);
+      return paddingTop + plotH - (Math.min(max, Math.max(0, Number(value) || 0)) / max) * plotH;
+    }
+
+    function describe(spec, index) {
+      const rows = [];
+      spec.series.forEach((s) => {
+        const value = s.values ? s.values[index] : null;
+        if (value === null || value === undefined) return;
+        rows.push({ name: s.name, color: s.color, value });
+      });
+      return rows;
+    }
+
+    const formatValue = (spec, value) => (
+      spec.yTickFormatter ? spec.yTickFormatter(value) : String(Math.round(value))
+    );
+
+    function syncAt(ratio, sourceWrap) {
+      const sourceSpec = specOf(sourceWrap);
+      const count = sourceSpec.timestamps.length;
+      const refIndex = Math.min(count - 1, Math.max(0, Math.round(ratio * (count - 1))));
+      const refTimestamps = sourceSpec.timestamps;
+      const crossesDay = timeLabelCrossesDay(refTimestamps);
+      const timeStr = formatTimeLabel(refTimestamps[refIndex], crossesDay);
+
+      wraps.forEach((wrap) => {
+        const spec = specOf(wrap);
+        const line = wrap.querySelector('.chart-crosshair-line');
+        const tooltip = wrap.querySelector('.chart-tooltip');
+        if (!spec || !line || !tooltip) return;
+
+        const index = entryAt(spec, ratio, refTimestamps, refIndex);
+        const targetX = paddingLeft + (index / Math.max(1, spec.timestamps.length - 1)) * plotW;
+
+        line.setAttribute('x1', targetX);
+        line.setAttribute('x2', targetX);
+        line.style.display = 'block';
+
+        const wrapRect = wrap.getBoundingClientRect();
+
+        const rows = describe(spec, index);
+        let contentHtml = `<div class="chart-tooltip-time">${timeStr}</div>`;
+        // 容器多时逐条列出会撑爆浮层：只保留当前值最高的 6 条，其余折叠计数。
+        const shown = rows.length > 6
+          ? [...rows].sort((a, b) => b.value - a.value).slice(0, 6)
+          : rows;
+        contentHtml += shown.map((row) => `
+          <div class="chart-tooltip-row">
+            <span class="chart-dot" style="background:${row.color}"></span>
+            <span>${e(row.name)}: <strong>${e(formatValue(spec, row.value))}</strong></span>
+          </div>
+        `).join('');
+        if (rows.length > shown.length) {
+          contentHtml += `<div class="chart-tooltip-row faint">其余 ${rows.length - shown.length} 个容器已折叠</div>`;
+        }
+        tooltip.innerHTML = contentHtml;
+        tooltip.style.display = 'block';
+
+        // 浮层宽度随容器名长短变化，必须按渲染后的真实宽度收边，
+        // 否则靠右悬停时浮层会溢出卡片被裁掉。
+        const tooltipPixelX = (targetX / width) * wrapRect.width;
+        const tipWidth = tooltip.offsetWidth || 0;
+        const maxLeft = Math.max(4, wrapRect.width - tipWidth - 4);
+        tooltip.style.left = `${Math.min(maxLeft, Math.max(4, tooltipPixelX - 60))}px`;
+
+        spec.series.forEach((s, dotIndex) => {
+          const dot = wrap.querySelector(`.chart-indicator-dot.dot-${dotIndex}`);
+          if (!dot) return;
+          const value = s.values ? s.values[index] : null;
+          if (value === null || value === undefined) {
+            dot.style.display = 'none';
+            return;
+          }
+          dot.setAttribute('cx', targetX);
+          dot.setAttribute('cy', yOf(spec, value));
+          dot.style.display = 'block';
+        });
+      });
+    }
+
+    function hideAll() {
+      wraps.forEach((wrap) => {
+        const line = wrap.querySelector('.chart-crosshair-line');
+        const tooltip = wrap.querySelector('.chart-tooltip');
+        if (line) line.style.display = 'none';
+        if (tooltip) tooltip.style.display = 'none';
+        wrap.querySelectorAll('.chart-indicator-dot').forEach((d) => { d.style.display = 'none'; });
+      });
+    }
+
+    wraps.forEach((wrap) => {
+      wrap.addEventListener('mousemove', (event) => {
+        const rect = wrap.getBoundingClientRect();
+        const px = event.clientX - rect.left;
+        const normalizedX = (px / rect.width) * width;
+        const ratio = Math.max(0, Math.min(1, (normalizedX - paddingLeft) / plotW));
+        syncAt(ratio, wrap);
+      });
+      wrap.addEventListener('mouseleave', () => {
+        hideAll();
+      });
+    });
+  }
+
+  // 兼容旧调用点（宿主图只传 history）：改由规格驱动。
+  function bindBeszelChartsSync(gridEl, history, host) {
+    if (!gridEl || !history || history.length < 2 || !host) return;
+    bindChartGrid(gridEl, hostChartSpecs(history, host));
+  }
+
+  // 单行各列的内容片段。整表渲染与轮询就地更新共用同一套片段，
+  // 避免两条路径产生不同的文案（如状态徽标与容器标签）。
+  function taskRowCells(t) {
+    const containersHtml = (t.containers || []).map((c) => `
+        <span class="container-tag" title="CPU: ${c.cpu_percent}% | 内存: ${c.mem_usage_human || '--'} | 块IO: ${c.block_io || '--'}">
+          <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${c.status === 'running' ? '#3fb950' : '#8b949e'}"></span>
+          ${e(c.container_name || c.container_id)}
+        </span>
+      `).join('');
+    return {
+      name: `<strong>${e(t.task_name)}</strong>`,
+      method: `<span class="faint">${e(AD.methodLabel(t.deploy_method))}</span>`,
+      status: monitorStatusBadge(t.status),
+      cpu: `<span class="mono">${t.cpu_percent}%</span>`,
+      mem: `<span class="mono">${AD.formatBytes(t.memory_used_bytes)}</span>`
+        + (t.memory_percent > 0 ? `<span class="faint"> (${t.memory_percent}%)</span>` : ''),
+      net: `<span class="faint">${(t.containers && t.containers[0]?.net_io) || '--'}</span>`,
+      containers: containersHtml || '<span class="faint">无关联容器</span>',
+    };
+  }
+
+  function renderTaskRowsHtml(tasks) {
+    if (!tasks || tasks.length === 0) {
+      return '<tr><td colspan="8" class="empty">暂无任务或尚未部署</td></tr>';
+    }
+    return tasks.map((t) => {
+      const cells = taskRowCells(t);
+      return `
+        <tr class="mon-task-row" data-mon-task="${Number(t.task_id)}" tabindex="0" aria-label="查看 ${a(t.task_name)} 的资源与日志">
+          <td data-col="name">${cells.name}</td>
+          <td data-col="method">${cells.method}</td>
+          <td data-col="status">${cells.status}</td>
+          <td data-col="cpu">${cells.cpu}</td>
+          <td data-col="mem">${cells.mem}</td>
+          <td data-col="net">${cells.net}</td>
+          <td data-col="containers">${cells.containers}</td>
+          <td class="right"><span class="mon-row-arrow" aria-hidden="true">›</span></td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  // 轮询时就地更新各行内容。整表 innerHTML 重建会销毁行元素本身：
+  // 用户（或自动化）在两次轮询之间点下的鼠标事件会落在已被替换的节点上，
+  // 表现为“点了没反应”，正在阅读的表格也会整体闪烁。
+  // 只有任务列表本身增减或换序时才整表重建。
+  function updateTaskRowsInPlace(tasksBody, tasks) {
+    const rows = Array.from(tasksBody.querySelectorAll('tr.mon-task-row'));
+    const sameShape = rows.length === tasks.length && rows.every(
+      (row, index) => Number(row.dataset.monTask) === Number(tasks[index].task_id));
+    if (!sameShape) return false;
+    tasks.forEach((t, index) => {
+      const cells = taskRowCells(t);
+      const row = rows[index];
+      for (const key of Object.keys(cells)) {
+        const cell = row.querySelector(`[data-col="${key}"]`);
+        // 逐列比对：只有真正变化的列才写 DOM，减少无谓的重排与 hover 抖动。
+        if (cell && cell.innerHTML !== cells[key]) cell.innerHTML = cells[key];
+      }
+    });
+    return true;
+  }
+
+  // ----------------------------------------------------------------------
+  // 任务资源详情抽屉：点击任务行后从右侧滑出，展示容器明细与部署日志。
+  // 指标每 4 秒就地刷新（不重建面板，避免打断日志阅读与滚动位置）。
+  // ----------------------------------------------------------------------
+  let taskDrawer = null;
+
+  function monitorStatusBadge(status) {
+    if (status === 'running') return '<span class="badge on">运行中</span>';
+    if (status === 'stopped') return '<span class="badge neutral">已停止</span>';
+    if (status === 'not_deployed') return '<span class="badge faint">未启动容器</span>';
+    return '<span class="badge neutral">系统进程</span>';
+  }
+
+  function containerMemPercent(c) {
+    const used = Number(c.mem_usage_bytes) || 0;
+    const limit = Number(c.mem_limit_bytes) || 0;
+    return limit > 0 ? (used / limit) * 100 : 0;
+  }
+
+  function renderDrawerStatsHtml(mon) {
+    const cpu = Number(mon.cpu_percent) || 0;
+    const memPct = Number(mon.memory_percent) || 0;
+    const containers = mon.containers || [];
+    const running = containers.filter((c) => c.status === 'running').length;
+    return `
+      <div class="drawer-stat">
+        <div class="drawer-stat-label">CPU 占比</div>
+        <div class="drawer-stat-value">${cpu}<small>%</small></div>
+        <div class="drawer-stat-bar"><i class="${toneForPercent(cpu)}" style="width:${Math.min(100, cpu)}%"></i></div>
+      </div>
+      <div class="drawer-stat">
+        <div class="drawer-stat-label">内存占用</div>
+        <div class="drawer-stat-value">${AD.formatBytes(Number(mon.memory_used_bytes) || 0)}</div>
+        <div class="drawer-stat-bar"><i class="${toneForPercent(memPct)}" style="width:${Math.min(100, memPct)}%"></i></div>
+      </div>
+      <div class="drawer-stat">
+        <div class="drawer-stat-label">容器数量</div>
+        <div class="drawer-stat-value">${running}<small>/ ${containers.length} 运行中</small></div>
+      </div>
+      <div class="drawer-stat">
+        <div class="drawer-stat-label">任务状态</div>
+        <div class="drawer-stat-value" style="font-size:14px;font-family:inherit">${mon.enabled ? '已启用' : '已暂停'}</div>
+        <div class="faint" style="font-size:11.5px;margin-top:3px">${e(AD.methodLabel(mon.deploy_method))}</div>
+      </div>
+    `;
+  }
+
+  function renderDrawerContainersHtml(mon) {
+    const containers = mon.containers || [];
+    if (!containers.length) {
+      return '<p class="faint">该任务当前没有关联容器。若部署方式不是 Docker，资源占用不会出现在这里。</p>';
+    }
+    return containers.map((c) => {
+      const memPct = containerMemPercent(c);
+      const limitText = Number(c.mem_limit_bytes) > 0
+        ? ` / ${AD.formatBytes(c.mem_limit_bytes)}（${memPct.toFixed(1)}%）`
+        : '';
+      const running = c.status === 'running';
+      return `
+        <div class="drawer-container">
+          <div class="drawer-container-head">
+            <span class="dot ${running ? 'success' : 'cancelled'}"></span>
+            <span class="drawer-container-name">${e(c.container_name || c.container_id || '未命名容器')}</span>
+            <span class="badge ${running ? 'on' : 'neutral'}">${running ? '运行中' : '已停止'}</span>
+            <span class="spacer"></span>
+            <span class="faint mono">${e(c.container_id || '')}</span>
+          </div>
+          <dl class="drawer-kv">
+            <div><dt>CPU</dt><dd>${Number(c.cpu_percent) || 0}%</dd></div>
+            <div><dt>内存</dt><dd>${e(c.mem_usage_human || '—')}${e(limitText)}</dd></div>
+            <div><dt>网络 I/O</dt><dd>${e(c.net_io || '—')}</dd></div>
+            <div><dt>块 I/O</dt><dd>${e(c.block_io || '—')}</dd></div>
+            <div><dt>进程数</dt><dd>${c.pids ?? '—'}</dd></div>
+            <div style="grid-column:1/-1"><dt>镜像</dt><dd>${e(c.image || '—')}</dd></div>
+          </dl>
+        </div>
+      `;
+    }).join('');
+  }
+
+  AD.closeTaskDrawer = function () {
+    const session = taskDrawer;
+    if (!session) return;
+    taskDrawer = null;
+    session.alive = false;
+    clearInterval(session.metricsTimer);
+    clearTimeout(session.logTimer);
+    document.removeEventListener('keydown', session.onKey);
+    document.body.style.overflow = session.prevOverflow;
+    // 收敛兜底可能写过内联 transition/transform，直接加关闭类会被内联样式压住，
+    // 面板将停在原位直到节点被移除。先清掉内联样式，让关闭态重新生效。
+    const panel = session.root.querySelector('.drawer-panel');
+    if (panel) {
+      panel.style.transition = '';
+      panel.style.transform = '';
+    }
+    session.root.classList.add('drawer-closing');
+    // 过渡结束（0.28s）后再移除节点，期间不响应面板内交互。
+    setTimeout(() => session.root.remove(), 320);
+    const row = document.querySelector(`tr[data-mon-task="${session.taskId}"]`);
+    if (row) row.classList.remove('is-open');
+  };
+
+  AD.openTaskDrawer = function (mon) {
+    if (!mon || mon.task_id === undefined || mon.task_id === null) return;
+    // 同一任务重复点击（含自动刷新后再次点击）不应重载日志、重置滚动位置。
+    if (taskDrawer && taskDrawer.alive && taskDrawer.taskId === Number(mon.task_id)) {
+      taskDrawer.mon = mon;
+      taskDrawer.paintMetrics?.();
+      return;
+    }
+    AD.closeTaskDrawer();
+
+    const root = document.createElement('div');
+    root.className = 'drawer-root drawer-entering';
+    root.innerHTML = `
+      <div class="drawer-backdrop" data-drawer-close></div>
+      <aside class="drawer-panel" role="dialog" aria-modal="true" aria-label="${a(mon.task_name || '任务')} 资源详情">
+        <div class="drawer-head">
+          <div class="drawer-head-main">
+            <h2 class="drawer-title"><span>${e(mon.task_name || '')}</span><span data-drawer-status>${monitorStatusBadge(mon.status)}</span></h2>
+            <div class="drawer-subtitle">
+              <span>${e(AD.methodLabel(mon.deploy_method))}</span>
+              <span data-drawer-container-count>${(mon.containers || []).length} 个容器</span>
+              <span data-drawer-last-run>最近运行：—</span>
+            </div>
+          </div>
+          <button class="ghost drawer-close" data-drawer-close aria-label="关闭">✕</button>
+        </div>
+        <div class="drawer-body">
+          <section class="drawer-section">
+            <div class="drawer-section-head">
+              <h3>资源占用</h3>
+              <span class="faint" data-drawer-updated>每 4 秒自动刷新</span>
+            </div>
+            <div class="drawer-stat-grid" data-drawer-stats>${renderDrawerStatsHtml(mon)}</div>
+          </section>
+          <section class="drawer-section">
+            <div class="drawer-section-head"><h3>容器明细</h3></div>
+            <div data-drawer-containers>${renderDrawerContainersHtml(mon)}</div>
+          </section>
+          <section class="drawer-section">
+            <div class="drawer-section-head">
+              <h3>部署日志</h3>
+              <div class="spacer"></div>
+              <div class="drawer-log-toolbar">
+                <select data-drawer-run aria-label="选择运行记录"></select>
+                <button class="ghost sm" data-drawer-task title="在任务页打开该任务">任务详情</button>
+              </div>
+            </div>
+            <div class="drawer-log-meta" data-drawer-log-meta>正在加载运行记录…</div>
+            <div class="log-view drawer-log" data-drawer-log><span class="log-empty">加载中…</span></div>
+          </section>
+        </div>
+      </aside>`;
+    const prevOverflow = document.body.style.overflow;
+    document.body.appendChild(root);
+    document.body.style.overflow = 'hidden';
+    // 先以屏外位置完成首帧样式计算，再移除进入态，过渡才会真正从右向左滑入。
+    // 不用 requestAnimationFrame：标签页在后台时 rAF 会被节流甚至不触发，
+    // 面板就会永久停在屏外。强制同步 reflow 同样能建立起始帧，且无此风险。
+    void root.offsetHeight;
+    root.classList.remove('drawer-entering');
+
+    const session = {
+      root,
+      mon,
+      taskId: Number(mon.task_id),
+      alive: true,
+      metricsTimer: null,
+      logTimer: null,
+      logToken: 0,
+      runId: null,
+      lineCount: 0,
+      prevOverflow,
+    };
+    session.onKey = (event) => {
+      if (event.key !== 'Escape') return;
+      // 抽屉之上可能叠着确认框/表单弹窗：此时 Escape 属于最上层弹窗，
+      // 抽屉必须让位，否则一次按键会把两层同时关掉。
+      if (AD.Modal && AD.Modal.stack && AD.Modal.stack.length) return;
+      AD.closeTaskDrawer();
+    };
+    document.addEventListener('keydown', session.onKey);
+    taskDrawer = session;
+
+    // 兜底收敛：标签页在后台或渲染管线被暂停时，浏览器会把 CSS 过渡的时间线
+    // 冻结在起始帧（实测内嵌浏览器中 rAF 完全不触发、transition 停在 0ms），
+    // 抽屉会永久停在屏幕外。过渡本该在 280ms 内结束，超过 400ms 就强制落位，
+    // 保证「点了就有面板」这个基本预期不依赖动画是否被调度。
+    setTimeout(() => {
+      if (!session.alive) return;
+      const panel = root.querySelector('.drawer-panel');
+      if (!panel) return;
+      panel.style.transition = 'none';
+      panel.style.transform = 'none';
+    }, 400);
+
+    const statusEl = root.querySelector('[data-drawer-status]');
+    const countEl = root.querySelector('[data-drawer-container-count]');
+    const lastRunEl = root.querySelector('[data-drawer-last-run]');
+    const statsEl = root.querySelector('[data-drawer-stats]');
+    const containersEl = root.querySelector('[data-drawer-containers]');
+    const updatedEl = root.querySelector('[data-drawer-updated]');
+    const select = root.querySelector('[data-drawer-run]');
+    const metaEl = root.querySelector('[data-drawer-log-meta]');
+    const logEl = root.querySelector('[data-drawer-log]');
+
+    const paintMetrics = () => {
+      const current = session.mon;
+      if (statusEl) statusEl.innerHTML = monitorStatusBadge(current.status);
+      if (countEl) countEl.textContent = `${(current.containers || []).length} 个容器`;
+      if (statsEl) statsEl.innerHTML = renderDrawerStatsHtml(current);
+      if (containersEl) containersEl.innerHTML = renderDrawerContainersHtml(current);
+      if (updatedEl) {
+        const now = new Date();
+        const hh = String(now.getHours()).padStart(2, '0');
+        const mm = String(now.getMinutes()).padStart(2, '0');
+        const ss = String(now.getSeconds()).padStart(2, '0');
+        updatedEl.textContent = `更新于 ${hh}:${mm}:${ss}（每 4 秒自动刷新）`;
+      }
+    };
+
+    const refreshMetrics = async () => {
+      try {
+        const list = await AD.api.get('/api/monitor/tasks');
+        if (!session.alive) return;
+        const found = (list || []).find((item) => Number(item.task_id) === session.taskId);
+        if (found) {
+          session.mon = found;
+          paintMetrics();
+        }
+      } catch (err) {
+        // 后台刷新失败时保留上一次数值，不打扰正在阅读的日志。
+      }
+    };
+
+    const startLog = (runId) => {
+      session.logToken += 1;
+      const token = session.logToken;
+      clearTimeout(session.logTimer);
+      session.logTimer = null;
+      session.runId = runId;
+      session.lineCount = 0;
+      const alive = () => session.alive && session.logToken === token && logEl.isConnected;
+
+      const paint = (lines, reset) => {
+        const follow = reset || logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight <= 32;
+        if (reset || logEl.querySelector('.log-empty')) logEl.innerHTML = '';
+        if (lines.length) {
+          logEl.insertAdjacentHTML('beforeend',
+            lines.map((line) => `<div class="log-line">${colorize(line)}</div>`).join(''));
+        }
+        while (logEl.childElementCount > 800) logEl.removeChild(logEl.firstChild);
+        if (!logEl.childElementCount) logEl.innerHTML = '<span class="log-empty">暂无日志输出</span>';        if (follow) logEl.scrollTop = logEl.scrollHeight;
+      };
+
+      logEl.innerHTML = '<span class="log-empty">加载中…</span>';
+      metaEl.textContent = `运行 #${runId} · 加载中…`;
+
+      const poll = async () => {
+        if (!alive()) return;
+        try {
+          const result = await AD.api.get(`/api/runs/${runId}/tail?after=${session.lineCount}`);
+          if (!alive()) return;
+          session.lineCount = result.total;
+          paint(result.lines || [], Boolean(result.reset));
+          // 历史运行（或已清理日志的样例）可能确实为空：把“0 行”解释清楚，
+          // 否则用户会以为是面板加载失败。
+          const emptyNote = !result.total && !result.active
+            ? '该运行没有留下日志文件（可能已被清理或运行未产生输出）'
+            : `已读取 ${result.total} 行（最多显示最近 800 行）`;
+          metaEl.textContent = `运行 #${runId} · ${AD.statusLabel(result.status)} · ${emptyNote}`
+            + (result.active ? ' · 实时跟随中' : '');
+          if (result.active) session.logTimer = setTimeout(poll, 1500);
+        } catch (err) {
+          if (!alive()) return;
+          metaEl.textContent = `运行 #${runId} · 日志读取失败：${err.message}`;
+          if (!logEl.childElementCount) {
+            logEl.innerHTML = '<span class="log-empty">日志读取失败，请稍后重试。</span>';
+          }
+        }
+      };
+      poll();
+    };
+
+    const loadRuns = async () => {
+      try {
+        const data = await AD.api.get(`/api/tasks/${session.taskId}/runs?limit=20`);
+        if (!session.alive) return;
+        const runs = data.runs || [];
+        if (runs.length) {
+          const latest = runs[0];
+          if (lastRunEl) {
+            lastRunEl.textContent = `最近运行：${AD.statusLabel(latest.status)} · `
+              + `${AD.formatRelative(latest.queued_at || latest.started_at)}`;
+          }
+        }
+        if (!runs.length) {
+          select.innerHTML = '<option value="">暂无运行记录</option>';
+          select.disabled = true;
+          metaEl.textContent = '该任务还没有运行记录';
+          logEl.innerHTML = '<span class="log-empty">该任务还没有运行记录</span>';
+          return;
+        }
+        select.innerHTML = runs.map((run) => {
+          // 没有日志文件的运行（如样例数据、日志被清理）在选项里标注出来，
+          // 否则用户选中后会看到空白面板却不知道原因。
+          const hasLog = Boolean(run.log_path) || ['queued', 'running'].includes(run.status);
+          return `<option value="${Number(run.id)}">#${Number(run.id)} · ${e(AD.statusLabel(run.status))}`
+            + ` · ${e(AD.formatTime(run.queued_at, true))}${hasLog ? '' : ' · 无日志'}</option>`;
+        }).join('');
+        select.disabled = false;
+        // 默认打开有日志的最新一次运行；全都无日志时退回最新一次，
+        // 让面板能明确说明“这条运行没有留下日志”，而不是一片空白。
+        const preferred = runs.find((run) => Boolean(run.log_path)) || runs[0];
+        select.value = String(preferred.id);
+        startLog(Number(preferred.id));
+      } catch (err) {
+        if (!session.alive) return;
+        metaEl.textContent = `运行记录加载失败：${err.message}`;
+        logEl.innerHTML = '<span class="log-empty">运行记录加载失败。</span>';
+      }
+    };
+
+    root.addEventListener('click', (event) => {
+      if (event.target.closest('[data-drawer-close]')) {
+        AD.closeTaskDrawer();
+        return;
+      }
+      if (event.target.closest('[data-drawer-task]')) {
+        const id = session.taskId;
+        AD.closeTaskDrawer();
+        AD.state.expandedTaskId = id;
+        AD.navigate('tasks');
+      }
+    });
+
+    select.addEventListener('change', () => {
+      const runId = Number(select.value);
+      if (runId) startLog(runId);
+    });
+
+    session.metricsTimer = setInterval(refreshMetrics, 4000);
+    session.paintMetrics = paintMetrics;
+    loadRuns();
+  };
+
+  // ======================================================================
+  // 备份与恢复中心：本地持久化快照与灾难恢复
+  // ======================================================================
+  AD.views.backups = async function (container) {
+    let data = null;
+    try {
+      data = await AD.api.get('/api/backups');
+    } catch (err) {
+      container.innerHTML = `<div class="panel"><div class="alert error">加载备份列表失败：${e(err.message)}</div></div>`;
+      return;
+    }
+
+    const backups = data.backups || [];
+    container.innerHTML = `
+      <div class="view-header">
+        <h1>数据备份与恢复</h1>
+        <div class="spacer"></div>
+        <button class="ghost" id="backup-upload-btn">上传备份包</button>
+        <button class="primary" id="backup-create-btn">立即创建备份</button>
+      </div>
+
+      <div class="grid cols-3" style="margin-bottom:16px">
+        <div class="panel">
+          <div class="panel-head"><h2>备份总数</h2></div>
+          <div class="stat-number">${data.total} <span class="stat-unit">份</span></div>
+          <div class="faint" style="font-size:12px;margin-top:4px">按保留策略自动轮转清理</div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>备份占用空间</h2></div>
+          <div class="stat-number">${AD.formatBytes(data.total_bytes)}</div>
+          <div class="faint" style="font-size:12px;margin-top:4px">tar.gz 压缩存储</div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>备份存储路径</h2></div>
+          <div class="mono truncate" style="font-size:13px;margin:12px 0 6px" title="${a(data.backup_dir)}">${e(data.backup_dir)}</div>
+          <div class="faint" style="font-size:12px">包含热备数据库与全局配置</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>备份归档列表</h2>
+          <div class="spacer"></div>
+          <span class="faint">共 ${backups.length} 条记录</span>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>备份文件</th>
+                <th>创建时间</th>
+                <th>大小</th>
+                <th>包含内容</th>
+                <th>触发方式</th>
+                <th style="width:160px;text-align:right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${renderBackupRowsHtml(backups)}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+
+    container.querySelector('#backup-create-btn').addEventListener('click', () => {
+      openCreateBackupModal();
+    });
+
+    container.querySelector('#backup-upload-btn').addEventListener('click', () => {
+      openUploadBackupModal();
+    });
+
+    container.querySelectorAll('[data-backup-inspect]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = Number(btn.dataset.backupInspect);
+        openInspectBackupModal(id);
+      });
+    });
+
+    container.querySelectorAll('[data-backup-cloud]').forEach((btn) => {
+      btn.addEventListener('click', async (event) => {
+        const id = Number(btn.dataset.backupCloud);
+        const name = btn.dataset.backupName;
+        AD.setBusy(event.currentTarget, true, '正在上传云端…');
+        try {
+          const res = await AD.api.post(`/api/backups/${id}/upload-cloud`);
+          AD.toastSuccess(res.message || `备份 ${name} 已上传至云端`);
+        } catch (err) {
+          AD.toastError(`上传云端失败: ${err.message}`);
+        } finally {
+          AD.setBusy(event.currentTarget, false);
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-backup-restore]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = Number(btn.dataset.backupRestore);
+        const name = btn.dataset.backupName;
+        openRestoreBackupModal(id, name);
+      });
+    });
+
+    container.querySelectorAll('[data-backup-delete]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const id = Number(btn.dataset.backupDelete);
+        const name = btn.dataset.backupName;
+        deleteBackup(id, name);
+      });
+    });
+  };
+
+  function renderBackupRowsHtml(backups) {
+    if (!backups || backups.length === 0) {
+      return '<tr><td colspan="6" class="empty">暂无备份文件，点击上方「立即创建备份」即可创建第一份完整快照</td></tr>';
+    }
+    return backups.map((b) => {
+      const triggerBadge = b.trigger === 'schedule'
+        ? '<span class="badge on">定时自动</span>'
+        : b.trigger === 'upload'
+        ? '<span class="badge info">外部导入</span>'
+        : '<span class="badge neutral">手动创建</span>';
+
+      const tags = ['<span class="badge">SQLite+配置</span>'];
+      if (b.contains_logs) tags.push('<span class="badge faint">运行日志</span>');
+      if (b.contains_artifacts) tags.push('<span class="badge faint">打包产物</span>');
+
+      return `
+        <tr>
+          <td>
+            <a href="/api/backups/${b.id}/download" class="mono bold" title="点击下载此备份">${e(b.filename)}</a>
+            <div class="faint mono" style="font-size:11px">SHA256: ${e(b.sha256 ? b.sha256.slice(0, 16) + '…' : '--')}</div>
+          </td>
+          <td><span class="nowrap">${e(AD.formatTime(b.created_at))}</span></td>
+          <td><span class="mono">${AD.formatBytes(b.size_bytes)}</span></td>
+          <td>${tags.join(' ')}</td>
+          <td>${triggerBadge}</td>
+          <td style="text-align:right">
+            <div class="row" style="justify-content:flex-end;gap:6px">
+              <button class="ghost sm" data-backup-inspect="${b.id}" title="检查备份包完整性">检查</button>
+              <button class="ghost sm" data-backup-cloud="${b.id}" data-backup-name="${a(b.filename)}" title="将该备份手动推送到云端存储">上传云端</button>
+              <button class="ghost sm" data-backup-restore="${b.id}" data-backup-name="${a(b.filename)}" style="color:var(--warning)">恢复</button>
+              <button class="ghost sm" data-backup-delete="${b.id}" data-backup-name="${a(b.filename)}" style="color:var(--danger)">删除</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  function openCreateBackupModal() {
+    const backdrop = AD.Modal.open({
+      title: '创建数据备份',
+      size: 'medium',
+      body: `
+        <div class="alert info">
+          将使用 SQLite 在线备份（Online Backup API）生成完全一致的快照，并在 tar.gz 包中打包全局配置与元数据。备份期间部署与调度不受影响。
+        </div>
+        <div style="margin-top:12px">
+          ${switchRow('bk-logs', false, '包含历史运行日志', 'data/logs/；日志可能较大，仅备份配置与数据时建议关闭')}
+          ${switchRow('bk-artifacts', false, '包含构建产物压缩包', 'data/artifacts/；包含各任务历史打包生成的压缩包')}
+        </div>
+        <div class="field" style="margin-top:12px">
+          <label for="bk-retention">本地自动保留份数</label>
+          <input type="number" id="bk-retention" value="10" min="1" max="100">
+          <div class="hint">备份完成后，若超过此数量将自动删除最旧的历史备份文件</div>
+        </div>
+        <div id="bk-err" class="alert error hidden"></div>
+      `,
+      footer: `
+        <button data-close>取消</button>
+        <button class="primary" id="bk-submit">立即备份</button>
+      `,
+    });
+
+    backdrop.querySelector('#bk-submit').addEventListener('click', async (event) => {
+      const includeLogs = backdrop.querySelector('#bk-logs').checked;
+      const includeArtifacts = backdrop.querySelector('#bk-artifacts').checked;
+      const retention = Number(backdrop.querySelector('#bk-retention').value) || 10;
+      const errBox = backdrop.querySelector('#bk-err');
+
+      AD.setBusy(event.currentTarget, true, '正在备份打包…');
+      try {
+        const result = await AD.api.post('/api/backups', {
+          include_logs: includeLogs,
+          include_artifacts: includeArtifacts,
+          retention_count: retention,
+        });
+        AD.toastSuccess(result.message || '备份创建成功');
+        AD.Modal.close();
+        AD.render('backups');
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('hidden');
+        AD.setBusy(event.currentTarget, false);
+      }
+    });
+  }
+
+  function openUploadBackupModal() {
+    const backdrop = AD.Modal.open({
+      title: '上传备份文件',
+      size: 'medium',
+      body: `
+        <div class="alert info">
+          支持从其他环境导出的 <span class="code-inline">.tar.gz</span> 备份归档文件。上传后将自动验证包内 SQLite 完整性校验和与清单结构。
+        </div>
+        <div class="field" style="margin-top:14px">
+          <label for="bk-upload-file">选择备份文件 (.tar.gz)</label>
+          <input type="file" id="bk-upload-file" accept=".tar.gz,application/gzip">
+        </div>
+        <div id="bk-upload-err" class="alert error hidden"></div>
+      `,
+      footer: `
+        <button data-close>取消</button>
+        <button class="primary" id="bk-upload-submit">上传并导入</button>
+      `,
+    });
+
+    backdrop.querySelector('#bk-upload-submit').addEventListener('click', async (event) => {
+      const fileInput = backdrop.querySelector('#bk-upload-file');
+      const file = fileInput.files[0];
+      const errBox = backdrop.querySelector('#bk-upload-err');
+      if (!file) {
+        errBox.textContent = '请先选择文件';
+        errBox.classList.remove('hidden');
+        return;
+      }
+      const formData = new FormData();
+      formData.append('file', file);
+
+      AD.setBusy(event.currentTarget, true, '上传校验中…');
+      try {
+        const response = await fetch('/api/backups/upload', {
+          method: 'POST',
+          body: formData,
+        });
+        const res = await response.json();
+        if (!response.ok) throw new Error(res.detail || '上传失败');
+        AD.toastSuccess(res.message || '备份上传成功');
+        AD.Modal.close();
+        AD.render('backups');
+      } catch (err) {
+        errBox.textContent = err.message;
+        errBox.classList.remove('hidden');
+        AD.setBusy(event.currentTarget, false);
+      }
+    });
+  }
+
+  async function openInspectBackupModal(backupId) {
+    let result = null;
+    try {
+      result = await AD.api.post(`/api/backups/${backupId}/inspect`);
+    } catch (err) {
+      AD.toastError(`检查备份失败: ${err.message}`);
+      return;
+    }
+    const info = result.inspection || {};
+    const manifest = info.manifest || {};
+    AD.Modal.open({
+      title: '备份完整性与清单详情',
+      size: 'medium',
+      body: `
+        <div class="alert success">
+          ✓ 数据库完整性校验（PRAGMA integrity_check）通过，归档结构正常。
+        </div>
+        <dl class="kv">
+          <dt>文件名</dt><dd class="mono">${e(info.filename)}</dd>
+          <dt>归档大小</dt><dd class="mono">${AD.formatBytes(info.size_bytes)}</dd>
+          <dt>SHA-256</dt><dd class="mono" style="word-break:break-all">${e(info.sha256)}</dd>
+          <dt>制作版本</dt><dd class="mono">AutoDeploy v${e(manifest.app_version || '未知')}</dd>
+          <dt>包含文件</dt><dd class="mono">${(manifest.files || []).join('、') || '--'}</dd>
+        </dl>
+      `,
+      footer: '<button data-close>关闭</button>',
+    });
+  }
+
+  async function openRestoreBackupModal(backupId, filename) {
+    const confirmed = await AD.confirm({
+      title: '恢复数据备份',
+      message: `确定要从备份「${filename}」恢复系统数据吗？`,
+      detail: '警告：恢复操作将用备份中的快照替换当前数据库中的全部任务、运行记录、全局凭据与系统配置。正在运行的部署可能被中断。',
+      confirmText: '确认恢复',
+      danger: true,
+    });
+    if (!confirmed) return;
+
+    const toast = AD.toast('正在验证并恢复数据，请稍候…', 'info', 30000);
+    try {
+      const res = await AD.api.post(`/api/backups/${backupId}/restore`);
+      if (toast && toast.remove) toast.remove();
+      AD.toastSuccess(res.message || '数据已成功恢复！');
+      // 恢复完成后重新加载页面，使新数据生效
+      setTimeout(() => {
+        window.location.reload();
+      }, 1000);
+    } catch (err) {
+      if (toast && toast.remove) toast.remove();
+      AD.toastError(`恢复失败: ${err.message}`);
+    }
+  }
+
+  async function deleteBackup(backupId, filename) {
+    const confirmed = await AD.confirm({
+      title: '删除备份文件',
+      message: `确定要删除备份「${filename}」吗？`,
+      detail: '磁盘上的归档文件及记录将永久移除，不可恢复。',
+      confirmText: '删除',
+      danger: true,
+    });
+    if (!confirmed) return;
+    try {
+      await AD.api.del(`/api/backups/${backupId}`);
+      AD.toastSuccess('备份已删除');
+      AD.render('backups');
+    } catch (err) {
+      AD.toastError(err.message);
+    }
+  }
+
 })(window.AD);
+
+

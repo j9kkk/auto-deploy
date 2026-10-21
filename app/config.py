@@ -106,6 +106,24 @@ class Settings:
     # A single run log is truncated after this many bytes to protect the disk.
     log_max_bytes: int = 8_000_000
 
+    # --- backup schedule --------------------------------------------------
+    backup_enabled: bool = False
+    backup_schedule_type: str = "cron"
+    backup_schedule_expression: str = "0 3 * * *"
+    backup_retention_count: int = 10
+    backup_include_logs: bool = False
+    backup_include_artifacts: bool = False
+
+    # --- cloud backup -----------------------------------------------------
+    cloud_backup_enabled: bool = False
+    cloud_provider: str = "webdav"  # "webdav" | "rclone"
+    cloud_webdav_url: str = ""
+    cloud_webdav_username: str = ""
+    cloud_webdav_password: str = ""
+    cloud_webdav_root: str = "autodeploy-backups"
+    cloud_rclone_remote: str = ""
+    cloud_retention_count: int = 10
+
     # --- self update ------------------------------------------------------
     # 自我更新的代码来源；可指向镜像或私有副本（需可匿名读取或配合代理）。
     update_repo: str = UPDATE_REPO_DEFAULT

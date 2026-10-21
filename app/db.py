@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -61,10 +61,15 @@ CREATE TABLE IF NOT EXISTS credentials (
     description     TEXT    NOT NULL DEFAULT '',
     created_at      TEXT    NOT NULL,
     updated_at      TEXT    NOT NULL,
-    -- 最近一次连通性测试结果，供界面显示凭据是否可用
+    -- 最近一次仓库连通性测试结果，供界面显示凭据是否可用
     last_tested_at  TEXT,
     last_test_ok    INTEGER,
-    last_test_error TEXT    NOT NULL DEFAULT ''
+    last_test_error TEXT    NOT NULL DEFAULT '',
+    -- SSH 私钥专有：最近一次「登录主机」测试结果。与仓库测试分开记，
+    -- 否则一次主机登录失败会把可用的仓库凭据显示成不可用（反之亦然）。
+    last_host_test_at    TEXT,
+    last_host_test_ok    INTEGER,
+    last_host_test_error TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -101,6 +106,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     docker_compose_file      TEXT    NOT NULL DEFAULT '',
     rsync_target             TEXT    NOT NULL DEFAULT '',
     rsync_options            TEXT    NOT NULL DEFAULT '-az --delete',
+    -- 目标主机；为空表示在本机（控制机）执行，保持原有行为。
+    host_id                  INTEGER REFERENCES hosts(id) ON DELETE SET NULL,
+    -- 部署源：git = 从仓库拉取；snapshot = 从任务快照包还原。
+    source_mode              TEXT    NOT NULL DEFAULT 'git',
+    -- 要纳入快照的数据源声明（JSON 数组）；为空则仅用自动探测结果。
+    data_sources             TEXT    NOT NULL DEFAULT '[]',
 
     env_vars                 TEXT    NOT NULL DEFAULT '{}',
     timeout_seconds          INTEGER NOT NULL DEFAULT 1800,
@@ -147,7 +158,10 @@ CREATE TABLE IF NOT EXISTS runs (
     log_bytes           INTEGER NOT NULL DEFAULT 0,
     error               TEXT    NOT NULL DEFAULT '',
     cancel_requested    INTEGER NOT NULL DEFAULT 0,
-    pid                 INTEGER
+    pid                 INTEGER,
+    -- 本次运行的目标主机快照：主机被改名或删除后，历史记录仍可追溯。
+    host_id             INTEGER,
+    host_name           TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
@@ -163,6 +177,67 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     ip      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(id DESC);
+
+CREATE TABLE IF NOT EXISTS backups (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename           TEXT    NOT NULL UNIQUE,
+    filepath           TEXT    NOT NULL,
+    size_bytes         INTEGER NOT NULL DEFAULT 0,
+    sha256             TEXT    NOT NULL DEFAULT '',
+    trigger            TEXT    NOT NULL DEFAULT 'manual',
+    contains_logs      INTEGER NOT NULL DEFAULT 0,
+    contains_artifacts INTEGER NOT NULL DEFAULT 0,
+    status             TEXT    NOT NULL DEFAULT 'success',
+    error              TEXT    NOT NULL DEFAULT '',
+    created_at         TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backups_created ON backups(id DESC);
+
+CREATE TABLE IF NOT EXISTS hosts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT    NOT NULL UNIQUE,
+    address        TEXT    NOT NULL,
+    port           INTEGER NOT NULL DEFAULT 22,
+    username       TEXT    NOT NULL,
+    credential_id  INTEGER REFERENCES credentials(id) ON DELETE SET NULL,
+    base_dir       TEXT    NOT NULL DEFAULT '/opt/autodeploy',
+    -- 首次连接成功后钉住的 SSH 主机指纹；之后指纹变化一律拒绝连接。
+    host_key       TEXT    NOT NULL DEFAULT '',
+    status         TEXT    NOT NULL DEFAULT 'unknown',
+    last_check_at  TEXT,
+    last_error     TEXT    NOT NULL DEFAULT '',
+    created_at     TEXT    NOT NULL,
+    updated_at     TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS host_metrics (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                 TEXT    NOT NULL,
+    cpu_percent        REAL    NOT NULL,
+    memory_percent     REAL    NOT NULL,
+    disk_read_rate     REAL    NOT NULL DEFAULT 0.0,
+    disk_write_rate    REAL    NOT NULL DEFAULT 0.0,
+    net_rx_rate        REAL    NOT NULL DEFAULT 0.0,
+    net_tx_rate        REAL    NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_host_metrics_ts ON host_metrics(ts);
+
+CREATE TABLE IF NOT EXISTS container_metrics (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                 TEXT    NOT NULL,
+    container_id       TEXT    NOT NULL,
+    container_name     TEXT    NOT NULL,
+    compose_project    TEXT    NOT NULL DEFAULT '',
+    cpu_percent        REAL    NOT NULL DEFAULT 0.0,
+    memory_bytes       REAL    NOT NULL DEFAULT 0.0,
+    memory_percent     REAL    NOT NULL DEFAULT 0.0,
+    disk_read_rate     REAL    NOT NULL DEFAULT 0.0,
+    disk_write_rate    REAL    NOT NULL DEFAULT 0.0,
+    net_rx_rate        REAL    NOT NULL DEFAULT 0.0,
+    net_tx_rate        REAL    NOT NULL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_container_metrics_ts ON container_metrics(ts);
+CREATE INDEX IF NOT EXISTS idx_container_metrics_cid_ts ON container_metrics(container_id, ts);
 """
 
 
@@ -269,10 +344,80 @@ class Database:
             self._migrate_v2_to_v3(conn)
         if current < 4:
             self._migrate_v3_to_v4(conn)
+        if current < 5:
+            self._migrate_v4_to_v5(conn)
+        if current < 6:
+            self._migrate_v5_to_v6(conn)
+        if current < 7:
+            self._migrate_v6_to_v7(conn)
+        if current < 8:
+            self._migrate_v7_to_v8(conn)
+        if current < 9:
+            self._migrate_v8_to_v9(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
         )
+
+    def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
+        """v8: 新增远程主机表 hosts，并给任务/运行补主机维度。
+
+        主机是「部署到哪里」的一等对象，通过 SSH 连接。凭据复用 credentials
+        表的 ssh_key 类型，不新增秘密存储；host_key 存放首次连接后钉住的
+        主机指纹，用于拒绝指纹变化（中间人）。
+
+        同一迁移里补三件与主机/快照相关的东西（都是加列或建表，可重复执行）：
+        * tasks.host_id / source_mode / data_sources
+        * runs.host_id / host_name（历史运行据此保留目标主机名）
+        """
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hosts (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                name           TEXT    NOT NULL UNIQUE,
+                address        TEXT    NOT NULL,
+                port           INTEGER NOT NULL DEFAULT 22,
+                username       TEXT    NOT NULL,
+                credential_id  INTEGER REFERENCES credentials(id) ON DELETE SET NULL,
+                base_dir       TEXT    NOT NULL DEFAULT '/opt/autodeploy',
+                host_key       TEXT    NOT NULL DEFAULT '',
+                status         TEXT    NOT NULL DEFAULT 'unknown',
+                last_check_at  TEXT,
+                last_error     TEXT    NOT NULL DEFAULT '',
+                created_at     TEXT    NOT NULL,
+                updated_at     TEXT    NOT NULL
+            )
+            """
+        )
+        self._add_column(
+            conn, "tasks", "host_id",
+            "INTEGER REFERENCES hosts(id) ON DELETE SET NULL",
+        )
+        self._add_column(conn, "tasks", "source_mode", "TEXT NOT NULL DEFAULT 'git'")
+        self._add_column(conn, "tasks", "data_sources", "TEXT NOT NULL DEFAULT '[]'")
+        self._add_column(conn, "runs", "host_id", "INTEGER")
+        self._add_column(conn, "runs", "host_name", "TEXT NOT NULL DEFAULT ''")
+
+    def _migrate_v8_to_v9(self, conn: sqlite3.Connection) -> None:
+        """v9: 凭据补「登录主机」测试结果，与仓库测试分开记录。
+
+        SSH 私钥有两条互不相干的用途（仓库 Deploy Key / 主机登录），共用
+        一列测试结论会让界面把「主机登录成功但仓库没配」显示成不可用。
+        """
+        self._add_column(conn, "credentials", "last_host_test_at", "TEXT")
+        self._add_column(conn, "credentials", "last_host_test_ok", "INTEGER")
+        self._add_column(
+            conn, "credentials", "last_host_test_error", "TEXT NOT NULL DEFAULT ''"
+        )
+
+    @staticmethod
+    def _add_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        """幂等地补一列；SQLite 的 ADD COLUMN 不能带 IF NOT EXISTS。"""
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column in columns:
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
 
     def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
         """v2: 任务名唯一约束。
@@ -387,6 +532,45 @@ class Database:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN webhook_secret TEXT NOT NULL DEFAULT ''"
             )
+
+    def _migrate_v4_to_v5(self, conn: sqlite3.Connection) -> None:
+        """v5: 新增数据备份记录表 backups。"""
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS backups (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename           TEXT    NOT NULL UNIQUE,
+                filepath           TEXT    NOT NULL,
+                size_bytes         INTEGER NOT NULL DEFAULT 0,
+                sha256             TEXT    NOT NULL DEFAULT '',
+                trigger            TEXT    NOT NULL DEFAULT 'manual',
+                contains_logs      INTEGER NOT NULL DEFAULT 0,
+                contains_artifacts INTEGER NOT NULL DEFAULT 0,
+                status             TEXT    NOT NULL DEFAULT 'success',
+                error              TEXT    NOT NULL DEFAULT '',
+                created_at         TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_backups_created ON backups(id DESC);
+            """
+        )
+
+    def _migrate_v5_to_v6(self, conn: sqlite3.Connection) -> None:
+        """v6: 新增轻量主机时序采样表 host_metrics。"""
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS host_metrics (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                 TEXT    NOT NULL,
+                cpu_percent        REAL    NOT NULL,
+                memory_percent     REAL    NOT NULL,
+                disk_read_rate     REAL    NOT NULL DEFAULT 0.0,
+                disk_write_rate    REAL    NOT NULL DEFAULT 0.0,
+                net_rx_rate        REAL    NOT NULL DEFAULT 0.0,
+                net_tx_rate        REAL    NOT NULL DEFAULT 0.0
+            );
+            CREATE INDEX IF NOT EXISTS idx_host_metrics_ts ON host_metrics(ts);
+            """
+        )
         from .security import new_token
 
         for row in conn.execute(
@@ -396,6 +580,29 @@ class Database:
                 "UPDATE tasks SET webhook_secret = ? WHERE id = ?",
                 (new_token(), row["id"]),
             )
+
+    def _migrate_v6_to_v7(self, conn: sqlite3.Connection) -> None:
+        """v7: 新增容器维度时序采样表 container_metrics。"""
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS container_metrics (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                 TEXT    NOT NULL,
+                container_id       TEXT    NOT NULL,
+                container_name     TEXT    NOT NULL,
+                compose_project    TEXT    NOT NULL DEFAULT '',
+                cpu_percent        REAL    NOT NULL DEFAULT 0.0,
+                memory_bytes       REAL    NOT NULL DEFAULT 0.0,
+                memory_percent     REAL    NOT NULL DEFAULT 0.0,
+                disk_read_rate     REAL    NOT NULL DEFAULT 0.0,
+                disk_write_rate    REAL    NOT NULL DEFAULT 0.0,
+                net_rx_rate        REAL    NOT NULL DEFAULT 0.0,
+                net_tx_rate        REAL    NOT NULL DEFAULT 0.0
+            );
+            CREATE INDEX IF NOT EXISTS idx_container_metrics_ts ON container_metrics(ts);
+            CREATE INDEX IF NOT EXISTS idx_container_metrics_cid_ts ON container_metrics(container_id, ts);
+            """
+        )
 
     def schema_version(self) -> int:
         try:

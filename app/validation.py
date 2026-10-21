@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any, Mapping
 
 from . import deployer, gitops
@@ -24,6 +25,10 @@ SCRIPT_MAX = 200_000
 
 DEPLOY_METHODS = set(deployer.DEPLOY_METHODS)
 SCHEDULE_TYPES = {"manual", "interval", "cron"}
+# 部署源：从仓库拉取，或从任务快照包还原。
+TASK_SOURCE_MODES = {"git", "snapshot"}
+# 数据源类型：宿主机绑定路径、Docker 命名卷、容器内路径。
+DATA_SOURCE_TYPES = {"bind", "volume", "container_path"}
 
 
 class ValidationError(Exception):
@@ -263,6 +268,40 @@ def validate_task_payload(
             errors["target_dir"] = "目标目录必须是绝对路径（以 / 开头）"
         out["target_dir"] = target
 
+    # 目标主机：空表示本机。存在性由 API 层校验（校验层不直连仓储），
+    # 但类型必须在这里把住，否则字符串会被存进 INTEGER 列。
+    if has("host_id") or not partial:
+        raw_host = payload.get("host_id", existing.get("host_id"))
+        if raw_host in (None, "", 0):
+            out["host_id"] = None
+        else:
+            try:
+                host_value = int(raw_host)
+            except (TypeError, ValueError):
+                host_value = 0
+            if host_value <= 0:
+                errors["host_id"] = "目标主机编号无效"
+            out["host_id"] = host_value if host_value > 0 else None
+
+    # 部署源：git = 拉取仓库；snapshot = 从任务快照还原（仓库地址可留空）。
+    if has("source_mode") or not partial:
+        source_mode = _clean_str(
+            payload.get("source_mode") or existing.get("source_mode") or "git", limit=20
+        ).lower()
+        if source_mode not in TASK_SOURCE_MODES:
+            errors["source_mode"] = f"部署源必须是 {sorted(TASK_SOURCE_MODES)} 之一"
+        out["source_mode"] = source_mode
+
+    # 数据源声明：快照采集时额外纳入的路径/卷。统一存成 JSON 文本，
+    # 每项必须是 {type, ...} 且路径为绝对路径。
+    if has("data_sources") or not partial:
+        specs, problem = _normalise_data_sources(
+            payload.get("data_sources", existing.get("data_sources", "[]"))
+        )
+        if problem:
+            errors["data_sources"] = problem
+        out["data_sources"] = json.dumps(specs, ensure_ascii=False)
+
     if has("keep_releases") or not partial:
         out["keep_releases"] = _clean_int(
             payload.get("keep_releases", existing.get("keep_releases", 5)), 5, low=0, high=1000
@@ -385,6 +424,66 @@ def _check_method_requirements(
         errors["rsync_target"] = "部署方式为 rsync 时必须填写目标地址"
 
 
+def _normalise_data_sources(raw: Any) -> tuple[list[dict[str, Any]], str | None]:
+    """规范化任务的数据源声明，返回 (列表, 错误信息)。
+
+    接受 JSON 文本或已解析的列表；每项形如
+    ``{"type": "bind", "path": "/srv/app/data"}``、
+    ``{"type": "volume", "name": "pgdata"}`` 或
+    ``{"type": "container_path", "container": "app", "path": "/var/lib/x"}``。
+
+    路径必须是绝对路径且不含 ``..``——这些值最终会拼进远端 shell 命令。
+    """
+    if raw in (None, ""):
+        return [], None
+    data: Any = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or text == "[]":
+            return [], None
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return [], "数据源声明必须是 JSON 数组"
+    if not isinstance(data, list):
+        return [], "数据源声明必须是 JSON 数组"
+    if len(data) > 50:
+        return [], "数据源数量过多（上限 50）"
+
+    cleaned: list[dict[str, Any]] = []
+    for index, item in enumerate(data, start=1):
+        if not isinstance(item, Mapping):
+            return [], f"第 {index} 条数据源格式无效"
+        kind = str(item.get("type") or "").strip().lower()
+        if kind not in DATA_SOURCE_TYPES:
+            return [], f"第 {index} 条数据源类型必须是 {sorted(DATA_SOURCE_TYPES)} 之一"
+        entry: dict[str, Any] = {"type": kind}
+        if kind in ("bind", "container_path"):
+            path = str(item.get("path") or "").strip()
+            if not path.startswith("/"):
+                return [], f"第 {index} 条数据源路径必须是绝对路径"
+            if ".." in Path(path).parts:
+                return [], f"第 {index} 条数据源路径不允许包含 .."
+            entry["path"] = path
+        if kind == "volume":
+            name = str(item.get("name") or "").strip()
+            if not name:
+                return [], f"第 {index} 条数据源缺少卷名称"
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}", name):
+                return [], f"第 {index} 条数据源的卷名称非法"
+            entry["name"] = name
+        if kind == "container_path":
+            container = str(item.get("container") or "").strip()
+            if not container:
+                return [], f"第 {index} 条数据源缺少容器名"
+            entry["container"] = container
+        label = str(item.get("label") or "").strip()
+        if label:
+            entry["label"] = label[:80]
+        cleaned.append(entry)
+    return cleaned, None
+
+
 def _normalise_env_vars(raw: Any) -> tuple[dict[str, str], str | None]:
     """Accept a dict or ``KEY=value`` text and return a plain string map."""
     if raw in (None, ""):
@@ -438,6 +537,106 @@ def describe_task_schedule(task: Mapping[str, Any]) -> str:
         str(task.get("schedule_type") or "manual"),
         str(task.get("schedule_expression") or ""),
     )
+
+
+# ---------------------------------------------------------------------------
+# 远程主机
+# ---------------------------------------------------------------------------
+
+# 主机名/地址：允许 IPv4、IPv6（含冒号）、DNS 名与带点的 FQDN。
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9_]([A-Za-z0-9_.\-]*[A-Za-z0-9_])?$|^[0-9a-fA-F:.]+$")
+_SSH_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,31}$")
+
+
+def validate_host_payload(
+    payload: Mapping[str, Any],
+    *,
+    partial: bool = False,
+    existing: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """校验远程主机创建/更新请求。
+
+    安全相关约束集中在这里：
+    * ``base_dir`` 必须是绝对路径且不含 ``..``——它会被拼进远端命令，
+      必须杜绝路径穿越与相对路径（相对路径会随远端 cwd 漂移）。
+    * 地址只允许主机名/IP 字符，避免把 shell 元字符带进 ssh 目标。
+    * 用户名同理；端口限定在合法范围。
+    """
+    existing = dict(existing or {})
+    errors: dict[str, str] = {}
+    out: dict[str, Any] = {}
+
+    def has(key: str) -> bool:
+        return key in payload
+
+    if has("name") or not partial:
+        name = _clean_str(payload.get("name") or existing.get("name"), limit=80)
+        if not name:
+            errors["name"] = "主机名称不能为空"
+        out["name"] = name
+
+    if has("address") or not partial:
+        address = _clean_str(payload.get("address", existing.get("address", "")), limit=255)
+        if not address:
+            errors["address"] = "主机地址不能为空"
+        elif not _HOSTNAME_RE.match(address):
+            errors["address"] = "主机地址只能包含字母、数字、点、连字符、下划线或冒号（IPv6）"
+        out["address"] = address
+
+    if has("port") or not partial:
+        raw_port = payload.get("port", existing.get("port", 22))
+        try:
+            port = int(raw_port if raw_port not in (None, "") else 22)
+        except (TypeError, ValueError):
+            port = -1
+        if not 1 <= port <= 65535:
+            errors["port"] = "SSH 端口必须在 1–65535 之间"
+        out["port"] = port
+
+    if has("username") or not partial:
+        username = _clean_str(payload.get("username", existing.get("username", "")), limit=32)
+        if not username:
+            errors["username"] = "SSH 用户名不能为空"
+        elif not _SSH_USER_RE.match(username):
+            errors["username"] = "SSH 用户名只能包含字母、数字、下划线、点和连字符（最长 32 位）"
+        out["username"] = username
+
+    if has("base_dir") or not partial:
+        base_dir = _clean_str(payload.get("base_dir", existing.get("base_dir", "")), limit=500) \
+            or "/opt/autodeploy"
+        if not base_dir.startswith("/"):
+            errors["base_dir"] = "远端基础目录必须是绝对路径（以 / 开头）"
+        elif ".." in Path(base_dir).parts:
+            errors["base_dir"] = "远端基础目录不允许包含 .. 越界"
+        elif base_dir != "/" and base_dir.endswith("/"):
+            base_dir = base_dir.rstrip("/")
+        out["base_dir"] = base_dir
+
+    if has("credential_id") or not partial:
+        raw = payload.get("credential_id", existing.get("credential_id"))
+        if raw in (None, "", 0):
+            out["credential_id"] = None
+        else:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = 0
+            if value <= 0:
+                errors["credential_id"] = "凭据编号无效"
+            out["credential_id"] = value if value > 0 else None
+
+    if errors:
+        raise ValidationError(errors)
+    return out
+
+
+def describe_host(host: Mapping[str, Any]) -> str:
+    """给日志与列表用的一行主机描述。"""
+    user = str(host.get("username") or "")
+    address = str(host.get("address") or "")
+    port = host.get("port") or 22
+    suffix = f":{port}" if int(port) != 22 else ""
+    return f"{user}@{address}{suffix}" if user else f"{address}{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -586,9 +785,16 @@ EDITABLE_SETTINGS: dict[str, tuple[type, int, int]] = {
     "artifact_retention_count": (int, 0, 1000),
     "log_retention_days": (int, 0, 3650),
     "log_max_bytes": (int, 100_000, 1_000_000_000),
+    # 定时自动备份与云端同步
+    "backup_retention_count": (int, 1, 1000),
+    "cloud_retention_count": (int, 1, 1000),
 }
 
-EDITABLE_BOOL_SETTINGS = ("trust_proxy_headers", "secure_cookies", "queue_while_running")
+EDITABLE_BOOL_SETTINGS = (
+    "trust_proxy_headers", "secure_cookies", "queue_while_running",
+    "backup_enabled", "backup_include_logs", "backup_include_artifacts",
+    "cloud_backup_enabled",
+)
 
 
 def validate_settings(payload: Mapping[str, Any], current: Settings) -> dict[str, Any]:
@@ -648,6 +854,60 @@ def validate_settings(payload: Mapping[str, Any], current: Settings) -> dict[str
         if not shell.startswith("/"):
             errors["shell"] = "shell 必须是绝对路径"
         out["shell"] = shell
+
+    # --- 定时备份与云端存储字段 -------------------------------------------
+    if "backup_schedule_type" in payload:
+        kind = _clean_str(payload["backup_schedule_type"], limit=16).lower()
+        if kind not in ("cron", "interval"):
+            errors["backup_schedule_type"] = "只支持 cron 或 interval"
+        else:
+            out["backup_schedule_type"] = kind
+
+    if "backup_schedule_expression" in payload:
+        expression = _clean_str(payload["backup_schedule_expression"], limit=64)
+        kind = out.get("backup_schedule_type") or str(
+            getattr(current, "backup_schedule_type", "cron")
+        )
+        problem = validate_schedule(kind, expression)
+        if problem:
+            errors["backup_schedule_expression"] = problem
+        else:
+            out["backup_schedule_expression"] = expression
+
+    if "cloud_provider" in payload:
+        provider = _clean_str(payload["cloud_provider"], limit=16).lower()
+        if provider not in ("webdav", "rclone"):
+            errors["cloud_provider"] = "只支持 webdav 或 rclone"
+        else:
+            out["cloud_provider"] = provider
+
+    if "cloud_webdav_url" in payload:
+        url = _clean_str(payload["cloud_webdav_url"], limit=500)
+        if url and not url.startswith(("http://", "https://")):
+            errors["cloud_webdav_url"] = "WebDAV 地址必须以 http:// 或 https:// 开头"
+        out["cloud_webdav_url"] = url
+
+    if "cloud_webdav_username" in payload:
+        out["cloud_webdav_username"] = _clean_str(payload["cloud_webdav_username"], limit=128)
+
+    # 与代理密码同一约定：留空表示保持原值，不回显明文。
+    if payload.get("cloud_webdav_password"):
+        out["cloud_webdav_password"] = _clean_str(payload["cloud_webdav_password"], limit=256)
+
+    if "cloud_webdav_root" in payload:
+        root = _clean_str(payload["cloud_webdav_root"], limit=200)
+        # 防路径穿越：WebDAV 目录名不允许分隔符越界写法
+        if root and (root.startswith("/") or ".." in root):
+            errors["cloud_webdav_root"] = "备份根目录不能以 / 开头或包含 .."
+        else:
+            out["cloud_webdav_root"] = root or "autodeploy-backups"
+
+    if "cloud_rclone_remote" in payload:
+        remote = _clean_str(payload["cloud_rclone_remote"], limit=300)
+        if remote and ":" not in remote:
+            errors["cloud_rclone_remote"] = "rclone 目标必须形如 remote:path"
+        else:
+            out["cloud_rclone_remote"] = remote
 
     # 代理相关设置交给专门函数校验，避免与本函数的大段逻辑混在一起。
     try:
