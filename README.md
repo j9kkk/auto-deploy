@@ -24,7 +24,19 @@
 | 发布 + systemd | 切换软链后重启服务并校验状态 |
 | Docker | 构建镜像，可选执行容器更新命令 |
 | Docker Compose | 执行 `docker compose up -d --build` |
+| Compose 内容直填 | 直接编辑 compose 内容并启动，**不拉取仓库**、不构建镜像 |
 | rsync | 把发布目录同步到远端或本地目标 |
+
+「Compose 内容直填」用于部署**不来自仓库**的服务：在任务里直接粘贴
+`docker-compose.yml` 正文，保存后每次运行先 `docker compose pull` 再 `up`。
+这类任务不需要填写仓库地址，也不要求机器上装 git、tar。compose 文件固定在
+发布根下的 `compose-inline/docker-compose.yml`，因此 `./data` 这类相对路径
+挂载跨部署稳定、升级不会清空数据。要点：
+
+- 镜像用 `latest` 时在内容里写 `pull_policy: always`，否则本地已有同名 tag
+  时 Docker 可能复用旧镜像（该方式的部署也会显式 pull，两者都建议加上）
+- 该方式没有版本化发布，因此**不支持回滚**：要回退请把内容改回旧版本再重新运行
+- 私有镜像仓库暂不支持认证，请使用公开镜像或宿主机上已 `docker login` 过的镜像
 
 - **控制台**：总览大盘（成功率、14 天趋势）、任务管理、运行记录（实时日志、可取消）、
   统计（每日曲线、磁盘占用）、设置（调度并发、超时、数据保留、通知、网络代理、操作日志）

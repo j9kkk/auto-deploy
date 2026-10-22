@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -104,6 +104,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     docker_image             TEXT    NOT NULL DEFAULT '',
     docker_command           TEXT    NOT NULL DEFAULT '',
     docker_compose_file      TEXT    NOT NULL DEFAULT '',
+    -- 「Compose 内容直填」方式的 compose 文件正文；该方式不依赖仓库。
+    compose_content          TEXT    NOT NULL DEFAULT '',
     rsync_target             TEXT    NOT NULL DEFAULT '',
     rsync_options            TEXT    NOT NULL DEFAULT '-az --delete',
     -- 目标主机；为空表示在本机（控制机）执行，保持原有行为。
@@ -354,10 +356,21 @@ class Database:
             self._migrate_v7_to_v8(conn)
         if current < 9:
             self._migrate_v8_to_v9(conn)
+        if current < 10:
+            self._migrate_v9_to_v10(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
         )
+
+    def _migrate_v9_to_v10(self, conn: sqlite3.Connection) -> None:
+        """v10: 任务可直填 compose 内容，部署不再依赖仓库。
+
+        ``compose_content`` 存 compose 文件正文；只有「Compose 内容直填」
+        方式使用它，其它方式的该列保持空串。既有任务全部是仓库拉取形态，
+        默认空串即可，无需回填。
+        """
+        self._add_column(conn, "tasks", "compose_content", "TEXT NOT NULL DEFAULT ''")
 
     def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
         """v8: 新增远程主机表 hosts，并给任务/运行补主机维度。

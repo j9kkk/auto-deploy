@@ -24,9 +24,12 @@ from pathlib import Path
 
 from . import config, gitops
 from .deployer import (
+    COMPOSE_INLINE_DIR,
     DeployContext,
     DeployError,
+    REPO_FREE_METHODS,
     _prune_remote_releases,
+    compose_inline_dir,
     create_bundle,
     next_release_dir,
     preflight,
@@ -329,6 +332,11 @@ class DeployRunner:
                     "请在任务配置里重新选择目标主机"
                 )
         if host_row is not None:
+            if str(task.get("deploy_method") or "").lower() in REPO_FREE_METHODS:
+                return self._pipeline_repo_free(
+                    task, run_id, active, log, trigger=trigger, host_row=host_row,
+                    settings=settings, check=check,
+                )
             return self._pipeline_remote(
                 task, run_id, active, log, trigger=trigger, host_row=host_row,
                 settings=settings, check=check,
@@ -336,6 +344,12 @@ class DeployRunner:
 
         # Bundled per-task environment variables, then the task's own.
         env = self._task_env(task)
+
+        if str(task.get("deploy_method") or "").lower() in REPO_FREE_METHODS:
+            return self._pipeline_repo_free(
+                task, run_id, active, log, trigger=trigger, host_row=None,
+                settings=settings, check=check,
+            )
 
         log("--- 阶段: 环境检查 ---")
         for check_result in preflight(task):
@@ -488,6 +502,116 @@ class DeployRunner:
         keep = int(task.get("keep_releases") or settings.release_retention_count)
         if keep > 0:
             prune_releases(releases_root, current_link, keep=keep, log=log)
+
+        active.last_exit_code = ctx.last_exit_code
+        return "success", ctx.last_exit_code
+
+    # -- 不依赖仓库的流水线 ------------------------------------------------
+    def _pipeline_repo_free(
+        self,
+        task: dict[str, Any],
+        run_id: int,
+        active: ActiveRun,
+        log: Callable[[str], None],
+        *,
+        trigger: str,
+        host_row: dict[str, Any] | None,
+        settings: config.Settings,
+        check: Callable[[], bool],
+    ) -> tuple[str, int | None]:
+        """执行「Compose 内容直填」：无仓库、无源码、无打包。
+
+        与正常流水线的差异只有「没有输入可拉」这一件事：
+        * 不做 git（任务本就没有仓库地址），也 skipped 不适用于无提交的场景；
+        * 不暂存发布目录、不打包产物，发布目录仍按惯例占位，供 compose 文件
+          落在固定子目录里（见 deployer.COMPOSE_INLINE_DIR）；
+        * 部署、清理与运行记录写入完全复用既有实现。
+        """
+        task_id = int(task["id"])
+        proxy = config.proxy_env(settings, for_scripts=True)
+        env = self._task_env(task)
+
+        log("--- 阶段: 环境检查 ---")
+        inspect_target = None
+        if host_row is not None:
+            credential_row = None
+            if host_row.get("credential_id"):
+                credential_row = self.store.credentials.get(int(host_row["credential_id"]))
+            try:
+                inspect_target = build_target(
+                    host_row, credential_row,
+                    work_dir=config.TMP_DIR / f"task-{task_id}-host",
+                )
+            except TargetError as exc:
+                raise DeployError(str(exc)) from exc
+            log(f"目标主机: {describe_host(host_row)}")
+        for check_result in preflight(task, target=inspect_target):
+            mark = "✓" if check_result["ok"] else "✗"
+            log(f"{mark} {check_result['name']}")
+            if not check_result["ok"]:
+                log(f"! {check_result['message']}")
+                raise DeployError(check_result["message"])
+
+        # 两种执行位置各自解析路径：本机用 Path，远程用目标机上的字符串。
+        artifact_name = f"{_safe_name(task.get('name') or 'task')}-{run_id}.tar.gz"
+        if host_row is not None:
+            layout = resolve_remote_layout(host_row, task)
+            inspect_target.make_dirs(layout.base_dir)
+            inspect_target.make_dirs(layout.releases_root)
+            releases_root: Any = layout.releases_root
+            current_link: Any = layout.current_link
+            artifact: Any = f"{layout.base_dir.rstrip('/')}/artifacts/{artifact_name}"
+            release_dir: Any = f"{layout.releases_root.rstrip('/')}/{COMPOSE_INLINE_DIR}"
+        else:
+            local_releases_root, local_current_link = resolve_release_paths(task)
+            local_releases_root.mkdir(parents=True, exist_ok=True)
+            releases_root = local_releases_root
+            current_link = local_current_link
+            artifact = config.artifacts_dir(task_id) / artifact_name
+            release_dir = compose_inline_dir(local_releases_root)
+            release_dir.mkdir(parents=True, exist_ok=True)
+        log(f"发布目录: {releases_root}（compose 文件位于 {COMPOSE_INLINE_DIR}/ 子目录）")
+
+        remote = host_row is not None
+        ctx = DeployContext(
+            task=task,
+            run_id=run_id,
+            # 没有源码可引用：工作目录就是 compose 文件所在的固定目录，
+            # 这样准备脚本里的相对路径也有确定落点。
+            workspace=Path(str(release_dir)) if not remote else Path(),
+            release_dir=Path(str(release_dir)) if not remote else Path(),
+            releases_root=Path(str(releases_root)) if not remote else Path(),
+            current_link=Path(str(current_link)) if not remote else Path(),
+            artifact_path=Path(str(artifact)) if not remote else Path(),
+            env=env,
+            log=log,
+            log_batch=lambda lines: self._write_log_batch(active, lines),
+            check_cancelled=check,
+            kill_grace_seconds=settings.kill_grace_seconds,
+            handles=active.handles,
+            proxy=proxy,
+            target=inspect_target,
+            remote_workspace=str(release_dir) if remote else "",
+            remote_release_dir=str(release_dir) if remote else "",
+            remote_releases_root=str(releases_root) if remote else "",
+            remote_current_link=str(current_link) if remote else "",
+            remote_artifact_path=str(artifact) if remote else "",
+        )
+        self.store.runs.update_outputs(run_id, release_dir=str(release_dir), artifact_path="")
+
+        log("--- 阶段: 准备脚本 ---")
+        prepare = (task.get("prepare_script") or "").strip()
+        if prepare:
+            run_script_stage(ctx, prepare, stage="prepare")
+        else:
+            log("(未配置准备脚本，跳过)")
+
+        if check():
+            raise DeployError("任务已被取消")
+
+        log("--- 阶段: 部署（Compose 内容直填） ---")
+        run_deploy(ctx)
+        # 该方式没有版本产物，不触发历史清理：compose-inline 目录必须长期保留。
 
         active.last_exit_code = ctx.last_exit_code
         return "success", ctx.last_exit_code

@@ -22,6 +22,8 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{3,64}$")
 TASK_NAME_MAX = 80
 TASK_NAME_RE = re.compile(r"[A-Za-z_]{1,80}")
 SCRIPT_MAX = 200_000
+# compose 正文上限：比脚本更宽，但仍要防止一次请求塞进巨量内容。
+COMPOSE_CONTENT_MAX = 200_000
 
 DEPLOY_METHODS = set(deployer.DEPLOY_METHODS)
 SCHEDULE_TYPES = {"manual", "interval", "cron"}
@@ -50,6 +52,14 @@ def _clean_str(value: Any, *, limit: int = 500) -> str:
         return ""
     text = str(value).strip()
     return text[:limit]
+
+
+def _resolved_method(payload: Mapping[str, Any], existing: Mapping[str, Any]) -> str:
+    """本次请求生效的部署方式：新提交的优先，否则沿用既有值。"""
+    raw = payload.get("deploy_method")
+    if raw is None or raw == "":
+        raw = existing.get("deploy_method") or "script"
+    return str(raw).strip().lower()
 
 
 def _clean_int(value: Any, default: int, *, low: int, high: int) -> int:
@@ -157,9 +167,13 @@ def validate_task_payload(
     # --- repository ----------------------------------------------------
     if has("repo_url") or not partial:
         repo_url = _clean_str(payload.get("repo_url") or existing.get("repo_url"), limit=1000)
-        problem = gitops.validate_repo_url(repo_url)
-        if problem:
-            errors["repo_url"] = problem
+        # 不依赖仓库的部署方式（compose 内容直填）没有代码可拉，仓库地址留空是
+        # 合法状态；其它方式仍然必须填写。
+        repo_free = _resolved_method(payload, existing) in deployer.REPO_FREE_METHODS
+        if repo_url or not repo_free:
+            problem = gitops.validate_repo_url(repo_url)
+            if problem:
+                errors["repo_url"] = problem
         out["repo_url"] = repo_url
     if has("repo_branch") or not partial:
         branch = _clean_str(payload.get("repo_branch") or existing.get("repo_branch") or "main", limit=200)
@@ -335,6 +349,17 @@ def validate_task_payload(
                 errors["docker_compose_file"] = problem
         out["docker_compose_file"] = compose
 
+    if has("compose_content") or not partial:
+        # compose 正文原样保存（不 strip 内部内容），只拒绝超长与空内容在
+        # 方式必填检查里统一处理。这里不做 YAML 解析：标准库没有解析器，
+        # 真正的校验交给 docker compose 本身，报错信息也更准确。
+        content = str(payload.get("compose_content", existing.get("compose_content", "")) or "")
+        if len(content) > COMPOSE_CONTENT_MAX:
+            errors["compose_content"] = (
+                f"compose 内容不能超过 {COMPOSE_CONTENT_MAX // 1000} KB"
+            )
+        out["compose_content"] = content
+
     if has("rsync_target") or not partial:
         rsync_target = _clean_str(
             payload.get("rsync_target", existing.get("rsync_target", "")), limit=1000
@@ -391,6 +416,7 @@ def validate_task_payload(
             "docker": [("docker_image", "Docker 镜像名称"),
                        ("docker_command", "容器启动命令")],
             "docker_compose": [("docker_compose_file", "compose 文件路径")],
+            "compose_inline": [("compose_content", "compose 内容")],
             "rsync": [("rsync_target", "rsync 目标")],
         }
         for owner_method, fields in method_labels.items():
@@ -420,6 +446,8 @@ def _check_method_requirements(
         errors["service_name"] = "部署方式为 systemd 时必须填写服务名称"
     if method == "docker" and not value("docker_image"):
         errors["docker_image"] = "部署方式为 Docker 时必须填写镜像名称"
+    if method == "compose_inline" and not value("compose_content"):
+        errors["compose_content"] = "部署方式为 Compose 内容直填时必须填写 compose 内容"
     if method == "rsync" and not value("rsync_target"):
         errors["rsync_target"] = "部署方式为 rsync 时必须填写目标地址"
 

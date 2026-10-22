@@ -16,6 +16,7 @@ AD.views = {};
     ['systemd', '发布 + systemd', '切换软链后重启 systemd 服务并校验状态'],
     ['docker', 'Docker 构建', '在发布目录构建镜像，可选执行容器启动命令'],
     ['docker_compose', 'Docker Compose', '执行 docker compose up -d --build'],
+    ['compose_inline', 'Compose 内容直填', '直接编辑 compose 内容并启动，不拉取仓库'],
     ['rsync', 'rsync 同步', '把发布目录同步到远端或本地目标路径'],
   ];
 
@@ -35,17 +36,21 @@ AD.views = {};
     systemd: ['service_name', 'deploy_script'],
     docker: ['docker_image', 'docker_command'],
     docker_compose: ['docker_compose_file'],
+    compose_inline: ['compose_content'],
     rsync: ['rsync_target', 'rsync_options'],
   };
   const METHOD_FIELD_ALL = ['deploy_script', 'service_name', 'docker_image',
-    'docker_compose_file', 'docker_command', 'rsync_target', 'rsync_options'];
+    'docker_compose_file', 'compose_content', 'docker_command', 'rsync_target', 'rsync_options'];
   // 方式专属必填项：与后端 _check_method_requirements 对应。
   const METHOD_REQUIRED = {
     script: ['deploy_script'],
     systemd: ['service_name'],
     docker: ['docker_image'],
+    compose_inline: ['compose_content'],
     rsync: ['rsync_target'],
   };
+  // 不依赖仓库的部署方式：没有代码要拉，界面隐藏「代码源」并跳过相关提示。
+  const REPO_FREE_METHODS = ['compose_inline'];
   // 方式说明：把“选了它到底会发生什么”写在选择框下面，而不是让用户猜。
   const METHOD_DESCRIPTIONS = {
     artifact: '拉取代码并按打包路径生成 .tar.gz 产物，不发布、不切换软链。',
@@ -54,6 +59,8 @@ AD.views = {};
     systemd: '切换软链后重启指定的 systemd 服务并校验状态（在本机执行，不是远程服务器）。',
     docker: '在发布目录构建镜像；只有填写启动命令才会创建或更新容器。',
     docker_compose: '在发布目录执行 docker compose up -d --build 更新服务。',
+    compose_inline: '直接使用你填写的 compose 内容启动服务：不拉取仓库、不构建镜像，'
+      + '每次部署先拉取镜像再 up。相对路径（如 ./data）以固定工作目录为基准，升级不会清空数据。',
     rsync: '把发布目录同步到目标路径；只有配置了目标目录才会更新本地软链。',
   };
 
@@ -657,16 +664,19 @@ AD.views = {};
         <span class="faint" data-inline-schedule>${dedupeIn([AD.scheduleText(t), nextRunInlineText(t)]).map((text) =>
           e(text)).join(' · ')}</span>
         <div class="spacer"></div>
+        ${REPO_FREE_METHODS.includes(t.deploy_method) ? '' : `
         <button class="sm" data-inline-rollback="${t.id}">${ICONS.rollback}<span>回滚上一版本</span></button>
         <button class="sm" data-inline-rollback-selected disabled aria-describedby="inline-rollback-reason-${t.id}">${ICONS.rollback}<span>回滚到这个版本</span></button>
-        <button class="sm" data-inline-artifacts="${t.id}">${ICONS.download}<span>产物</span></button>
+        <button class="sm" data-inline-artifacts="${t.id}">${ICONS.download}<span>产物</span></button>`}
         <span data-inline-cancel-slot>${activeRun ? `<button class="sm danger" data-inline-cancel="${activeRun.id}">取消 #${activeRun.id}</button>` : ''}</span>
       </div>
       <div class="hint inline-rollback-reason" id="inline-rollback-reason-${t.id}" data-inline-rollback-reason aria-live="polite"></div>
       ${t.workspace_error ? `<div class="alert warning">工作目录：${e(t.workspace_error)}</div>` : ''}
 
       <dl class="kv">
-        <dt>仓库</dt><dd class="mono">${e(t.repo_url)} <span class="dim">@${e(t.repo_branch)}</span>${t.repo_subdir ? ' / ' + e(t.repo_subdir) : ''}</dd>
+        <dt>仓库</dt><dd class="mono">${REPO_FREE_METHODS.includes(t.deploy_method)
+          ? '<span class="faint">不拉取仓库（compose 内容直填）</span>'
+          : `${e(t.repo_url)} <span class="dim">@${e(t.repo_branch)}</span>${t.repo_subdir ? ' / ' + e(t.repo_subdir) : ''}`}</dd>
         <dt>发布目录</dt><dd class="mono truncate" title="${a(t.releases_root || '')}">${e(t.releases_root || '—')}</dd>
         <dt>环境检查</dt><dd>${checks.map((c) =>
           `<span class="badge ${c.ok ? 'on' : 'failed'}" title="${a(c.message)}">${c.ok ? '✓' : '✗'} ${e(c.name)}</span>`).join(' ') || '<span class="faint">—</span>'}</dd>
@@ -708,14 +718,19 @@ AD.views = {};
     });
     let selectedRun = null;
     let rollbackBusy = false;
+    // 无仓库方式不渲染回滚/产物按钮：这里必须容忍元素缺失，否则整个展开面板
+    // 会在绑定阶段抛错，连带日志区一起失效。
     const previousButton = root.querySelector('[data-inline-rollback]');
     const selectedButton = root.querySelector('[data-inline-rollback-selected]');
     const rollbackReason = root.querySelector('[data-inline-rollback-reason]');
     const updateRollbackControls = () => {
       const active = runs.some((run) => ['queued', 'running'].includes(run.status));
-      previousButton.disabled = rollbackBusy || active;
-      selectedButton.disabled = rollbackBusy || active || !selectedRun
-        || selectedRun.status !== 'success' || !selectedRun.release_dir;
+      if (previousButton) previousButton.disabled = rollbackBusy || active;
+      if (selectedButton) {
+        selectedButton.disabled = rollbackBusy || active || !selectedRun
+          || selectedRun.status !== 'success' || !selectedRun.release_dir;
+      }
+      if (!rollbackReason) return;
       rollbackReason.textContent = active ? '任务正在运行或排队，暂不能回滚。'
         : !selectedRun ? '选择一条成功的执行记录后可回滚到对应版本。'
         : selectedRun.status !== 'success' || !selectedRun.release_dir
@@ -747,8 +762,8 @@ AD.views = {};
         updateRollbackControls();
       }
     };
-    previousButton.addEventListener('click', () => requestRollback(previousButton, null));
-    selectedButton.addEventListener('click', () => requestRollback(selectedButton, selectedRun ? { ...selectedRun } : null));
+    previousButton?.addEventListener('click', () => requestRollback(previousButton, null));
+    selectedButton?.addEventListener('click', () => requestRollback(selectedButton, selectedRun ? { ...selectedRun } : null));
     root.querySelector('[data-inline-artifacts]')?.addEventListener('click', async () => {
       try {
         const artifacts = await AD.api.get(`/api/tasks/${taskId}/artifacts`);
@@ -1358,6 +1373,12 @@ AD.views = {};
                 <label>rsync 参数</label>
                 <input type="text" id="f-rsync_options" value="${a(t.rsync_options || '-az --delete')}">
               </div>
+              <div class="field span-2" data-method-field="compose_inline">
+                <label>Compose 内容<span class="req req-compose_content hidden">*</span></label>
+                <textarea id="f-compose_content" rows="14" spellcheck="false"
+                          placeholder="# docker-compose.yml&#10;services:&#10;  app:&#10;    image: ghcr.io/owner/app:latest&#10;    pull_policy: always&#10;    ports:&#10;      - &quot;8080:80&quot;&#10;    volumes:&#10;      - ./data:/data">${e(t.compose_content || '')}</textarea>
+                <div class="hint">直接粘贴 compose 文件正文，保存后每次部署按它启动服务，不拉取仓库。相对路径（如 <code class="code-inline">./data</code>）以固定的 <code class="code-inline">compose-inline/</code> 目录为基准，跨版本不变。镜像是 latest 时建议写 <code class="code-inline">pull_policy: always</code>，否则本地已有同名 tag 会复用旧镜像。</div>
+              </div>
             </div>
 
             <div class="section-title">回滚</div>
@@ -1418,8 +1439,10 @@ AD.views = {};
                 <div class="hint">部署结束后把结果发送到该地址，留空使用全局设置；与上面的触发地址无关</div>
               </div>
             </div>
+            <div data-method-field="artifact script release systemd docker docker_compose rsync">
             ${switchRow('f-skip_if_no_changes', (t.skip_if_no_changes === undefined ? true : t.skip_if_no_changes),
               '代码无变化时跳过部署', '提交哈希未变化时直接标记为「已跳过」，不执行构建与发布')}
+            </div>
             ${isEdit ? '' : switchRow('f-run_on_create', false,
               '创建后立即运行一次', '保存成功后马上排队执行，便于验证配置是否正确')}
           </section>
@@ -1586,25 +1609,35 @@ AD.views = {};
       const repoUrl = value('#f-repo_url');
       const branch = value('#f-repo_branch') || 'main';
       const subdir = value('#f-repo_subdir');
-      lines.push('代码：' + (repoUrl || '（未填写仓库地址）') + ' @ ' + branch + (subdir ? '，子目录 ' + subdir : ''));
-      const authMode = scanAuthMode();
-      if (authMode === 'credential') {
-        let credName = '';
-        (credSelect ? credSelect.querySelectorAll('option') : []).forEach((option) => {
-          if (String(option.value) === String(credSelect.value)) credName = option.textContent;
-        });
-        lines.push('认证：使用集中凭据' + (credName ? '「' + credName + '」' : ''));
-      } else if (authMode === 'token') {
-        lines.push('认证：任务内令牌' + (t.has_token ? '（已配置）' : ''));
+      const methodNow = methodSelect.value;
+      if (REPO_FREE_METHODS.includes(methodNow)) {
+        lines.push('代码：不拉取仓库（compose 内容直填）');
       } else {
-        lines.push('认证：无需认证' + (isEdit && t.has_token ? '（保存后清除已存令牌）' : ''));
+        lines.push('代码：' + (repoUrl || '（未填写仓库地址）') + ' @ ' + branch + (subdir ? '，子目录 ' + subdir : ''));
+        const authMode = scanAuthMode();
+        if (authMode === 'credential') {
+          let credName = '';
+          (credSelect ? credSelect.querySelectorAll('option') : []).forEach((option) => {
+            if (String(option.value) === String(credSelect.value)) credName = option.textContent;
+          });
+          lines.push('认证：使用集中凭据' + (credName ? '「' + credName + '」' : ''));
+        } else if (authMode === 'token') {
+          lines.push('认证：任务内令牌' + (t.has_token ? '（已配置）' : ''));
+        } else {
+          lines.push('认证：无需认证' + (isEdit && t.has_token ? '（保存后清除已存令牌）' : ''));
+        }
       }
       const method = methodSelect.value;
       const fieldLabels = { deploy_script: '部署脚本', service_name: '服务', docker_image: '镜像',
         docker_command: '启动命令', docker_compose_file: 'Compose 文件',
-        rsync_target: '目标', rsync_options: '参数' };
+        compose_content: 'Compose 内容', rsync_target: '目标', rsync_options: '参数' };
       const bits = (METHOD_FIELD_IDS[method] || []).map((id) => {
         const current = value('#f-' + id);
+        // compose 正文多行且可能很长：摘要里只说行数，不把正文塞进一行。
+        if (id === 'compose_content') {
+          const count = current ? current.split('\n').length : 0;
+          return count ? `Compose 内容 ${count} 行` : '';
+        }
         return current ? fieldLabels[id] + ' ' + current : '';
       }).filter(Boolean);
       lines.push('部署：' + methodLabel(method) + (bits.length ? ' — ' + bits.join('；') : ''));
@@ -1652,11 +1685,28 @@ AD.views = {};
       });
       const desc = backdrop.querySelector('#method-desc');
       if (desc) desc.textContent = METHOD_DESCRIPTIONS[method] || '';
+      // 不依赖仓库的方式把「代码源」整页藏掉：该页全是仓库与凭据，留着只会
+      // 让人以为必须填（后端也确实允许仓库地址为空）。
+      const repoFree = REPO_FREE_METHODS.includes(method);
+      const sourceTab = backdrop.querySelector('[data-form-tab="source"]');
+      if (sourceTab) sourceTab.classList.toggle('hidden', repoFree);
+      const sourcePanel = backdrop.querySelector('[data-form-panel="source"]');
+      if (sourcePanel) sourcePanel.classList.toggle('hidden', repoFree);
+      // 从「代码源」页切到无仓库方式时，若正停在该页则回到基础页，避免白屏。
+      if (repoFree) {
+        const activeTab = backdrop.querySelector('.form-tab-btn.active');
+        if (activeTab && activeTab.dataset.formTab === 'source') {
+          const basicTab = backdrop.querySelector('[data-form-tab="basic"]');
+          if (basicTab) basicTab.click();
+        }
+      }
       const rollbackHint = backdrop.querySelector('#rollback-hint');
       if (rollbackHint) {
         rollbackHint.textContent = method === 'systemd'
           ? '回滚时在目标发布目录执行，随后重启服务 ' + (value('#f-service_name') || '(尚未填写服务名)')
-          : '回滚时在目标发布目录执行；该方式回滚只切换本地软链，不会重建容器或同步远端';
+          : (method === 'compose_inline'
+            ? '该方式没有历史版本可回滚：请把 compose 内容改回旧内容后重新部署'
+            : '回滚时在目标发布目录执行；该方式回滚只切换本地软链，不会重建容器或同步远端');
       }
       renderSummary();
     };
@@ -1839,7 +1889,7 @@ AD.views = {};
           'f-name', 'basic');
         return;
       }
-      if (!payload.repo_url) {
+      if (!payload.repo_url && !REPO_FREE_METHODS.includes(payload.deploy_method)) {
         failOn('请填写仓库地址', 'f-repo_url', 'source');
         return;
       }
@@ -1850,7 +1900,7 @@ AD.views = {};
       for (const id of methodRequired) {
         if (!String(payload[id] || '').trim()) {
           const labels = { deploy_script: '部署脚本', service_name: 'systemd 服务名',
-            docker_image: '镜像名称', rsync_target: 'rsync 目标' };
+            docker_image: '镜像名称', compose_content: 'Compose 内容', rsync_target: 'rsync 目标' };
           failOn(`部署方式为「${methodLabel(payload.deploy_method)}」时必须填写「${labels[id] || id}」`,
             'f-' + id, 'build');
           return;
@@ -1943,6 +1993,9 @@ AD.views = {};
       docker_image: value('#f-docker_image'),
       docker_command: backdrop.querySelector('#f-docker_command').value,
       docker_compose_file: value('#f-docker_compose_file'),
+      // compose 内容保留原始换行与缩进，不能用 value() 的 trim 取值后再说；
+      // 首尾空白无意义，仍按 trim 提交。
+      compose_content: value('#f-compose_content'),
       rsync_target: value('#f-rsync_target'),
       rsync_options: value('#f-rsync_options'),
       env_vars: backdrop.querySelector('#f-env_vars').value,
@@ -1992,6 +2045,8 @@ AD.views = {};
     const runs = data.runs || [];
     const releases = data.releases || [];
     const checks = data.preflight || [];
+    // 不依赖仓库的方式没有版本化发布，也没有产物可下载/回滚。
+    const repoFree = REPO_FREE_METHODS.includes(t.deploy_method);
 
     const body = `
       <div class="grid cols-3" style="margin-bottom:16px">
@@ -2013,19 +2068,25 @@ AD.views = {};
 
       <div class="section-title">配置</div>
       <dl class="kv">
-        <dt>仓库</dt><dd class="mono">${e(t.repo_url)} <span class="dim">@${e(t.repo_branch)}</span>${t.repo_subdir ? ' / ' + e(t.repo_subdir) : ''}</dd>
+        <dt>仓库</dt><dd class="mono">${REPO_FREE_METHODS.includes(t.deploy_method)
+          ? '<span class="faint">不拉取仓库（compose 内容直填）</span>'
+          : `${e(t.repo_url)} <span class="dim">@${e(t.repo_branch)}</span>${t.repo_subdir ? ' / ' + e(t.repo_subdir) : ''}`}</dd>
         <dt>调度</dt><dd>${e(AD.scheduleText(t))}${t.enabled ? '' : ' <span class="badge off">已暂停</span>'}</dd>
         <dt>部署方式</dt><dd>${e(methodLabel(t.deploy_method))}</dd>
         <dt>发布目录</dt><dd class="mono">${e(t.releases_root || '')}</dd>
         <dt>当前版本</dt><dd class="mono">${e(t.current_link || '')}</dd>
-        <dt>打包路径</dt><dd class="mono">${t.artifact_paths ? e(t.artifact_paths).replace(/\n/g, ', ') : '<span class="faint">整个仓库</span>'}</dd>
+        <dt>打包路径</dt><dd class="mono">${REPO_FREE_METHODS.includes(t.deploy_method)
+          ? '<span class="faint">不打包（无源码）</span>'
+          : (t.artifact_paths ? e(t.artifact_paths).replace(/\n/g, ', ') : '<span class="faint">整个仓库</span>')}</dd>
         <dt>超时</dt><dd>${e(t.timeout_seconds)} 秒</dd>
         <dt>环境检查</dt><dd>${checks.map((c) =>
             `<span class="badge ${c.ok ? 'on' : 'failed'}" title="${a(c.message)}">${c.ok ? '✓' : '✗'} ${e(c.name)}</span>`).join(' ') || '<span class="faint">—</span>'}</dd>
       </dl>
 
-      <div class="section-title">发布版本（${data.releases_remote ? '远程' : releases.length}）</div>
-      ${data.releases_remote
+      <div class="section-title">发布版本（${data.releases_remote ? '远程' : (repoFree ? '不适用' : releases.length)}）</div>
+      ${repoFree
+        ? '<p class="faint">该方式没有版本化发布：服务由 compose 内容决定，改内容后重新运行即可。</p>'
+        : data.releases_remote
         ? `<p class="faint">${e(data.releases_note || '发布版本位于目标主机上')}</p>`
         : releases.length ? `<ul class="release-list">${releases.map((r) => `
         <li>
@@ -2055,7 +2116,10 @@ AD.views = {};
       title: t.name,
       size: 'wide',
       body,
-      footerLeft: `<button data-rollback>回滚上一版本</button>
+      // 无仓库方式没有历史版本与打包产物：留着按钮只会点出错误提示。
+      footerLeft: repoFree
+        ? `<button data-export>导出配置</button>`
+        : `<button data-rollback>回滚上一版本</button>
                    <button data-download>下载产物</button>
                    <button data-export>导出配置</button>`,
       footer: '<button data-close>关闭</button>'
@@ -2078,7 +2142,8 @@ AD.views = {};
       AD.openTaskForm(taskId);
     });
 
-    backdrop.querySelector('[data-download]').addEventListener('click', async (event) => {
+    // 下载与回滚按钮在无仓库方式下不渲染，绑定要容错（null 上挂监听会抛错）。
+    backdrop.querySelector('[data-download]')?.addEventListener('click', async (event) => {
       try {
         const data = await AD.api.get(`/api/tasks/${taskId}/artifacts`);
         if (!data.artifacts.length) { AD.toastError('暂无打包产物'); return; }
@@ -2098,7 +2163,7 @@ AD.views = {};
       window.location.href = `/api/tasks/${taskId}/export`;
     });
 
-    backdrop.querySelector('[data-rollback]').addEventListener('click', async (event) => {
+    backdrop.querySelector('[data-rollback]')?.addEventListener('click', async (event) => {
       const confirmed = await AD.confirm({
         title: '回滚到上一版本',
         message: '确定要把 current 软链切换到上一个发布版本吗？',

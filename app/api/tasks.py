@@ -14,6 +14,7 @@ from .. import config
 from ..deployer import (
     METHOD_LABELS,
     METHOD_BINARIES,
+    REPO_FREE_METHODS,
     REQUIRED_BINARIES,
     cleanup_path,
     current_release,
@@ -89,23 +90,35 @@ def _decorate(
         last_run = runs[0] if runs else None
     enriched["last_run"] = last_run
     # Report whether the checkout exists so the UI can offer a first run hint.
+    if str(task.get("deploy_method") or "").lower() in REPO_FREE_METHODS:
+        # 不依赖仓库的方式没有 Git 工作副本：说清原因，否则界面会一直提示
+        # 「首次运行前需要拉取代码」，而这类任务根本不需要拉取。
+        enriched["workspace_exists"] = True
+        enriched["workspace"] = ""
+        enriched["workspace_note"] = "该部署方式不拉取仓库，没有 Git 工作副本"
+    else:
+        _describe_workspace(task, enriched)
+    enriched["releases_root"], enriched["current_link"] = (
+        str(part) for part in resolve_release_paths(task)
+    )
+    return enriched
+
+
+def _describe_workspace(task: dict[str, Any], enriched: dict[str, Any]) -> None:
+    """把任务的 Git 工作副本位置与存在性写进响应，供界面判断首次运行提示。"""
     try:
         workspace = config.workspace_dir_for_task(task)
     except ValueError as exc:
         enriched["workspace_error"] = str(exc)
         enriched["workspace_exists"] = False
         enriched["workspace"] = ""
-    else:
-        if not (workspace / ".git").exists():
-            legacy = config.workspace_dir(int(task["id"]))
-            if legacy in config.owned_workspace_dirs(task) and (legacy / ".git").exists():
-                workspace = legacy
-        enriched["workspace_exists"] = (workspace / ".git").exists()
-        enriched["workspace"] = str(workspace)
-    enriched["releases_root"], enriched["current_link"] = (
-        str(part) for part in resolve_release_paths(task)
-    )
-    return enriched
+        return
+    if not (workspace / ".git").exists():
+        legacy = config.workspace_dir(int(task["id"]))
+        if legacy in config.owned_workspace_dirs(task) and (legacy / ".git").exists():
+            workspace = legacy
+    enriched["workspace_exists"] = (workspace / ".git").exists()
+    enriched["workspace"] = str(workspace)
 
 
 @router.get("")
