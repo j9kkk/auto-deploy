@@ -2893,6 +2893,160 @@ def run() -> int:
           "other" in picked and "renamed" in picked, str(picked))
 
     # ------------------------------------------------------------------
+    section("Compose 内容直填（不依赖仓库）")
+
+    from unittest.mock import patch as inline_patch
+
+    from app import deployer as deployer_mod2
+    from app.deployer import (
+        COMPOSE_INLINE_DIR,
+        REPO_FREE_METHODS,
+        compose_inline_dir,
+        compose_inline_path,
+        list_releases,
+        preflight as _preflight,
+        stop_task_containers as _stop_containers,
+    )
+
+    def inline_result_of(command, exit_code=0, output=""):
+        return deployer_mod2.CommandResult(
+            command=command, exit_code=exit_code, output=output, duration_ms=1
+        )
+
+    check("方式已登记为不依赖仓库", "compose_inline" in REPO_FREE_METHODS)
+    check("方式已进入部署方式清单", "compose_inline" in deployer_mod2.DEPLOY_METHODS
+          and "compose_inline" in deployer_mod2._DEPLOY_DISPATCH)
+    check("方式有中文标签",
+          deployer_mod2.METHOD_LABELS.get("compose_inline") == "Compose 内容直填")
+
+    inline_root = tmp_root / "inline-releases"
+    check("固定目录名稳定", compose_inline_dir(inline_root) == inline_root / COMPOSE_INLINE_DIR)
+    check("compose 文件名固定",
+          compose_inline_path(inline_root).name == "docker-compose.yml")
+    # 关键回归：该固定目录绝不能被当成历史发布清掉，否则挂载数据会跟着消失。
+    (inline_root / COMPOSE_INLINE_DIR).mkdir(parents=True)
+    (inline_root / "20260101-000000-abcdef12").mkdir()
+    releases_seen = [p.name for p in list_releases(inline_root)]
+    check("固定目录不计入历史发布", COMPOSE_INLINE_DIR not in releases_seen, str(releases_seen))
+    check("正常发布目录仍被列出", "20260101-000000-abcdef12" in releases_seen)
+
+    # 校验：仓库地址可为空，但内容必填；其它方式仍必须填仓库。
+    inline_ok = validate_task_payload({
+        "name": "Inline_Compose",
+        "deploy_method": "compose_inline",
+        "compose_content": "services:\n  app:\n    image: nginx:alpine\n",
+    })
+    check("无仓库方式允许空仓库地址", inline_ok.get("repo_url", "") == "")
+    check("compose 内容原样保存", inline_ok["compose_content"].endswith("nginx:alpine\n"))
+    for label, payload, field in (
+        ("缺内容被拒绝",
+         {"name": "x", "deploy_method": "compose_inline"}, "compose_content"),
+        ("内容超长被拒绝",
+         {"name": "x", "deploy_method": "compose_inline",
+          "compose_content": "a" * 200_001}, "compose_content"),
+        ("其它方式仍要求仓库地址",
+         {"name": "x", "deploy_method": "release"}, "repo_url"),
+    ):
+        try:
+            validate_task_payload(payload)
+        except ValidationError as exc:
+            check(label, field in exc.errors, f"错误字段为 {list(exc.errors)}")
+        else:
+            check(label, False, "未抛出校验错误")
+    # 互斥：内容字段只属于该方式。
+    try:
+        validate_task_payload({
+            "name": "x", "repo_url": "https://github.com/a/b.git",
+            "deploy_method": "script", "deploy_script": "echo hi",
+            "compose_content": "services: {}",
+        })
+    except ValidationError as exc:
+        check("其它方式填 compose 内容被拒绝", "compose_content" in exc.errors)
+    else:
+        check("其它方式填 compose 内容被拒绝", False)
+
+    # 无仓库方式不因缺 git/tar 被拦住。
+    no_binary_checks = _preflight({"deploy_method": "compose_inline"}, target=None)
+    check("无仓库方式不检查 git/tar",
+          all(c["name"] not in {"git", "tar"} for c in no_binary_checks),
+          str([c["name"] for c in no_binary_checks]))
+    check("无仓库方式只要求 docker",
+          [c["name"] for c in no_binary_checks] == ["docker"])
+
+    # 部署命令：先 pull（跳过纯 build 服务）再 up，且项目目录固定。
+    recorded: list[list[str]] = []
+    written: dict[str, str] = {}
+
+    class _FakeTarget:
+        is_remote = False
+
+        def which(self, binary):
+            return binary == "docker"
+
+        def run(self, args, **kwargs):
+            recorded.append(list(args))
+            return CommandResult(" ".join(args), 0, "", 0)
+
+    def _fake_write(ctx, path, content):
+        written[str(path)] = content
+
+    inline_ctx = deployer_mod2.DeployContext(
+        task={"id": 9001, "name": "Inline", "deploy_method": "compose_inline",
+              "compose_content": "services:\n  app:\n    image: nginx:alpine\n"},
+        run_id=1,
+        workspace=inline_root,
+        release_dir=compose_inline_dir(inline_root),
+        releases_root=inline_root,
+        current_link=inline_root / "current",
+        artifact_path=tmp_root / "inline.tar.gz",
+        target=_FakeTarget(),
+    )
+    real_supports = deployer_mod2._supports_compose_v2
+    real_write = deployer_mod2._write_compose_file
+    deployer_mod2._supports_compose_v2 = lambda target=None: True
+    deployer_mod2._write_compose_file = _fake_write
+    try:
+        deployer_mod2.deploy_compose_inline(inline_ctx)
+    finally:
+        deployer_mod2._supports_compose_v2 = real_supports
+        deployer_mod2._write_compose_file = real_write
+    joined = [" ".join(args) for args in recorded]
+    check("先拉取镜像再启动", len(joined) == 2 and " pull " in f" {joined[0]} "
+          and " up " in f" {joined[1]} ", str(joined))
+    check("pull 跳过纯 build 服务", "--ignore-buildable" in joined[0])
+    check("使用固定项目目录",
+          all("--project-directory" in args for args in recorded), str(joined))
+    check("compose 文件落在固定目录",
+          COMPOSE_INLINE_DIR in list(written)[0] if written else False, str(list(written)))
+    check("内容原样写入", next(iter(written.values()), "").endswith("nginx:alpine\n"))
+
+    # compose_inline 的容器清理按项目标签走，不依赖已删除的 compose 文件。
+    cleanup_calls: list[list[str]] = []
+
+    def _cleanup_run(args, **kwargs):
+        cleanup_calls.append(list(args))
+        if list(args)[:2] == ["docker", "ps"]:
+            return inline_result_of(" ".join(args), output=(
+                "inline-1\tcom.docker.compose.project=autodeploy-inline-task\n"
+                "foreign-1\tcom.docker.compose.project=someone-else\n"))
+        return inline_result_of(" ".join(args))
+
+    with inline_patch.object(deployer_mod, "command_exists", return_value=True), \
+            inline_patch.object(deployer_mod, "run_command", side_effect=_cleanup_run):
+        removed_names = _stop_containers(
+            {"id": 9002, "name": "Inline_Task", "deploy_method": "compose_inline"},
+            log=lambda _m: None)
+    check("无仓库方式按标签移除容器", removed_names == ["inline-1"], str(removed_names))
+    check("无仓库方式不触碰他人容器",
+          all("foreign-1" not in " ".join(call) for call in cleanup_calls))
+
+    # 回滚明确拒绝：没有历史版本可直接切回。
+    ok, message = deployer_mod2.rollback_task(
+        {"id": 9003, "name": "Inline_Rb", "deploy_method": "compose_inline"},
+        log=lambda _m: None)
+    check("无仓库方式拒绝回滚", ok is False and "compose 内容改回旧内容" in message, message)
+
+    # ------------------------------------------------------------------
     section("一键自我更新")
 
     from unittest.mock import patch

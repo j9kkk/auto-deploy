@@ -16,10 +16,12 @@ If anything fails before the swap, the previous release keeps serving traffic.
 
 from __future__ import annotations
 
+import base64
 import fnmatch
 import glob
 import os
 import re
+import shlex
 import shutil
 import tarfile
 import time
@@ -38,6 +40,7 @@ DEPLOY_METHODS = (
     "systemd",        # release + systemctl restart
     "docker",         # docker build (+ optional run/update command)
     "docker_compose", # docker compose up -d --build
+    "compose_inline", # compose 内容直填：不拉仓库，直接 compose up
     "rsync",          # push the release to a remote target
 )
 
@@ -48,8 +51,12 @@ METHOD_LABELS = {
     "systemd": "发布 + systemd 重启",
     "docker": "Docker 构建/启动",
     "docker_compose": "Docker Compose",
+    "compose_inline": "Compose 内容直填",
     "rsync": "rsync 同步到远程",
 }
+
+# 不需要仓库的部署方式：这些任务没有源码可拉，流水线跳过拉代码、暂存与打包。
+REPO_FREE_METHODS = frozenset({"compose_inline"})
 
 # Files never staged into a release or a bundle.
 _STAGE_EXCLUDES = (
@@ -358,6 +365,28 @@ def current_release(releases_root: Path, current_link: Path) -> Path | None:
     return None
 
 
+# 「Compose 内容直填」在发布根下的固定子目录名。相对路径挂载（``./data``）
+# 以 compose 文件的所在目录为基准，因此文件必须写在这个跨运行不变的目录里，
+# 而不是每次新建的 releases/<时间戳> 里——后者会让数据目录每次部署都变成
+# 「空的新目录」，看起来就是数据被清空。
+COMPOSE_INLINE_DIR = "compose-inline"
+COMPOSE_INLINE_FILE = "docker-compose.yml"
+# 用户内容里出现这些写法时，日志里会提示它们相对于这个固定目录解析。
+_COMPOSE_REPO_FREE_NOTE = (
+    "相对路径（如 ./data 或 build: .）以 {dir} 为基准解析；"
+    "该目录不随发布版本变化，升级不会清空挂载的数据"
+)
+
+
+def compose_inline_dir(releases_root: Path) -> Path:
+    """「Compose 内容直填」写入 compose 文件的固定目录。"""
+    return releases_root / COMPOSE_INLINE_DIR
+
+
+def compose_inline_path(releases_root: Path) -> Path:
+    return compose_inline_dir(releases_root) / COMPOSE_INLINE_FILE
+
+
 def previous_release(releases_root: Path, current_link: Path) -> Path | None:
     """The newest release older than the one ``current`` points at."""
     active = current_release(releases_root, current_link)
@@ -379,7 +408,12 @@ def list_releases(releases_root: Path) -> list[Path]:
     entries = [
         entry
         for entry in releases_root.iterdir()
-        if entry.is_dir() and not entry.is_symlink() and not entry.name.startswith(".")
+        if entry.is_dir()
+        and not entry.is_symlink()
+        and not entry.name.startswith(".")
+        # 「Compose 内容直填」的固定工作目录不是发布版本：它跨运行复用，
+        # 若被当作历史发布清理，挂载在其中的数据会被一并删除。
+        and entry.name != COMPOSE_INLINE_DIR
     ]
     # The timestamp prefix sorts chronologically; mtime is the tiebreaker.
     entries.sort(key=lambda p: (p.name, p.stat().st_mtime), reverse=True)
@@ -832,6 +866,130 @@ def _supports_compose_v2(target: Any = None) -> bool:
     return probe.ok
 
 
+def _write_compose_file(ctx: DeployContext, path: Any, content: str) -> None:
+    """把 compose 正文写到目标位置。
+
+    本机直接写文件；远程目标没有本地文件系统，改用 base64 中转到远端再解码。
+    先编码再传输，避免 YAML 里的引号、``$`` 与反斜杠被 shell 二次解释——
+    用户写的 compose 文件不该因为 shell 规则变形。
+    """
+    target = ctx._exec_target()
+    if not ctx.is_remote:
+        directory = Path(str(path)).parent
+        directory.mkdir(parents=True, exist_ok=True)
+        Path(str(path)).write_text(content, encoding="utf-8")
+        return
+
+    target.make_dirs(str(Path(str(path)).parent))
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    # 用 heredoc 一次性投递整段 base64：分块 printf 会在超大文件上拼出长脚本，
+    # 而 heredoc 的内容按行传给 bash，不受命令行长度限制。
+    quoted = _quote(path)
+    script = "\n".join([
+        f"base64 -d > {quoted} <<'AUTODEPLOY_COMPOSE_EOF'",
+        *[encoded[i:i + 76] for i in range(0, len(encoded), 76)],
+        "AUTODEPLOY_COMPOSE_EOF",
+    ])
+    result = target.run_script(
+        script,
+        timeout=_timeout_for(ctx),
+        log=ctx.log,
+        log_batch=ctx.log_batch,
+        label="compose-write",
+        handle_out=ctx.handles,
+        check_cancelled=ctx.check_cancelled,
+        kill_grace_seconds=ctx.kill_grace_seconds,
+    )
+    if not result.ok:
+        reason = "已取消" if result.cancelled else (result.error or f"退出码 {result.exit_code}")
+        raise DeployError(f"写入 compose 文件失败: {reason}")
+
+
+def _quote(value: Any) -> str:
+    return shlex.quote(str(value))
+
+
+def deploy_compose_inline(ctx: DeployContext) -> None:
+    """用任务内直填的 compose 内容启动服务，全程不碰仓库。
+
+    与 ``docker_compose`` 的差别：
+    * 内容来自任务字段，不是发布目录里的文件，因此不拉代码、不暂存、不打包；
+    * compose 文件写在发布根下跨运行固定的 ``compose-inline/`` 目录里，
+      让 ``./data`` 这类相对挂载有稳定基准（见 ``COMPOSE_INLINE_DIR``）；
+    * 先 ``pull`` 再 ``up``：该方式的「发布」语义就是换镜像，不显式拉取的话
+      本地同名 tag 会一直复用旧镜像，改内容也不会生效。
+    """
+    target = ctx._exec_target()
+    if not target.which("docker"):
+        raise DeployError("未找到 docker 命令，无法使用 Compose 内容直填方式")
+    content = str(ctx.task.get("compose_content") or "")
+    if not content.strip():
+        raise DeployError("部署方式为 Compose 内容直填，但 compose 内容为空")
+
+    releases_root = ctx.releases_root_path
+    work_dir = f"{str(releases_root).rstrip('/')}/{COMPOSE_INLINE_DIR}"
+    compose_path = f"{work_dir}/{COMPOSE_INLINE_FILE}"
+
+    ctx.log(f"--- 阶段: 写入 compose 文件 ({compose_path}) ---")
+    _write_compose_file(ctx, compose_path, content)
+    ctx.log(_COMPOSE_REPO_FREE_NOTE.format(dir=work_dir))
+
+    env = ctx.script_env()
+    base = ["docker", "compose"] if _supports_compose_v2(target) else ["docker-compose"]
+    project_name = compose_project_name(ctx.task)
+
+    # pull 放在 up 之前：该方式的「发布」就是换镜像，不显式拉取会让本地同名
+    # tag 一直复用旧镜像。`--ignore-buildable` 跳过只有 build 段的服
+    # （compose 会因这类服务没有可拉取的镜像而整体报错）；旧版 compose 不认识
+    # 该参数，失败后再退回不带它的写法。
+    ctx.log("--- 阶段: 拉取镜像 ---")
+    pull_args = [*base, "-f", compose_path, "-p", project_name,
+                 "--project-directory", work_dir, "pull"]
+    pull = ctx.exec([*pull_args, "--ignore-buildable"], cwd=work_dir, env=env,
+                    timeout=_timeout_for(ctx), label="compose-pull")
+    if not pull.ok and not pull.cancelled:
+        lowered = (pull.output or "") + (pull.error or "")
+        if "unknown flag" in lowered or "unknown shorthand" in lowered:
+            ctx.log("当前 compose 版本不支持 --ignore-buildable，改用普通 pull")
+            pull = ctx.exec(pull_args, cwd=work_dir, env=env,
+                            timeout=_timeout_for(ctx), label="compose-pull")
+    if not pull.ok:
+        if pull.cancelled:
+            raise DeployError("任务已被取消")
+        # 拉取失败不直接中止：本地可能已有可用镜像（离线或私有库未登录），
+        # 继续 up 并让真正的错误在启动阶段暴露。
+        ctx.log(f"! 镜像拉取未成功（{pull.error or '退出码 ' + str(pull.exit_code)}），"
+                "将尝试用本地已有镜像启动")
+
+    ctx.log(f"--- 阶段: docker compose up ({COMPOSE_INLINE_FILE}) ---")
+    result = ctx.exec(
+        [*base, "-f", compose_path, "-p", project_name, "--project-directory", work_dir,
+         "up", "-d", "--remove-orphans"],
+        cwd=work_dir,
+        env=env,
+        timeout=_timeout_for(ctx),
+        label="compose",
+    )
+    if not result.ok and not result.cancelled:
+        # 与 docker_compose 一致：旧命名的遗留容器占着容器名时清理后重试一次。
+        stale = _conflicting_stale_containers(result.output, project_name, target=target)
+        if stale:
+            ctx.log(f"! 检测到旧部署遗留容器占用容器名: {', '.join(stale)}")
+            if _remove_stale_containers(ctx, stale):
+                ctx.log("已清理遗留容器，重试部署…")
+                result = ctx.exec(
+                    [*base, "-f", compose_path, "-p", project_name,
+                     "--project-directory", work_dir, "up", "-d", "--remove-orphans"],
+                    cwd=work_dir,
+                    env=env,
+                    timeout=_timeout_for(ctx),
+                    label="compose",
+                )
+    if not result.ok:
+        reason = "已取消" if result.cancelled else (result.error or f"退出码 {result.exit_code}")
+        raise DeployError(f"docker compose 启动失败: {reason}")
+
+
 def deploy_rsync(ctx: DeployContext) -> None:
     """Push the release to a remote (or local) target with rsync."""
     executor_target = ctx._exec_target()
@@ -871,6 +1029,7 @@ _DEPLOY_DISPATCH: dict[str, Callable[[DeployContext], None]] = {
     "systemd": deploy_systemd,
     "docker": deploy_docker,
     "docker_compose": deploy_docker_compose,
+    "compose_inline": deploy_compose_inline,
     "rsync": deploy_rsync,
 }
 
@@ -1049,6 +1208,13 @@ def rollback_task(
     传入 ``target``（远程执行目标）与 ``layout`` 时走远程回滚：换链与脚本都在
     目标主机上完成，本地路径逻辑完全不变。
     """
+    # 「Compose 内容直填」没有版本化的发布目录：容器状态由任务里那份 compose
+    # 内容决定，历史运行也没有保存当时的正文，切换软链毫无意义。明确拒绝，
+    # 避免用户以为回滚成功而实际服务没变。
+    if str(task.get("deploy_method") or "").strip().lower() == "compose_inline":
+        return False, (
+            "Compose 内容直填方式没有历史版本可供回滚：请把 compose 内容改回旧内容后重新部署"
+        )
     if target is not None and getattr(target, "is_remote", False) and layout is not None:
         return _remote_rollback(
             task, selected_run=selected_run, target=target, layout=layout,
@@ -1236,6 +1402,7 @@ METHOD_BINARIES: dict[str, str] = {
     "systemd": "systemctl",
     "docker": "docker",
     "docker_compose": "docker",
+    "compose_inline": "docker",
     "rsync": "rsync",
 }
 
@@ -1252,11 +1419,17 @@ def preflight(task: dict[str, Any], *, target: Any = None) -> list[dict[str, Any
     checks: list[dict[str, Any]] = []
     remote = bool(target is not None and getattr(target, "is_remote", False))
     which = target.which if target is not None else command_exists
+    # 不依赖仓库的方式既没有源码要拉、也没有产物要打包：git/tar 缺失不应
+    # 拦住它们（用户完全可以在一个没装 git 的机器上跑 compose）。
+    method = (task.get("deploy_method") or "script").strip().lower()
+    repo_free = method in REPO_FREE_METHODS
     for binary, message in REQUIRED_BINARIES.items():
+        if repo_free:
+            continue
         if remote and binary == "git":
             continue
         checks.append({"name": binary, "ok": which(binary), "message": message})
-    if remote:
+    if remote and not repo_free:
         # rsync 是源码镜像的前提；缺了就没法把代码送过去。
         checks.append({
             "name": "rsync",
@@ -1402,14 +1575,27 @@ def stop_task_containers(
             log(message)
 
     method = str(task.get("deploy_method") or "").strip().lower()
-    if method not in {"docker", "docker_compose"}:
+    if method not in {"docker", "docker_compose", "compose_inline"}:
         return []
     if not _docker_available():
         note("! 未找到 docker 命令，跳过容器清理")
         return []
 
     removed: list[str] = []
-    if method == "docker_compose":
+    if method == "compose_inline":
+        # compose 文件是从任务字段生成的，任务记录删除后内容已无从取得，
+        # 无法再让 compose 解析它；直接按项目标签逐个移除容器与网络。
+        project = compose_project_name(task)
+        before = _running_compose_containers(project)
+        note(f"--- 按项目标签停止 compose 项目 {project} ---")
+        for name in before:
+            note(f"--- 强制移除容器 {name} ---")
+            removal = run_command(["docker", "rm", "-f", name], timeout=60, log=log)
+            if removal.ok:
+                removed.append(name)
+        network = f"{project}_default"
+        run_command(["docker", "network", "rm", network], timeout=60, log=log)
+    elif method == "docker_compose":
         project = compose_project_name(task)
         # 先取一次名单：compose down 成功后容器已消失，事后查询会得到空列表。
         before = _running_compose_containers(project)
