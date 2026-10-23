@@ -111,6 +111,16 @@ class DeployContext:
     remote_releases_root: str = ""
     remote_current_link: str = ""
     remote_artifact_path: str = ""
+    # 「Compose 内容直填」的固定工作目录（compose 文件与容器数据都在这）。
+    # 本机为 Path，远程为目标机上的字符串；为空时按任务 id 推算本机路径。
+    persistent_dir: Any = None
+
+    @property
+    def persistent_path(self) -> Any:
+        """持久化工作目录：远程返回远端路径字符串，本机返回 Path。"""
+        if self.persistent_dir:
+            return self.persistent_dir
+        return compose_inline_dir(int(self.task.get("id") or 0))
 
     def _exec_target(self) -> Any:
         """惰性取得执行目标：未显式注入时即本机。"""
@@ -365,12 +375,15 @@ def current_release(releases_root: Path, current_link: Path) -> Path | None:
     return None
 
 
-# 「Compose 内容直填」在发布根下的固定子目录名。相对路径挂载（``./data``）
-# 以 compose 文件的所在目录为基准，因此文件必须写在这个跨运行不变的目录里，
-# 而不是每次新建的 releases/<时间戳> 里——后者会让数据目录每次部署都变成
-# 「空的新目录」，看起来就是数据被清空。
-COMPOSE_INLINE_DIR = "compose-inline"
+# 「Compose 内容直填」的工作目录名。相对路径挂载（``./data``）以 compose 文件
+# 的所在目录为基准，因此文件必须写在一个跨运行不变的目录里，而不是每次新建
+# 的 releases/<时间戳>——后者会让数据目录每次部署都变成「空的新目录」。
+# 该目录放在 config.PERSISTENT_DIR 下，与可重建的 releases/ 分开：发布历史
+# 清理与删除任务都不会动它（见 config.owned_data_dirs）。
 COMPOSE_INLINE_FILE = "docker-compose.yml"
+# 0.4.1 把 compose 内联的工作目录放在 releases/<...>/compose-inline；0.4.2 起
+# 迁到 config.PERSISTENT_DIR。旧目录名仍需被发布清理逻辑忽略。
+LEGACY_COMPOSE_INLINE_DIR = "compose-inline"
 # 用户内容里出现这些写法时，日志里会提示它们相对于这个固定目录解析。
 _COMPOSE_REPO_FREE_NOTE = (
     "相对路径（如 ./data 或 build: .）以 {dir} 为基准解析；"
@@ -378,13 +391,44 @@ _COMPOSE_REPO_FREE_NOTE = (
 )
 
 
-def compose_inline_dir(releases_root: Path) -> Path:
-    """「Compose 内容直填」写入 compose 文件的固定目录。"""
-    return releases_root / COMPOSE_INLINE_DIR
+def compose_inline_dir(task_id: int) -> Path:
+    """「Compose 内容直填」写入 compose 文件与挂载数据的固定目录。"""
+    return config.persistent_dir(int(task_id))
 
 
-def compose_inline_path(releases_root: Path) -> Path:
-    return compose_inline_dir(releases_root) / COMPOSE_INLINE_FILE
+def compose_inline_path(task_id: int) -> Path:
+    return compose_inline_dir(task_id) / COMPOSE_INLINE_FILE
+
+
+def migrate_legacy_compose_inline(
+    task: dict[str, Any], releases_root: Path, *, log: Callable[[str], None] | None = None
+) -> bool:
+    """把 0.4.1 的 releases/<...>/compose-inline 迁移到持久化目录。
+
+    0.4.1 只有一个固定目录（同任务所有部署共用），所以搬过去即可；目标已
+    存在时不覆盖——那说明已经迁移过，或用户在新版本里已经跑过一次部署，
+    此时旧目录留给用户自行确认，绝不盲目合并两个数据目录。
+    迁移是**复制**而不是移动：复制成功后才删旧目录，中途失败不会两边都没。
+    """
+    legacy = Path(releases_root) / LEGACY_COMPOSE_INLINE_DIR
+    target = compose_inline_dir(int(task.get("id") or 0))
+    if not legacy.is_dir() or legacy.is_symlink():
+        return False
+    if target.exists():
+        if log:
+            log(f"! 发现旧版 compose 工作目录 {legacy}，但新目录已存在，跳过迁移（请自行确认数据）")
+        return False
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(legacy, target, symlinks=True)
+    except OSError as exc:
+        if log:
+            log(f"! 迁移旧 compose 工作目录失败（旧目录未删除）: {exc}")
+        return False
+    shutil.rmtree(legacy, ignore_errors=True)
+    if log:
+        log(f"已把旧版 compose 工作目录迁移到 {target}（容器挂载的数据随之保留）")
+    return True
 
 
 def previous_release(releases_root: Path, current_link: Path) -> Path | None:
@@ -411,9 +455,10 @@ def list_releases(releases_root: Path) -> list[Path]:
         if entry.is_dir()
         and not entry.is_symlink()
         and not entry.name.startswith(".")
-        # 「Compose 内容直填」的固定工作目录不是发布版本：它跨运行复用，
-        # 若被当作历史发布清理，挂载在其中的数据会被一并删除。
-        and entry.name != COMPOSE_INLINE_DIR
+        # 0.4.1 曾把 compose 内联的工作目录放在这里；0.4.2 起已迁到
+        # config.PERSISTENT_DIR。这一条保留给尚未完成自动迁移的旧实例兜底：
+        # 该目录里是容器挂载的业务数据，绝不能被当作历史发布清掉。
+        and entry.name != LEGACY_COMPOSE_INLINE_DIR
     ]
     # The timestamp prefix sorts chronologically; mtime is the tiebreaker.
     entries.sort(key=lambda p: (p.name, p.stat().st_mtime), reverse=True)
@@ -914,8 +959,9 @@ def deploy_compose_inline(ctx: DeployContext) -> None:
 
     与 ``docker_compose`` 的差别：
     * 内容来自任务字段，不是发布目录里的文件，因此不拉代码、不暂存、不打包；
-    * compose 文件写在发布根下跨运行固定的 ``compose-inline/`` 目录里，
-      让 ``./data`` 这类相对挂载有稳定基准（见 ``COMPOSE_INLINE_DIR``）；
+    * compose 文件与挂载数据都在 ``config.PERSISTENT_DIR/task-<id>/``，跨运行
+      固定，``./data`` 这类相对挂载有稳定基准，也不会被发布清理或删除任务
+      顺手删掉（见 ``config.owned_data_dirs``）；
     * 先 ``pull`` 再 ``up``：该方式的「发布」语义就是换镜像，不显式拉取的话
       本地同名 tag 会一直复用旧镜像，改内容也不会生效。
     """
@@ -926,8 +972,7 @@ def deploy_compose_inline(ctx: DeployContext) -> None:
     if not content.strip():
         raise DeployError("部署方式为 Compose 内容直填，但 compose 内容为空")
 
-    releases_root = ctx.releases_root_path
-    work_dir = f"{str(releases_root).rstrip('/')}/{COMPOSE_INLINE_DIR}"
+    work_dir = str(ctx.persistent_path).rstrip("/")
     compose_path = f"{work_dir}/{COMPOSE_INLINE_FILE}"
 
     ctx.log(f"--- 阶段: 写入 compose 文件 ({compose_path}) ---")

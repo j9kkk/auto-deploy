@@ -2899,7 +2899,7 @@ def run() -> int:
 
     from app import deployer as deployer_mod2
     from app.deployer import (
-        COMPOSE_INLINE_DIR,
+        LEGACY_COMPOSE_INLINE_DIR,
         REPO_FREE_METHODS,
         compose_inline_dir,
         compose_inline_path,
@@ -2919,16 +2919,70 @@ def run() -> int:
     check("方式有中文标签",
           deployer_mod2.METHOD_LABELS.get("compose_inline") == "Compose 内容直填")
 
+    # 持久化目录必须与可重建的 releases/ 分开：业务数据不能随发布清理消失。
+    inline_task = {"id": 4242, "name": "Inline_Data"}
+    inline_dir = compose_inline_dir(4242)
+    check("工作目录位于 persistent 下",
+          inline_dir == config.persistent_dir(4242)
+          and config.PERSISTENT_DIR in inline_dir.parents, str(inline_dir))
+    check("工作目录不在 releases 下",
+          config.RELEASES_DIR not in inline_dir.parents, str(inline_dir))
+    check("compose 文件名固定", compose_inline_path(4242).name == "docker-compose.yml")
+    check("持久化目录被识别为用户数据",
+          inline_dir in config.owned_data_dirs(inline_task))
+    check("持久化目录不在可重建产物里",
+          inline_dir not in config.owned_storage_dirs(inline_task))
+
+    # 0.4.1 的旧目录仍必须被发布清理忽略（尚未迁移的存量实例）。
     inline_root = tmp_root / "inline-releases"
-    check("固定目录名稳定", compose_inline_dir(inline_root) == inline_root / COMPOSE_INLINE_DIR)
-    check("compose 文件名固定",
-          compose_inline_path(inline_root).name == "docker-compose.yml")
-    # 关键回归：该固定目录绝不能被当成历史发布清掉，否则挂载数据会跟着消失。
-    (inline_root / COMPOSE_INLINE_DIR).mkdir(parents=True)
+    (inline_root / LEGACY_COMPOSE_INLINE_DIR).mkdir(parents=True)
     (inline_root / "20260101-000000-abcdef12").mkdir()
     releases_seen = [p.name for p in list_releases(inline_root)]
-    check("固定目录不计入历史发布", COMPOSE_INLINE_DIR not in releases_seen, str(releases_seen))
+    check("旧版固定目录不计入历史发布",
+          LEGACY_COMPOSE_INLINE_DIR not in releases_seen, str(releases_seen))
     check("正常发布目录仍被列出", "20260101-000000-abcdef12" in releases_seen)
+
+    # 升级迁移：旧目录数据搬到 persistent/，且不覆盖已存在的新目录。
+    legacy_task_id = 5151
+    legacy_root = tmp_root / "legacy-releases"
+    legacy_dir = legacy_root / LEGACY_COMPOSE_INLINE_DIR
+    (legacy_dir / "data").mkdir(parents=True)
+    (legacy_dir / "data" / "important.txt").write_text("业务数据", encoding="utf-8")
+    migrated = deployer_mod2.migrate_legacy_compose_inline(
+        {"id": legacy_task_id}, legacy_root, log=lambda _m: None)
+    new_dir = config.persistent_dir(legacy_task_id)
+    check("旧版工作目录被迁移", migrated is True)
+    check("迁移保留挂载数据",
+          (new_dir / "data" / "important.txt").read_text(encoding="utf-8") == "业务数据")
+    check("迁移后删除旧目录", not legacy_dir.exists())
+    # 新目录已存在时不覆盖（避免把两份数据合并成不可信状态）
+    legacy_root2 = tmp_root / "legacy-releases-2"
+    (legacy_root2 / LEGACY_COMPOSE_INLINE_DIR / "data").mkdir(parents=True)
+    (legacy_root2 / LEGACY_COMPOSE_INLINE_DIR / "data" / "old.txt").write_text("x", encoding="utf-8")
+    (new_dir / "data" / "newer.txt").write_text("y", encoding="utf-8")
+    skipped = deployer_mod2.migrate_legacy_compose_inline(
+        {"id": legacy_task_id}, legacy_root2, log=lambda _m: None)
+    check("新目录已存在时跳过迁移", skipped is False
+          and (new_dir / "data" / "newer.txt").exists()
+          and (legacy_root2 / LEGACY_COMPOSE_INLINE_DIR / "data" / "old.txt").exists())
+    shutil.rmtree(new_dir, ignore_errors=True)
+
+    # 回归：若在迁移前先把目标目录建出来，迁移会因「目标已存在」永久跳过，
+    # 用户升级后看到空目录、旧数据仍在 releases 下「消失」。这里按 runner 的
+    # 真实顺序断言目标目录必须由迁移自身创建。
+    order_task_id = 5252
+    order_root = tmp_root / "order-releases"
+    (order_root / LEGACY_COMPOSE_INLINE_DIR / "data").mkdir(parents=True)
+    (order_root / LEGACY_COMPOSE_INLINE_DIR / "data" / "keep.txt").write_text(
+        "升级前的数据", encoding="utf-8")
+    order_target = config.persistent_dir(order_task_id)
+    check("迁移前目标目录不存在", not order_target.exists())
+    order_ok = deployer_mod2.migrate_legacy_compose_inline(
+        {"id": order_task_id}, order_root, log=lambda _m: None)
+    check("未预先建目录时迁移成功", order_ok is True)
+    check("迁移后数据可用",
+          (order_target / "data" / "keep.txt").read_text(encoding="utf-8") == "升级前的数据")
+    shutil.rmtree(order_target, ignore_errors=True)
 
     # 校验：仓库地址可为空，但内容必填；其它方式仍必须填仓库。
     inline_ok = validate_task_payload({
@@ -2994,11 +3048,12 @@ def run() -> int:
         task={"id": 9001, "name": "Inline", "deploy_method": "compose_inline",
               "compose_content": "services:\n  app:\n    image: nginx:alpine\n"},
         run_id=1,
-        workspace=inline_root,
-        release_dir=compose_inline_dir(inline_root),
+        workspace=inline_dir,
+        release_dir=inline_dir,
         releases_root=inline_root,
         current_link=inline_root / "current",
         artifact_path=tmp_root / "inline.tar.gz",
+        persistent_dir=inline_dir,
         target=_FakeTarget(),
     )
     real_supports = deployer_mod2._supports_compose_v2
@@ -3016,8 +3071,10 @@ def run() -> int:
     check("pull 跳过纯 build 服务", "--ignore-buildable" in joined[0])
     check("使用固定项目目录",
           all("--project-directory" in args for args in recorded), str(joined))
-    check("compose 文件落在固定目录",
-          COMPOSE_INLINE_DIR in list(written)[0] if written else False, str(list(written)))
+    check("compose 文件写在持久化目录",
+          str(inline_dir) in str(next(iter(written), "")), str(list(written)))
+    check("project-directory 指向持久化目录",
+          all(str(inline_dir) in args for args in recorded), str(joined))
     check("内容原样写入", next(iter(written.values()), "").endswith("nginx:alpine\n"))
 
     # compose_inline 的容器清理按项目标签走，不依赖已删除的 compose 文件。
@@ -3045,6 +3102,76 @@ def run() -> int:
         {"id": 9003, "name": "Inline_Rb", "deploy_method": "compose_inline"},
         log=lambda _m: None)
     check("无仓库方式拒绝回滚", ok is False and "compose 内容改回旧内容" in message, message)
+
+    # ------------------------------------------------------------------
+    section("持久化数据的备份、恢复与删除语义")
+
+    from app import backup as backup_mod
+
+    # 用一个独立的数据目录跑真实备份/恢复，避免污染运行中的 data/。
+    persist_task_id = 6161
+    persist_dir = config.persistent_dir(persist_task_id)
+    (persist_dir / "data").mkdir(parents=True, exist_ok=True)
+    (persist_dir / "data" / "app.db").write_text("业务数据库", encoding="utf-8")
+    (persist_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+    backup_store = Store(config.DB_PATH) if "config" in globals() else None
+    check("持久化目录位于数据目录下", config.DATA_DIR in persist_dir.parents)
+
+    # 备份包必须包含 persistent/，否则这份业务数据在灾难恢复时会永久丢失。
+    if backup_store is None:
+        backup_store = Store(Database(config.DB_PATH))
+    archive = backup_mod.create_backup(
+        backup_store, trigger="manual", include_logs=False,
+        include_artifacts=False, retention_count=100,
+    )
+    import tarfile as _tarfile
+    with _tarfile.open(archive["filepath"], "r:gz") as tar:
+        names = tar.getnames()
+    check("备份包含持久化数据",
+          any(n.startswith("persistent/") for n in names), str(names[:10]))
+    check("备份包含 compose 文件",
+          any("docker-compose.yml" in n for n in names))
+    check("manifest 标记包含持久化数据",
+          bool(archive.get("contains_persistent")), str(archive.get("contains_persistent")))
+
+    # 恢复要能还原被删掉的业务数据。
+    (persist_dir / "data" / "app.db").unlink()
+    check("恢复前数据已删", not (persist_dir / "data" / "app.db").exists())
+    backup_mod.restore_backup(backup_store, archive["id"])
+    check("恢复还原持久化数据",
+          (persist_dir / "data" / "app.db").read_text(encoding="utf-8") == "业务数据库")
+
+    # 旧备份（无 persistent/）不得清空现存数据。
+    legacy_archive = backup_mod.create_backup(
+        backup_store, trigger="manual", include_logs=False,
+        include_artifacts=False, retention_count=100,
+    )
+    backup_mod.restore_backup(backup_store, legacy_archive["id"])
+    check("恢复不影响未被备份的数据目录内容",
+          (persist_dir / "data" / "app.db").exists())
+
+    # 备份包里的软链/设备条目必须被拒绝（防止解压逃逸）。
+    evil = tmp_root / "evil.tar.gz"
+    with _tarfile.open(evil, "w:gz") as tar:
+        info = _tarfile.TarInfo("link")
+        info.type = _tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        tar.addfile(info)
+    try:
+        backup_mod.inspect_backup_file(evil)
+    except backup_mod.BackupError as exc:
+        check("拒绝含软链的备份包", "链接" in str(exc) or "非法" in str(exc), str(exc))
+    else:
+        check("拒绝含软链的备份包", False, "未拒绝")
+
+    # 清理本节创建的数据与备份文件，避免影响后续检查。
+    for item in (persist_dir,):
+        shutil.rmtree(item, ignore_errors=True)
+    for path in (archive.get("filepath"), legacy_archive.get("filepath")):
+        if path:
+            Path(path).unlink(missing_ok=True)
+    backup_store.db.close()
 
     # ------------------------------------------------------------------
     section("一键自我更新")

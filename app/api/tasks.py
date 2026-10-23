@@ -305,6 +305,10 @@ def delete_task(
     task_id: int,
     request: Request,
     purge: bool = Query(True, description="同时删除工作目录、发布产物与历史存档"),
+    purge_data: bool = Query(
+        False,
+        description="同时删除容器挂载的持久化业务数据（persistent/）；默认保留以便迁移",
+    ),
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
@@ -322,6 +326,10 @@ def delete_task(
 
     ``purge=False`` 只保留文件，容器仍会被停止——任务记录消失后它已无人
     管理，继续运行只会占用端口与资源。
+
+    ``persistent/`` 下的容器挂载数据**不受 purge 影响**，只有 ``purge_data``
+    才会删除：那个目录里是用户业务数据，删掉无法重建，不能因为「清理存档」
+    这个默认动作被一并抹掉。保留时会在返回的 ``kept`` 里给出路径。
     """
     with service.scheduler._lock:
         row = service.store.tasks.get(task_id)
@@ -378,9 +386,22 @@ def delete_task(
     else:
         kept.append("工作目录、发布产物与运行日志已按 purge=false 保留")
 
+    # 容器挂载的业务数据与上面那批可重建产物分开处理：purge 管的是存档，
+    # 不该顺带删掉用户数据；只有 purge_data 才动它。
+    data_dirs = config.owned_data_dirs(row)
+    for path in data_dirs:
+        if not (path.exists() or path.is_symlink()):
+            continue
+        if purge_data:
+            cleanup_path(path)
+            purged.append(str(path))
+        else:
+            kept.append(f"持久化数据：{path}（如需一并删除，请再次确认时选择删除业务数据）")
+
     audit(
         service, "task_deleted", actor=user["username"], target=f"task:{task_id}",
-        detail=f"{name} purge={purge} 容器:{len(containers)} 运行记录:{run_total}",
+        detail=(f"{name} purge={purge} purge_data={purge_data} "
+                f"容器:{len(containers)} 运行记录:{run_total}"),
         ip=client_ip(request),
     )
     return {

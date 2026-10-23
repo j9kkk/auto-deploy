@@ -24,13 +24,13 @@ from pathlib import Path
 
 from . import config, gitops
 from .deployer import (
-    COMPOSE_INLINE_DIR,
     DeployContext,
     DeployError,
     REPO_FREE_METHODS,
     _prune_remote_releases,
     compose_inline_dir,
     create_bundle,
+    migrate_legacy_compose_inline,
     next_release_dir,
     preflight,
     prune_releases,
@@ -561,16 +561,22 @@ class DeployRunner:
             releases_root: Any = layout.releases_root
             current_link: Any = layout.current_link
             artifact: Any = f"{layout.base_dir.rstrip('/')}/artifacts/{artifact_name}"
-            release_dir: Any = f"{layout.releases_root.rstrip('/')}/{COMPOSE_INLINE_DIR}"
+            # 远程的持久化目录同样在 releases 之外，按任务 slug 独立存放。
+            work_dir: Any = f"{layout.base_dir.rstrip('/')}/persistent/{_safe_name(task.get('name') or 'task')}"
+            inspect_target.make_dirs(str(work_dir))
         else:
             local_releases_root, local_current_link = resolve_release_paths(task)
             local_releases_root.mkdir(parents=True, exist_ok=True)
             releases_root = local_releases_root
             current_link = local_current_link
             artifact = config.artifacts_dir(task_id) / artifact_name
-            release_dir = compose_inline_dir(local_releases_root)
-            release_dir.mkdir(parents=True, exist_ok=True)
-        log(f"发布目录: {releases_root}（compose 文件位于 {COMPOSE_INLINE_DIR}/ 子目录）")
+            work_dir = compose_inline_dir(task_id)
+            # 迁移必须在建目录之前：旧数据要落到一个还不存在的目标上。
+            # 先 mkdir 会让迁移判定「目标已存在」而跳过，用户升级后看到的
+            # 就是一个空目录，旧数据仍在 releases 下「消失」。
+            migrate_legacy_compose_inline(task, local_releases_root, log=log)
+            work_dir.mkdir(parents=True, exist_ok=True)
+        log(f"工作目录: {work_dir}（compose 文件与容器相对挂载都以它为基准）")
 
         remote = host_row is not None
         ctx = DeployContext(
@@ -578,11 +584,12 @@ class DeployRunner:
             run_id=run_id,
             # 没有源码可引用：工作目录就是 compose 文件所在的固定目录，
             # 这样准备脚本里的相对路径也有确定落点。
-            workspace=Path(str(release_dir)) if not remote else Path(),
-            release_dir=Path(str(release_dir)) if not remote else Path(),
+            workspace=Path(str(work_dir)) if not remote else Path(),
+            release_dir=Path(str(work_dir)) if not remote else Path(),
             releases_root=Path(str(releases_root)) if not remote else Path(),
             current_link=Path(str(current_link)) if not remote else Path(),
             artifact_path=Path(str(artifact)) if not remote else Path(),
+            persistent_dir=work_dir,
             env=env,
             log=log,
             log_batch=lambda lines: self._write_log_batch(active, lines),
@@ -591,13 +598,13 @@ class DeployRunner:
             handles=active.handles,
             proxy=proxy,
             target=inspect_target,
-            remote_workspace=str(release_dir) if remote else "",
-            remote_release_dir=str(release_dir) if remote else "",
+            remote_workspace=str(work_dir) if remote else "",
+            remote_release_dir=str(work_dir) if remote else "",
             remote_releases_root=str(releases_root) if remote else "",
             remote_current_link=str(current_link) if remote else "",
             remote_artifact_path=str(artifact) if remote else "",
         )
-        self.store.runs.update_outputs(run_id, release_dir=str(release_dir), artifact_path="")
+        self.store.runs.update_outputs(run_id, release_dir=str(work_dir), artifact_path="")
 
         log("--- 阶段: 准备脚本 ---")
         prepare = (task.get("prepare_script") or "").strip()

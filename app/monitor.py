@@ -352,7 +352,9 @@ class TaskResourceMonitor:
             enabled = bool(task.get("enabled", False))
 
             matched_containers = []
-            if deploy_method == "docker_compose":
+            # compose_inline 与 docker_compose 一样按固定项目名起容器，
+            # 只是 compose 文件来自任务内容而非发布目录。
+            if deploy_method in {"docker_compose", "compose_inline"}:
                 proj_name = compose_project_name(task)
                 matched_containers = [c for c in docker_stats.values() if c.get("compose_project") == proj_name]
             elif deploy_method == "docker":

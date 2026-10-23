@@ -1091,6 +1091,7 @@ class BackupRepository:
         trigger: str = "manual",
         contains_logs: bool = False,
         contains_artifacts: bool = False,
+        contains_persistent: bool = False,
         status: str = "success",
         error: str = "",
         created_at: str | None = None,
@@ -1099,8 +1100,9 @@ class BackupRepository:
             """
             INSERT INTO backups (
                 filename, filepath, size_bytes, sha256, trigger,
-                contains_logs, contains_artifacts, status, error, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                contains_logs, contains_artifacts, contains_persistent,
+                status, error, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 filename,
@@ -1110,6 +1112,7 @@ class BackupRepository:
                 trigger,
                 1 if contains_logs else 0,
                 1 if contains_artifacts else 0,
+                1 if contains_persistent else 0,
                 status,
                 error,
                 created_at or iso(utcnow()),
