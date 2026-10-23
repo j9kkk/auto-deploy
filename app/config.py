@@ -237,6 +237,11 @@ RELEASES_DIR = DATA_DIR / "releases"
 ARTIFACTS_DIR = DATA_DIR / "artifacts"
 LOGS_DIR = DATA_DIR / "logs"
 TMP_DIR = DATA_DIR / "tmp"
+# 「Compose 内容直填」任务的持久化工作目录。与 releases/ 分开存放是刻意的：
+# releases/ 里是可以随时重建的发布产物，发布历史清理与删除任务都会整目录清掉；
+# 而这里的 data/ 是容器挂载出来的业务数据，删掉就再也回不来了。语义不同，
+# 清理与备份规则必须能分别处理。
+PERSISTENT_DIR = DATA_DIR / "persistent"
 WEB_DIR = ROOT_DIR / "web"
 
 
@@ -248,6 +253,7 @@ def ensure_dirs() -> None:
         ARTIFACTS_DIR,
         LOGS_DIR,
         TMP_DIR,
+        PERSISTENT_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -437,14 +443,33 @@ def temp_dir(task_id: int) -> Path:
     return TMP_DIR / f"task-{task_id}"
 
 
+def persistent_dir(task_id: int) -> Path:
+    """「Compose 内容直填」任务的持久化工作目录。
+
+    目录布局：``persistent/task-<id>/docker-compose.yml`` 与容器挂载的
+    ``persistent/task-<id>/data`` 等相对路径同级。compose 文件也放这里，
+    让 ``./data`` 的解析基准跨部署保持不变。
+    """
+    return PERSISTENT_DIR / f"task-{task_id}"
+
+
 def owned_storage_dirs(task: dict[str, Any]) -> list[Path]:
-    """本任务在数据目录下拥有的持久化目录（不含工作目录）。
+    """本任务在数据目录下拥有的目录（不含工作目录）。
 
     删除任务与「清理任务文件」共用这一份归属定义，避免两处规则漂移后
     一方漏删、另一方误删。
+
+    这里只列**可重建**的产物（发布目录、打包产物、临时文件）。用户数据
+    另外由 :func:`owned_data_dirs` 单独列出，删除时必须分别询问——把两者
+    混在一起会让「删除任务」顺手删掉容器挂载的业务数据。
     """
     task_id = int(task["id"])
     return [releases_dir(task_id), artifacts_dir(task_id), temp_dir(task_id)]
+
+
+def owned_data_dirs(task: dict[str, Any]) -> list[Path]:
+    """本任务持有的**不可重建**用户数据目录（容器挂载的持久化数据）。"""
+    return [persistent_dir(int(task["id"]))]
 
 
 def run_log_path(run_id: int) -> Path:

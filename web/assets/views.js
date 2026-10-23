@@ -340,11 +340,17 @@ AD.views = {};
   function deleteConsequences(task) {
     const items = ['停止并移除该任务部署的容器', '删除工作目录与发布产物', '删除全部运行记录与日志'];
     const method = String(task.deploy_method || '');
-    if (method === 'docker_compose') items[0] = '执行 docker compose down，停止并移除该项目容器与网络';
+    if (method === 'compose_inline') {
+      items[0] = '按 compose 项目标签停止并移除容器与网络';
+    } else if (method === 'docker_compose') items[0] = '执行 docker compose down，停止并移除该项目容器与网络';
     else if (method === 'docker') items[0] = '执行回滚脚本停止容器（未配置回滚脚本时需手动确认）';
     else if (method === 'systemd') items[0] = '不会停止 systemd 服务，如需停止请手动执行 systemctl stop';
     else if (method === 'rsync') items[0] = '不会同步远端，远端文件保持原样';
     else items[0] = '该部署方式没有需要停止的容器';
+    if (method === 'compose_inline') {
+      // 这个方式的持久化目录里是容器挂载的业务数据，删掉无法重建。
+      items.push('容器挂载的业务数据（persistent/）默认保留，不会被删除');
+    }
     items.push('目标目录（target_dir）本身不会被删除');
     return items;
   }
@@ -373,12 +379,16 @@ AD.views = {};
 
     // 第二步：输入任务名。这是唯一能防止「手滑点到删除」的关卡，
     // 因为删除会连带清掉磁盘上的部署文件夹，无法从界面恢复。
+    const isComposeInline = String(task.deploy_method || '') === 'compose_inline';
     const typed = await AD.prompt({
       title: '最后确认',
       label: `请输入任务名「${task.name}」以确认删除`,
       placeholder: task.name,
       value: '',
-      hint: '删除后无法恢复：工作目录、发布产物与运行日志都会被清理。',
+      hint: isComposeInline
+        ? '删除后无法恢复：工作目录、发布产物与运行日志都会被清理。'
+          + '容器挂载的业务数据（persistent/）会保留在磁盘上，可手动取用或删除。'
+        : '删除后无法恢复：工作目录、发布产物与运行日志都会被清理。',
     });
     if (typed === null) return false;
     if (String(typed).trim() !== String(task.name)) {
@@ -389,7 +399,12 @@ AD.views = {};
       const result = await AD.api.del(`/api/tasks/${taskId}`);
       const removed = (result.purged || []).length;
       const stopped = (result.containers || []).length;
-      AD.toastSuccess(`任务已删除（清理 ${removed} 项${stopped ? `，停止容器 ${stopped} 个` : ''}）`);
+      // kept 里可能带「持久化数据」提示：如实告诉用户数据还在哪，
+      // 否则他会以为磁盘已经干净，数据却悄悄留在原处。
+      const keptData = (result.kept || []).find((item) => String(item).includes('持久化数据'));
+      AD.toastSuccess(`任务已删除（清理 ${removed} 项${stopped ? `，停止容器 ${stopped} 个` : ''}）`
+        + (keptData ? '；容器业务数据已保留' : ''));
+      if (keptData) AD.toastError(keptData);
       AD.render('tasks');
       return true;
     } catch (err) {
@@ -6140,6 +6155,9 @@ AD.views = {};
       const tags = ['<span class="badge">SQLite+配置</span>'];
       if (b.contains_logs) tags.push('<span class="badge faint">运行日志</span>');
       if (b.contains_artifacts) tags.push('<span class="badge faint">打包产物</span>');
+      // 业务数据不在不就可以少显示，但要明确标出来：旧备份没有它，
+      // 恢复时不会覆盖现有的 persistent/。
+      if (b.contains_persistent) tags.push('<span class="badge faint">业务数据</span>');
 
       return `
         <tr>
@@ -6171,6 +6189,7 @@ AD.views = {};
       body: `
         <div class="alert info">
           将使用 SQLite 在线备份（Online Backup API）生成完全一致的快照，并在 tar.gz 包中打包全局配置与元数据。备份期间部署与调度不受影响。
+          容器挂载的业务数据（<code class="code-inline">data/persistent/</code>）会被<b>自动包含</b>，无需勾选。
         </div>
         <div style="margin-top:12px">
           ${switchRow('bk-logs', false, '包含历史运行日志', 'data/logs/；日志可能较大，仅备份配置与数据时建议关闭')}

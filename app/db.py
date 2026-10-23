@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -189,6 +189,8 @@ CREATE TABLE IF NOT EXISTS backups (
     trigger            TEXT    NOT NULL DEFAULT 'manual',
     contains_logs      INTEGER NOT NULL DEFAULT 0,
     contains_artifacts INTEGER NOT NULL DEFAULT 0,
+    -- 是否包含容器挂载的持久化业务数据（persistent/）；旧备份为 0。
+    contains_persistent INTEGER NOT NULL DEFAULT 0,
     status             TEXT    NOT NULL DEFAULT 'success',
     error              TEXT    NOT NULL DEFAULT '',
     created_at         TEXT    NOT NULL
@@ -358,6 +360,8 @@ class Database:
             self._migrate_v8_to_v9(conn)
         if current < 10:
             self._migrate_v9_to_v10(conn)
+        if current < 11:
+            self._migrate_v10_to_v11(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
@@ -371,6 +375,19 @@ class Database:
         默认空串即可，无需回填。
         """
         self._add_column(conn, "tasks", "compose_content", "TEXT NOT NULL DEFAULT ''")
+
+    def _migrate_v10_to_v11(self, conn: sqlite3.Connection) -> None:
+        """v11: 备份记录标记是否包含容器挂载的持久化业务数据。
+
+        0.4.1 已发布为 v10，因此这一列必须单独占用一个新版本号：写进 v10
+        的函数里，已装 0.4.1 的实例会因为版本相等而整段跳过，列永远不存在。
+
+        旧备份（0.4.1 及更早）不含 persistent/，默认 0 —— 恢复流程据此
+        判断不应清空现有数据。
+        """
+        self._add_column(
+            conn, "backups", "contains_persistent", "INTEGER NOT NULL DEFAULT 0"
+        )
 
     def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
         """v8: 新增远程主机表 hosts，并给任务/运行补主机维度。
@@ -559,6 +576,7 @@ class Database:
                 trigger            TEXT    NOT NULL DEFAULT 'manual',
                 contains_logs      INTEGER NOT NULL DEFAULT 0,
                 contains_artifacts INTEGER NOT NULL DEFAULT 0,
+                contains_persistent INTEGER NOT NULL DEFAULT 0,
                 status             TEXT    NOT NULL DEFAULT 'success',
                 error              TEXT    NOT NULL DEFAULT '',
                 created_at         TEXT    NOT NULL

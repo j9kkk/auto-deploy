@@ -43,6 +43,9 @@ class BackupManifest:
     contains_logs: bool
     contains_artifacts: bool
     files: list[str]
+    # 旧备份没有这个字段：读取时按 False 处理，恢复流程也据此决定是否
+    # 覆盖 persistent/（旧包不含该目录，绝不能把用户现存数据清掉）。
+    contains_persistent: bool = False
 
 
 def get_backup_dir() -> Path:
@@ -83,6 +86,7 @@ def create_backup(
 
     # 0. 快照在前、记录在后：先落库再拍快照会让备份包里永远留一条
     #    in_progress 幽灵记录，恢复后还会被误当作有效备份。
+    contains_persistent = False
     try:
         with tempfile.TemporaryDirectory(prefix="autodeploy-backup-") as tmp:
             stage = Path(tmp)
@@ -121,7 +125,16 @@ def create_backup(
                 shutil.copytree(config.ARTIFACTS_DIR, dest_artifacts, dirs_exist_ok=True)
                 files_manifest.append("artifacts/")
 
-            # 5. Write manifest.json
+            # 5. 容器挂载的持久化数据（不可重建，总是备份）
+            #    与 artifacts 不同，这里没有开关：它包含的是用户业务数据，
+            #    漏备一次就可能永久丢失。
+            if config.PERSISTENT_DIR.exists():
+                dest_persistent = stage / "persistent"
+                shutil.copytree(config.PERSISTENT_DIR, dest_persistent, dirs_exist_ok=True)
+                files_manifest.append("persistent/")
+                contains_persistent = True
+
+            # 6. Write manifest.json
             manifest = BackupManifest(
                 manifest_version=1,
                 app_version=VERSION,
@@ -129,10 +142,11 @@ def create_backup(
                 contains_logs=include_logs,
                 contains_artifacts=include_artifacts,
                 files=files_manifest,
+                contains_persistent=contains_persistent,
             )
             (stage / MANIFEST_NAME).write_text(json.dumps(asdict(manifest), ensure_ascii=False, indent=2), encoding="utf-8")
 
-            # 6. Compress stage folder into .tar.gz
+            # 7. Compress stage folder into .tar.gz
             try:
                 with tarfile.open(target_path, "w:gz") as tar:
                     for item in stage.iterdir():
@@ -154,6 +168,7 @@ def create_backup(
             trigger=trigger,
             contains_logs=include_logs,
             contains_artifacts=include_artifacts,
+            contains_persistent=contains_persistent,
             status="success",
         )
     except Exception:
@@ -188,6 +203,27 @@ def create_backup(
     return store.backups.get(backup_id) or {}
 
 
+def _safe_extract(archive_path: Path, stage: Path) -> None:
+    """把备份包解压到 stage，拒绝任何可能逃逸目录的成员。
+
+    只检查 ``..`` 与绝对路径不够：软链成员（或先建软链再往里写文件）能让
+    ``extractall`` 把内容写到 stage 之外。这里额外拒绝软链/设备文件，并在
+    可用时交给 ``filter="data"`` 做同一套校验。
+    """
+    with tarfile.open(archive_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            name = member.name
+            if name.startswith("/") or ".." in Path(name).parts:
+                raise BackupError(f"备份文件包含非法路径: {name}")
+            if member.issym() or member.islnk() or member.isdev():
+                raise BackupError(f"备份文件包含不支持的链接或设备条目: {name}")
+        try:
+            tar.extractall(stage, filter="data")
+        except TypeError:
+            # Python < 3.12 没有 filter 参数；上面的显式检查已覆盖同一风险。
+            tar.extractall(stage)
+
+
 def inspect_backup_file(archive_path: Path) -> dict[str, Any]:
     """Inspect an existing backup tar.gz file and verify integrity without modifying state."""
     if not archive_path.is_file():
@@ -199,12 +235,9 @@ def inspect_backup_file(archive_path: Path) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="autodeploy-inspect-") as tmp:
         stage = Path(tmp)
         try:
-            with tarfile.open(archive_path, "r:gz") as tar:
-                # Security: prevent directory traversal in archive
-                for member in tar.getmembers():
-                    if member.name.startswith("/") or ".." in member.name:
-                        raise BackupError(f"备份文件包含非法路径: {member.name}")
-                tar.extractall(stage)
+            _safe_extract(archive_path, stage)
+        except BackupError:
+            raise
         except Exception as e:
             raise BackupError(f"解压备份文件失败: {e}") from e
 
@@ -272,8 +305,7 @@ def restore_backup(
 
     with tempfile.TemporaryDirectory(prefix="autodeploy-restore-") as tmp:
         stage = Path(tmp)
-        with tarfile.open(archive_path, "r:gz") as tar:
-            tar.extractall(stage)
+        _safe_extract(archive_path, stage)
 
         restored_db_path = stage / "autodeploy.db"
         # 1. Restore SQLite database into live connection safely using SQLite backup API
@@ -300,6 +332,7 @@ def restore_backup(
                     trigger=prev.get("trigger", "manual"),
                     contains_logs=bool(prev.get("contains_logs")),
                     contains_artifacts=bool(prev.get("contains_artifacts")),
+                    contains_persistent=bool(prev.get("contains_persistent")),
                     status="success",
                     created_at=prev.get("created_at"),
                 )
@@ -319,6 +352,24 @@ def restore_backup(
                 shutil.copytree(restored_logs, config.LOGS_DIR, dirs_exist_ok=True)
             except Exception as e:
                 logger.warning("恢复日志失败: %s", e)
+
+        # 5. Restore artifacts if present（备份时可以勾选包含，恢复必须能还原，
+        #    否则数据库里仍记着产物路径、磁盘上却没有对应文件）
+        restored_artifacts = stage / "artifacts"
+        if restored_artifacts.exists() and restored_artifacts.is_dir():
+            try:
+                shutil.copytree(restored_artifacts, config.ARTIFACTS_DIR, dirs_exist_ok=True)
+            except Exception as e:
+                logger.warning("恢复打包产物失败: %s", e)
+
+        # 6. 恢复容器挂载的持久化数据。只在备份确实包含时才还原：旧备份没有
+        #    这个目录，若无条件清空会把用户现存的业务数据抹掉。
+        restored_persistent = stage / "persistent"
+        if restored_persistent.exists() and restored_persistent.is_dir():
+            try:
+                shutil.copytree(restored_persistent, config.PERSISTENT_DIR, dirs_exist_ok=True)
+            except Exception as e:
+                logger.warning("恢复持久化数据失败: %s", e)
 
     return {
         "ok": True,
