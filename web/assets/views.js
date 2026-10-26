@@ -1198,13 +1198,6 @@ AD.views = {};
       : (hostList.length
         ? '选择主机后，代码拉取仍在控制机完成，构建与部署在目标主机执行（目标机需装 rsync 与构建工具）。'
         : '还没有配置远程主机；任务将在本机执行。可到「主机」页添加。');
-    // 已有任务且高级项偏离默认值时，打开表单就把「高级」页标记为已修改：
-    // 原来靠 <details open> 提示这些配置存在，分页后改用标签页标记承载。
-    const hasAdvanced = isEdit && (
-      (t.git_depth !== undefined && t.git_depth !== 1)
-      || (t.timeout_seconds !== undefined && t.timeout_seconds !== (defaults.timeout_seconds || 1800))
-      || Boolean(t.env_vars && Object.keys(t.env_vars).length)
-    );
 
     const credentialOptions = (AD.state.credentials || []).map((c) =>
       `<option value="${c.id}"${boundCredentialId === String(c.id) ? ' selected' : ''}>${e(c.name)}（${e(c.kind_label || c.kind)}）</option>`).join('');
@@ -1225,7 +1218,8 @@ AD.views = {};
             ['basic', '基础'],
             ['source', '代码源'],
             ['build', '构建与发布'],
-            ['trigger', '触发'],
+            ['schedule', '定时触发'],
+            ['webhook', 'Webhook'],
             ['advanced', '高级'],
             ['summary', '摘要'],
           ].map(([key, label], index) => `
@@ -1406,7 +1400,10 @@ AD.views = {};
             </div>
           </section>
 
-          <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-trigger" data-form-panel="trigger" aria-labelledby="tab-btn-trigger">
+          <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-schedule" data-form-panel="schedule" aria-labelledby="tab-btn-schedule">
+            ${switchRow('f-enabled', (t.enabled === undefined ? true : t.enabled), '启用定时触发',
+              '关闭后不会按定时调度自动执行，仍可手动或通过 Webhook 触发')}
+
             <div class="section-title">定时调度</div>
             <div class="form-grid cols-2">
               <div class="field">
@@ -1428,10 +1425,21 @@ AD.views = {};
                 <div id="schedule-preview" class="faint" style="min-height:20px"></div>
               </div>
             </div>
-            ${switchRow('f-enabled', (t.enabled === undefined ? true : t.enabled), '启用定时调度',
-              '关闭后仅手动或 Webhook 触发，不会按调度自动执行')}
 
-            <div class="section-title">Webhook 触发</div>
+            <div class="section-title">执行策略</div>
+            <div data-method-field="artifact script release systemd docker docker_compose rsync">
+            ${switchRow('f-skip_if_no_changes', (t.skip_if_no_changes === undefined ? true : t.skip_if_no_changes),
+              '代码无变化时跳过部署', '提交哈希未变化时直接标记为「已跳过」，不执行构建与发布')}
+            </div>
+            ${isEdit ? '' : switchRow('f-run_on_create', false,
+              '创建后立即运行一次', '保存成功后马上排队执行，便于验证配置是否正确')}
+          </section>
+
+          <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-webhook" data-form-panel="webhook" aria-labelledby="tab-btn-webhook">
+            ${switchRow('f-webhook_enabled', (t.webhook_enabled === undefined ? true : t.webhook_enabled), '启用 Webhook 触发',
+              '关闭后外部 Webhook 调用会被拒绝，无法通过地址触发部署')}
+
+            <div class="section-title">触发地址</div>
             ${isEdit && t.webhook_url ? `
             <div class="form-grid cols-2">
               <div class="field span-2">
@@ -1441,12 +1449,12 @@ AD.views = {};
                   <button type="button" class="ghost" id="webhook-copy">复制</button>
                   <button type="button" class="ghost" id="webhook-reset">重新生成</button>
                 </div>
-                <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。任务暂停期间该地址不可用，调用会被拒绝并记录在操作日志中。</div>
+                <div class="hint">向该地址发送 GET 或 POST 请求即触发一次部署（外部无需登录），适合 GitHub/Gitee 的 Webhook 或 <code class="code-inline">curl</code>。重新生成后旧地址立即失效。未启用 Webhook 触发或任务暂停期间该地址不可用，调用会被拒绝并记录在操作日志中。</div>
               </div>
             </div>` : `
             <div class="hint" style="margin:0 0 12px">任务创建后自动生成 Webhook 触发地址（向它发请求即触发部署），可在编辑页复制使用。</div>`}
 
-            <div class="section-title">通知与执行策略</div>
+            <div class="section-title">结果通知</div>
             <div class="form-grid cols-2">
               <div class="field span-2">
                 <label>结果通知 Webhook</label>
@@ -1454,12 +1462,6 @@ AD.views = {};
                 <div class="hint">部署结束后把结果发送到该地址，留空使用全局设置；与上面的触发地址无关</div>
               </div>
             </div>
-            <div data-method-field="artifact script release systemd docker docker_compose rsync">
-            ${switchRow('f-skip_if_no_changes', (t.skip_if_no_changes === undefined ? true : t.skip_if_no_changes),
-              '代码无变化时跳过部署', '提交哈希未变化时直接标记为「已跳过」，不执行构建与发布')}
-            </div>
-            ${isEdit ? '' : switchRow('f-run_on_create', false,
-              '创建后立即运行一次', '保存成功后马上排队执行，便于验证配置是否正确')}
           </section>
 
           <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-advanced" data-form-panel="advanced" aria-labelledby="tab-btn-advanced">
@@ -1493,7 +1495,7 @@ AD.views = {};
             <div id="config-summary" class="config-summary"></div>
             <div class="hint" style="margin-top:10px">
               摘要随输入实时更新，用于保存前确认「这个任务到底会做什么」。
-              带橙色圆点的标签页表示该页存在与默认值不同的配置。
+              带橙色圆点的标签页表示该页有未保存的修改。
             </div>
           </section>
         </div>
@@ -1528,7 +1530,7 @@ AD.views = {};
     // ---- 分页导航 ------------------------------------------------------
     // 面板始终留在 DOM 里（只用 .hidden 切换）：collectForm 与各 apply*UI
     // 都按 id 读取全部字段，销毁子树会导致保存静默丢字段。
-    const TAB_KEYS = ['basic', 'source', 'build', 'trigger', 'advanced', 'summary'];
+    const TAB_KEYS = ['basic', 'source', 'build', 'schedule', 'webhook', 'advanced', 'summary'];
     const tabButtons = Array.from(backdrop.querySelectorAll('[data-form-tab]'));
     const tabPanels = Array.from(backdrop.querySelectorAll('[data-form-panel]'));
     const panelOf = (key) => backdrop.querySelector(`[data-form-panel="${key}"]`);
@@ -1570,7 +1572,7 @@ AD.views = {};
     });
 
     // 菜单项状态点：dirtyKey 记录用户实际改过哪一页；hasError 由保存校验回填。
-    const tabDirty = hasAdvanced ? { advanced: true } : {};
+    const tabDirty = {};
     const tabError = {};
     const paintTabBadges = () => {
       tabButtons.forEach((button) => {
@@ -1659,10 +1661,14 @@ AD.views = {};
       const scheduleType = typeSelect.value;
       const expression = value('#f-schedule_expression');
       const enabledNode = backdrop.querySelector('#f-enabled');
-      if (enabledNode && !enabledNode.checked) lines.push('触发：定时已停用，仅手动运行');
-      else if (scheduleType === 'manual') lines.push('触发：仅手动触发');
-      else if (scheduleType === 'interval') lines.push('触发：固定间隔 ' + (expression || '（未填写）'));
-      else lines.push('触发：Cron ' + (expression || '（未填写）') + '（按 UTC 计算）');
+      if (enabledNode && !enabledNode.checked) lines.push('定时：已停用，不按计划自动执行');
+      else if (scheduleType === 'manual') lines.push('定时：仅手动触发');
+      else if (scheduleType === 'interval') lines.push('定时：固定间隔 ' + (expression || '（未填写）'));
+      else lines.push('定时：Cron ' + (expression || '（未填写）') + '（按 UTC 计算）');
+
+      const webhookNode = backdrop.querySelector('#f-webhook_enabled');
+      if (webhookNode && !webhookNode.checked) lines.push('Webhook：已停用');
+      else lines.push('Webhook：已启用');
       // 高级项偏离默认值时在摘要里点出来：分页后这些字段藏在「高级」页，
       // 不提示就等于悄悄生效。
       const advancedBits = [];
@@ -1996,6 +2002,7 @@ AD.views = {};
       schedule_type: value('#f-schedule_type'),
       schedule_expression: value('#f-schedule_expression'),
       enabled: checked('#f-enabled'),
+      webhook_enabled: checked('#f-webhook_enabled'),
       deploy_method: value('#f-deploy_method'),
       host_id: value('#f-host_id') ? Number(value('#f-host_id')) : null,
       artifact_paths: value('#f-artifact_paths'),

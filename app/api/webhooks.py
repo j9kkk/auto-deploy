@@ -67,6 +67,16 @@ def trigger_webhook(
             detail="任务已暂停，Webhook 触发被拒绝",
         )
 
+    if not (row or {}).get("webhook_enabled", 1):
+        audit(
+            service, "webhook_rejected", actor="webhook", target=f"task:{task_id_num}",
+            detail="reason:webhook_disabled", ip=client_ip(request),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Webhook 触发已禁用",
+        )
+
     if service.store.runs.count_active() >= service.settings.max_global_workers:
         audit(
             service, "webhook_rate_limited", actor="webhook", target=f"task:{task_id_num}",

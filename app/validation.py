@@ -234,6 +234,10 @@ def validate_task_payload(
         out["schedule_expression"] = expression
     if has("enabled") or not partial:
         out["enabled"] = _clean_bool(payload.get("enabled", existing.get("enabled", True)), True)
+    if has("webhook_enabled") or not partial:
+        out["webhook_enabled"] = _clean_bool(
+            payload.get("webhook_enabled", existing.get("webhook_enabled", True)), True
+        )
 
     # Only a full schedule pair can be checked; a partial update checks the
     # merged result so a schedule type change without an expression still fails.

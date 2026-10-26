@@ -22,7 +22,7 @@ TASK_INSERT_COLUMNS = (
     "name", "description",
     "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username", "git_token",
     "credential_id",
-    "schedule_type", "schedule_expression", "enabled", "webhook_secret",
+    "schedule_type", "schedule_expression", "enabled", "webhook_enabled", "webhook_secret",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
     "artifact_paths", "target_dir", "keep_releases",
     "service_name", "docker_image", "docker_command", "docker_compose_file",
@@ -36,7 +36,7 @@ TASK_UPDATE_COLUMNS = (
     "name", "description",
     "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username", "git_token",
     "credential_id",
-    "schedule_type", "schedule_expression", "enabled", "webhook_secret",
+    "schedule_type", "schedule_expression", "enabled", "webhook_enabled", "webhook_secret",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
     "artifact_paths", "target_dir", "keep_releases",
     "service_name", "docker_image", "docker_command", "docker_compose_file",
@@ -520,7 +520,7 @@ class TaskRepository:
         payload = dict(data)
         if "env_vars" in payload:
             payload["env_vars"] = encode_env_vars(payload["env_vars"])
-        for flag in ("enabled", "skip_if_no_changes", "run_on_create"):
+        for flag in ("enabled", "webhook_enabled", "skip_if_no_changes", "run_on_create"):
             if flag in payload and isinstance(payload[flag], bool):
                 payload[flag] = 1 if payload[flag] else 0
         return payload

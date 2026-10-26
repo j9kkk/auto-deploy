@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     schedule_type            TEXT    NOT NULL DEFAULT 'interval',
     schedule_expression      TEXT    NOT NULL DEFAULT '1h',
     enabled                  INTEGER NOT NULL DEFAULT 1,
+    -- Webhook 触发开关：0 = 禁用，1 = 启用
+    webhook_enabled          INTEGER NOT NULL DEFAULT 1,
     -- Webhook 触发令牌：拼在触发地址路径里，持有者即可触发一次部署；
     -- 为空表示待生成（v4 迁移或首次保存时补齐）。
     webhook_secret           TEXT    NOT NULL DEFAULT '',
@@ -362,6 +364,8 @@ class Database:
             self._migrate_v9_to_v10(conn)
         if current < 11:
             self._migrate_v10_to_v11(conn)
+        if current < 12:
+            self._migrate_v11_to_v12(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
@@ -387,6 +391,15 @@ class Database:
         """
         self._add_column(
             conn, "backups", "contains_persistent", "INTEGER NOT NULL DEFAULT 0"
+        )
+
+    def _migrate_v11_to_v12(self, conn: sqlite3.Connection) -> None:
+        """v12: 任务支持分别配置定时触发与 Webhook 触发是否启用。
+
+        ``webhook_enabled`` 控制 Webhook 触发开关，默认 1（启用）；既有任务保持开启。
+        """
+        self._add_column(
+            conn, "tasks", "webhook_enabled", "INTEGER NOT NULL DEFAULT 1"
         )
 
     def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
@@ -655,6 +668,7 @@ def decode_task(row: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     task = dict(row)
     task["enabled"] = bool(task.get("enabled"))
+    task["webhook_enabled"] = bool(task.get("webhook_enabled", 1))
     task["skip_if_no_changes"] = bool(task.get("skip_if_no_changes"))
     task["run_on_create"] = bool(task.get("run_on_create"))
     raw_env = task.get("env_vars") or "{}"

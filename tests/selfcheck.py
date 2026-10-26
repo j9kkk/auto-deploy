@@ -2009,6 +2009,34 @@ def run() -> int:
             if reset_status not in ("queued", "running"):
                 break
             time.sleep(0.4)
+
+        # --- 独立禁用 Webhook 触发 -------------------------------------
+        dis_wh_resp = client.put(f"/api/tasks/{webhook_id}", json={"webhook_enabled": False})
+        check("更新任务禁用 Webhook 触发", dis_wh_resp.status_code == 200
+              and dis_wh_resp.json()["task"]["webhook_enabled"] is False, dis_wh_resp.text[:150])
+        wh_disabled_resp = client.post(new_path)
+        check("单独禁用 Webhook 时触发返回 409", wh_disabled_resp.status_code == 409,
+              wh_disabled_resp.text[:150])
+        check("单独禁用 Webhook 错误提示明确", "Webhook 触发已禁用" in wh_disabled_resp.text,
+              wh_disabled_resp.text[:150])
+        audit_entries = client.get("/api/audit").json().get("entries", [])
+        wh_disabled_audit = [e for e in audit_entries
+                             if e["action"] == "webhook_rejected" and "reason:webhook_disabled" in (e.get("detail") or "")]
+        check("禁用 Webhook 调用写入审计日志且原因正确", bool(wh_disabled_audit))
+
+        en_wh_resp = client.put(f"/api/tasks/{webhook_id}", json={"webhook_enabled": True})
+        check("恢复启用 Webhook 触发", en_wh_resp.status_code == 200
+              and en_wh_resp.json()["task"]["webhook_enabled"] is True, en_wh_resp.text[:150])
+        wh_enabled_resp = client.post(new_path)
+        check("恢复启用 Webhook 后可正常触发", wh_enabled_resp.status_code == 200,
+              wh_enabled_resp.text[:150])
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            en_status = client.get(f"/api/runs/{wh_enabled_resp.json()['run_id']}").json()["run"]["status"]
+            if en_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+
         response = client.delete(f"/api/tasks/{webhook_id}")
         check("清理 Webhook 测试任务", response.status_code == 200, response.text[:150])
         check("Webhook 触发写入审计日志", any(

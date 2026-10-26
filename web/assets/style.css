@@ -292,6 +292,7 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--warning); flex: none; display: none;
 }
+/* 实心点只表示本页有未保存的修改。 */
 .form-tab-btn.is-dirty .tab-dot { display: block; }
 .form-tab-btn.has-error { color: var(--danger); }
 .form-tab-btn.has-error .tab-dot { display: block; background: var(--danger); }

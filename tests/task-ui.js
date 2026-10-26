@@ -743,7 +743,8 @@ async function taskFormUxChecks() {
   const summaryText = summarised.q('#config-summary').textContent;
   assert.match(summaryText, /认证：无需认证/);
   assert.match(summaryText, /部署：自定义脚本/);
-  assert.match(summaryText, /触发：固定间隔 1h/);
+  assert.match(summaryText, /定时：固定间隔 1h/);
+  assert.match(summaryText, /Webhook：已启用/);
   summarised.finish();
 
   // ---- 分页表单 ------------------------------------------------------
@@ -751,7 +752,7 @@ async function taskFormUxChecks() {
   const tabbed = await scenario();
   await tabbed.AD.openTaskForm(1); await flush();
   assert.equal(tabbed.q('[data-form-panel="basic"]').classList.contains('hidden'), false);
-  for (const key of ['source', 'build', 'trigger', 'advanced', 'summary']) {
+  for (const key of ['source', 'build', 'schedule', 'webhook', 'advanced', 'summary']) {
     assert.equal(tabbed.q(`[data-form-panel="${key}"]`).classList.contains('hidden'), true,
       `初始应隐藏面板 ${key}`);
   }
@@ -808,6 +809,49 @@ async function taskFormUxChecks() {
     '修改基础页字段后应出现未保存标记');
   assert.equal(dirtyTab.q('[data-form-tab="source"]').classList.contains('is-dirty'), false);
   dirtyTab.finish();
+
+  // 6b) 既有任务的高级项偏离默认值，不等于「用户改过」：打开表单不得留任何标记，
+  //     否则用户什么都没动却看到脏点，会怀疑自己的配置被动过。
+  const advancedConfigured = await scenario([run(30)], { env_vars: { PURENAV_PORT: '9001' } });
+  await advancedConfigured.AD.openTaskForm(1); await flush();
+  assert.equal(advancedConfigured.q('[data-form-tab="advanced"]').classList.contains('is-dirty'), false,
+    '存在自定义环境变量也不应在打开表单时显示为已修改');
+  assert.equal(advancedConfigured.q('[data-form-tab="advanced"]').classList.contains('has-config'), false,
+    '既有配置不应单独打标记');
+  // 真正改动后才出现标记。
+  advancedConfigured.q('#f-git_depth').value = '5';
+  advancedConfigured.q('#f-git_depth').fire('input');
+  await flush();
+  assert.equal(advancedConfigured.q('[data-form-tab="advanced"]').classList.contains('is-dirty'), true,
+    '改动高级页字段后必须标记为已修改');
+  advancedConfigured.finish();
+
+  // 6c) 触发菜单已拆分为「定时触发」与「Webhook」两项，且启用开关均在第一项：
+  const triggerSplit = await scenario();
+  await triggerSplit.AD.openTaskForm(1); await flush();
+  assert.ok(triggerSplit.q('[data-form-tab="schedule"]'), '应存在「定时触发」标签页');
+  assert.ok(triggerSplit.q('[data-form-tab="webhook"]'), '应存在「Webhook」标签页');
+  assert.equal(triggerSplit.document.querySelector('[data-form-tab="trigger"]'), null, '原「触发」标签页应已移除');
+
+  // 切到「定时触发」，第一项为启用开关
+  await triggerSplit.click('[data-form-tab="schedule"]');
+  assert.equal(triggerSplit.q('[data-form-panel="schedule"]').classList.contains('hidden'), false);
+  const firstScheduleInput = triggerSplit.q('[data-form-panel="schedule"] input');
+  assert.equal(firstScheduleInput.id, 'f-enabled', '定时触发菜单第一项应为启用开关');
+
+  // 切到「Webhook」，第一项为启用开关
+  await triggerSplit.click('[data-form-tab="webhook"]');
+  assert.equal(triggerSplit.q('[data-form-panel="webhook"]').classList.contains('hidden'), false);
+  const firstWebhookInput = triggerSplit.q('[data-form-panel="webhook"] input');
+  assert.equal(firstWebhookInput.id, 'f-webhook_enabled', 'Webhook 菜单第一项应为启用开关');
+
+  // 关闭 Webhook 启用开关并保存
+  firstWebhookInput.checked = false;
+  triggerSplit.enqueue('PUT', '/api/tasks/1', { task: { ...triggerSplit.task, webhook_enabled: false } });
+  await triggerSplit.click('#form-save');
+  const putReq = triggerSplit.requests.filter(r => r.method === 'PUT').at(-1);
+  assert.equal(putReq.body.webhook_enabled, false, '表单应提交 webhook_enabled 字段');
+  triggerSplit.finish();
 
   // 「创建后立即运行」派发失败时后端返回 warning，必须提示而不是只报成功。
   const warned = await scenario();
@@ -926,6 +970,9 @@ function styleChecks() {
   assert.match(rule('.form-tab-panels'), /overflow-y:\s*auto;/, '内容超高时应在面板内滚动');
   assert.match(rule('.form-tab-btn.active'), /background:\s*var\(--accent-soft\);/);
   assert.match(rule('.form-tab-btn.has-error'), /color:\s*var\(--danger\);/);
+  // 「有非默认配置」必须是空心点，否则与「有未保存修改」的实心点无法区分。
+  assert.match(rule('.form-tab-btn.is-dirty .tab-dot'), /display:\s*block;/, '未保存修改标记应为实心点');
+  assert.equal(css.includes('has-config'), false, '既有配置不应有独立标记样式');
   // 移动端：720px 断点内导航转横向（文件里有多个 720px 块，逐块找含 form-tab-nav 的那个）。
   const mobileBlocks = [...css.matchAll(/@media\s*\(max-width:\s*720px\)\s*\{/g)];
   const tabBlock = mobileBlocks
@@ -982,5 +1029,5 @@ function styleChecks() {
   await selectionChecks(); await raceChecks(); await pollingChecks(); await runFinishChecks();
   await runDetailIsolationChecks(); await rollbackChecks(); await deleteChecks();
   await formChecks(); await taskFormUxChecks(); styleChecks();
-  console.log('任务页 Node 回归通过：真实详情/表单 handler、日志选择与下载、异步会话隔离、增量轮询及清理、运行结束就地收敛（取消按钮消失且不重绘）、查看日志不触发整体刷新、回滚确认与错误、名称原样校验、删除两步确认与后果说明、表单 UX（方式切换保留输入、无关字段提交清空、clear_token 协议、凭据绑定保留、仅打包显隐、默认值兜底、配置摘要、创建警告）及 CSS 契约（有限 DOM 模拟，未进行真实浏览器验收）');
+  console.log('任务页 Node 回归通过：真实详情/表单 handler、日志选择与下载、异步会话隔离、增量轮询及清理、运行结束就地收敛（取消按钮消失且不重绘）、查看日志不触发整体刷新、回滚确认与错误、名称原样校验、删除两步确认与后果说明、分页表单（跨页校验、既有高级配置不留脏标记）、表单 UX（方式切换保留输入、无关字段提交清空、clear_token 协议、凭据绑定保留、仅打包显隐、默认值兜底、配置摘要、创建警告）及 CSS 契约（有限 DOM 模拟，未进行真实浏览器验收）');
 })().catch(error => { console.error(error); process.exitCode = 1; });
