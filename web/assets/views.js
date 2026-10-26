@@ -474,8 +474,8 @@ AD.views = {};
       <td class="task-name-cell" data-label="任务">
         <button type="button" class="task-name-link" data-task-edit="${task.id}"
                 title="点击编辑任务">${e(task.name)}</button>
-        ${task.description ? `<div class="faint truncate" title="${a(task.description)}">${e(task.description)}</div>` : ''}
-        <div class="faint truncate" style="max-width:280px" title="${a(task.repo_url)}">
+        ${task.description ? `<div class="faint truncate" data-task-desc title="${a(task.description)}">${e(task.description)}</div>` : ''}
+        <div class="faint truncate" data-task-repo style="max-width:280px" title="${a(task.repo_url)}">
           ${e(task.repo_url)}<span class="dim"> @${e(task.repo_branch)}</span>
         </div>
       </td>
@@ -483,9 +483,8 @@ AD.views = {};
       <td class="mono" data-label="调度" style="font-size:11.5px">${e(task.schedule_expression || '—')}</td>
       <td data-label="部署方式">
         <span class="badge neutral">${e(methodLabel(task.deploy_method))}</span>
-        ${task.host_id
-          ? `<div class="faint truncate" style="margin-top:3px;max-width:160px" title="${a(task.host_target || task.host_label)}">🖥 ${e(task.host_label)}</div>`
-          : ''}
+        <div data-task-host class="faint truncate${task.host_id ? '' : ' hidden'}" style="margin-top:3px;max-width:160px"
+             title="${a(task.host_target || task.host_label)}">🖥 ${e(task.host_label)}</div>
       </td>
       <td class="nowrap" data-label="最近运行">${lastRun}</td>
       <td class="nowrap" data-label="下次执行">${nextRun}</td>
@@ -1097,6 +1096,54 @@ AD.views = {};
       const toggleInput = row.querySelector('[data-task-toggle]');
       if (toggleInput) syncToggleInput(toggleInput, Boolean(found.enabled));
 
+      // 名称/备注/仓库/调度/部署方式：保存表单时这些都可能被改过。
+      // 不刷新的话，弹窗里刚保存的新名字在列表上还是旧的，看起来像没存上。
+      // 逐个子节点就地改文本，不重建整格：名称按钮上已绑定的事件监听器
+      // 挂在节点上，innerHTML 重建会把它连节点一起换掉，之后点名字打不开表单。
+      const nameLink = row.querySelector('[data-task-edit]');
+      if (nameLink) nameLink.textContent = found.name || '';
+      const nameCell = row.querySelector('td[data-label="任务"]');
+      if (nameCell) {
+        const descNode = nameCell.querySelector('[data-task-desc]');
+        if (found.description) {
+          if (descNode) {
+            descNode.textContent = found.description;
+            descNode.title = found.description;
+          } else if (nameLink && nameLink.parentNode) {
+            // 原本没有备注时节点不存在，新增的备注要插在名称按钮之后，
+            // 否则列表上看不到刚填的说明。
+            const node = document.createElement('div');
+            node.className = 'faint truncate';
+            node.dataset.taskDesc = '';
+            node.textContent = found.description;
+            node.title = found.description;
+            nameLink.after(node);
+          }
+        } else if (descNode) {
+          descNode.remove();
+        }
+        const repoNode = nameCell.querySelector('[data-task-repo]');
+        if (repoNode) {
+          repoNode.textContent = `${found.repo_url || ''} @${found.repo_branch || ''}`;
+          repoNode.title = found.repo_url || '';
+        }
+      }
+      const scheduleCell = row.querySelector('td[data-label="调度"]');
+      if (scheduleCell) scheduleCell.textContent = found.schedule_expression || '—';
+      const methodCell = row.querySelector('td[data-label="部署方式"]');
+      if (methodCell) {
+        const badge = methodCell.querySelector('.badge');
+        if (badge) badge.textContent = methodLabel(found.deploy_method);
+        const hostNode = methodCell.querySelector('[data-task-host]');
+        if (hostNode) {
+          hostNode.classList.toggle('hidden', !found.host_id);
+          if (found.host_id) {
+            hostNode.textContent = '🖥 ' + (found.host_label || '');
+            hostNode.title = found.host_target || found.host_label || '';
+          }
+        }
+      }
+
       // 禁用行样式
       row.classList.toggle('row-disabled', !found.enabled);
     };
@@ -1133,6 +1180,24 @@ AD.views = {};
     }
   }
   AD.refreshTaskRowsInPlace = refreshTaskRowsInPlace;
+
+  /** 表单保存后刷新任务列表。
+   *
+   * 保存不再关闭弹窗，因此默认不能整页重绘（会把弹窗背后的视图重建掉）。
+   * 已存在任务行时就地更新；列表结构与内容有变化（新建任务、当前不在任务
+   * 列表页）时，只有弹窗正好盖在任务页上方才允许重绘该页，否则下次进入
+   * 视图时自然重取。
+   */
+  async function refreshTaskListAfterSave() {
+    const hasRows = Boolean(document.querySelector('tr[data-task-row]'));
+    if (hasRows) { await refreshTaskRowsInPlace(); return; }
+    AD.state.tasks = (await AD.api.get('/api/tasks')).tasks || [];
+    // 列表里没有任务行有两种可能：空列表（刚建出第一个任务）或当前不在
+    // 任务页。前者必须把新行渲染出来，否则关掉弹窗仍显示「还没有任务」。
+    if (document.getElementById('tasks-body') && AD.state.currentView === 'tasks') {
+      await AD.render('tasks');
+    }
+  }
 
   // ======================================================================
   // Task form (create / edit)
@@ -1507,7 +1572,9 @@ AD.views = {};
       size: 'wide',
       body,
       footerLeft: isEdit ? `<button class="danger" id="form-delete">删除任务</button>` : '<div class="left"></div>',
-      footer: '<button data-close>取消</button>'
+      // 保存后弹窗保持打开，因此这里是「关闭」而不是「取消」：
+      // 叫「取消」会让用户以为点击会撤销刚才的保存。
+      footer: '<button data-close>关闭</button>'
         + `<button class="primary" id="form-save">${isEdit ? '保存修改' : '创建任务'}</button>`,
       // 关闭关卡：有未保存修改时先确认，避免误触遮罩/Escape 丢配置。
       beforeClose: async () => {
@@ -1930,9 +1997,9 @@ AD.views = {};
 
       AD.setBusy(button, true, isEdit ? '保存中…' : '创建中…');
       try {
-        let result;
+        let result = null;
         if (isEdit) {
-          result = await AD.api.put(`/api/tasks/${taskId}`, payload);
+          await AD.api.put(`/api/tasks/${taskId}`, payload);
           AD.toastSuccess('任务已保存');
         } else {
           result = await AD.api.post('/api/tasks', payload);
@@ -1941,14 +2008,49 @@ AD.views = {};
           // 以为第一次部署已经开始了。
           if (result.warning) AD.toastError(result.warning);
         }
-        // 保存期间用户可能已关闭本表单并打开了其它弹窗：此时只刷新数据，
-        // 不再代关当前弹窗（旧实现会误关新打开的弹窗）。
-        if (AD.Modal.top && AD.Modal.top() !== backdrop) {
-          AD.render('tasks');
+
+        // 保存成功只提示、不关弹窗：用户可以接着改下一处配置。
+        // 清掉未保存标记，否则关闭时还会追问「放弃未保存的修改？」。
+        formDirty = false;
+        Object.keys(tabDirty).forEach((key) => { delete tabDirty[key]; });
+        Object.keys(tabError).forEach((key) => { delete tabError[key]; });
+        paintTabBadges();
+        const errorBox = backdrop.querySelector('#form-error');
+        if (errorBox) { errorBox.classList.add('hidden'); errorBox.textContent = ''; }
+
+        // 新建成功后表单已经指向一个真实任务：留在「新建」态再点保存会
+        // 重复创建，因此用同一个任务以编辑态重新打开，弹窗不关闭。
+        // 这一步要在「用户是否已关掉本弹窗」的判断之前做：重新打开会先
+        // 关掉旧节点，旧节点的 backdrop 不再是栈顶，走下面的分支会被当成
+        // 「用户已关闭」而提前返回，表单就停在新建成态了。
+        if (!isEdit) {
+          const newId = result && result.task ? result.task.id : null;
+          if (newId) {
+            AD.Modal.close();
+            await refreshTaskListAfterSave();
+            await AD.openTaskForm(newId);
+            return;
+          }
+          AD.setBusy(button, false);
+          AD.Modal.close();
           return;
         }
-        AD.Modal.close();
-        AD.render('tasks');
+
+        // 保存期间用户可能已关闭本表单并打开了其它弹窗：此时只刷新数据，
+        // 不代关也不重开（旧实现会误关新弹出的弹窗）。
+        if (AD.Modal.top && AD.Modal.top() !== backdrop) {
+          await refreshTaskListAfterSave();
+          return;
+        }
+
+        // 弹窗保持打开，所以不能整页重绘（会连带重建当前视图）：
+        // 任务页就地更新受影响的行，其它视图下次进入时自然重取。
+        await refreshTaskListAfterSave();
+
+        AD.setBusy(button, false);
+        // 改名后标题要跟着走，否则弹窗还顶着旧名字。
+        const titleNode = backdrop.querySelector('.modal-head h2');
+        if (titleNode) titleNode.textContent = '编辑任务：' + (payload.name || '');
       } catch (err) {
         // 后端拒绝（含唯一性冲突）时错误属于整体提交，不指向具体页面：
         // 留在当前页展示原因，同时不污染任何标签页的错误标记。

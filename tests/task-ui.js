@@ -183,8 +183,18 @@ async function scenario(runs = [run(30), run(20)], taskExtra = {}, options = {})
     prompt: async options_ => { prompts.push(options_); return promptResult; },
     api: Object.fromEntries(['get', 'post', 'put', 'del'].map(method => [method,
       (url, body) => request(method === 'del' ? 'DELETE' : method.toUpperCase(), url, body)])),
-    Modal: { open: options_ => { modalRoot.innerHTML = ''; modal = new Element(); modalRoot.append(modal);
-      modal.innerHTML = options_.body + (options_.footerLeft || '') + options_.footer; return modal;
+    Modal: { open: options_ => { modalRoot.innerHTML = ''; const node = new Element(); modal = node; modalRoot.append(node);
+      node.innerHTML = options_.body + (options_.footerLeft || '') + options_.footer;
+      node.beforeClose = options_.beforeClose || null;
+      // 与真实 Modal 一致：点 [data-close] 先过关闭关卡，不通过就不关。
+      node.addEventListener('click', async event => {
+        const target = event.target;
+        if (modal !== node || !target || typeof target.closest !== 'function') return;
+        if (!target.closest('[data-close]')) return;
+        if (node.beforeClose && !(await node.beforeClose())) return;
+        AD.Modal.close();
+      });
+      return node;
     }, close: () => { modalRoot.innerHTML = ''; modal = null; }, top: () => modal } };
   for (const key of ['statusLabel', 'formatTime', 'formatRelative', 'formatDuration', 'triggerLabel', 'shortCommit']) AD[key] = v => String(v ?? '');
   // 运行详情弹窗使用 setInterval 轮询与 MutationObserver 感知关闭；这里提供
@@ -614,7 +624,7 @@ async function formChecks() {
     }
     const valid = ['_', 'Abc_task', 'A'.repeat(80), ...(editing ? ['旧名称-1 '] : [])];
     for (const name of valid) {
-      // 保存成功会关闭节点；每次重新打开真实表单。
+      // 保存成功后弹窗保持打开，但新建会转成编辑态，所以每次都重新打开。
       await test.AD.openTaskForm(editing ? 1 : null); await flush();
       test.q('#f-name').value = name; test.q('#f-description').value = '中文部署备注';
       test.q('#f-repo_url').value = 'https://example.test/repo.git';
@@ -622,10 +632,66 @@ async function formChecks() {
       test.q('#f-deploy_script').value = 'echo deploy';
       const method = editing ? 'PUT' : 'POST', url = editing ? '/api/tasks/1' : '/api/tasks';
       test.enqueue(method, url, {}); await test.click('#form-save');
-      const request = test.requests.at(-1); assert.equal(request.method, method); assert.equal(request.url, url);
+      // 保存后还会刷新任务列表（GET /api/tasks），因此按方法取提交请求，
+      // 不能用 at(-1) 假定最后一个是保存请求。
+      const request = test.requests.filter(r => r.method === method && r.url === url).at(-1);
+      assert.ok(request, `应发出 ${method} ${url} 请求`);
       assert.equal(request.body.name, name); assert.equal(request.body.description, '中文部署备注');
     }
     test.finish();
+  }
+
+  // 保存后弹窗保持打开：只弹 toast，方便接着改下一处配置。
+  // 旧实现关掉整个弹窗，用户改一项就得重新找任务、重新展开表单。
+  {
+    const keep = await scenario([run(30)], { name: 'Keep_open' });
+    await keep.AD.openTaskForm(1); await flush();
+    keep.q('#f-description').value = '改一处';
+    keep.q('#f-description').fire('input');
+    assert.equal(keep.q('[data-form-tab="basic"]').classList.contains('is-dirty'), true, '改动后应标记');
+    keep.enqueue('PUT', '/api/tasks/1', { task: { ...keep.task, description: '改一处' } });
+    await keep.click('#form-save');
+    assert.ok(keep.AD.Modal.top(), '编辑保存后弹窗必须保持打开');
+    assert.equal(keep.q('#f-description').value, '改一处', '保存后输入内容不应被重建丢失');
+    assert.ok(keep.successes.some(m => /任务已保存/.test(m)), '保存结果通过 toast 提示');
+    assert.equal(keep.q('[data-form-tab="basic"]').classList.contains('is-dirty'), false,
+      '保存成功后应清除未保存标记，否则关闭时还会追问是否放弃修改');
+    // 未保存标记已清：关闭不再追问。
+    const confirmsBefore = keep.confirms.length;
+    await keep.click('[data-close]');
+    assert.equal(keep.confirms.length, confirmsBefore, '已保存的表单关闭时不应再确认放弃修改');
+    assert.equal(keep.AD.Modal.top(), null, '关闭按钮应真正关闭弹窗');
+    keep.finish();
+  }
+
+  // 新建保存后转为编辑同一任务：留在「新建」态再点保存会重复创建任务。
+  {
+    const created = await scenario();
+    await created.AD.openTaskForm(null); await flush();
+    created.q('#f-name').value = 'New_task';
+    created.q('#f-repo_url').value = 'https://example.test/repo.git';
+    created.q('#f-deploy_script').value = 'echo hi';
+    const newTask = { ...created.task, id: 2, name: 'New_task' };
+    created.enqueue('POST', '/api/tasks', { task: newTask });
+    created.enqueue('GET', '/api/tasks/2', { task: newTask, runs: [] });
+    await created.click('#form-save');
+    assert.ok(created.AD.Modal.top(), '新建保存后应继续显示表单，而不是关闭');
+    // 模拟 Modal 不渲染标题栏，用「以该任务重新拉取」证明当前是编辑态。
+    assert.ok(created.requests.some(r => r.method === 'GET' && r.url === '/api/tasks/2'),
+      '新建保存后应以该任务重新打开编辑表单');
+    // 按钮文案必须跟着变：还是「创建任务」就说明表单停在新建成态，
+    // 再点一次会重复创建。
+    assert.equal(created.q('#form-save').textContent.trim(), '保存修改',
+      '新建保存后表单应转为编辑态（按钮变成「保存修改」）');
+    assert.equal(created.q('[data-close]').textContent.trim(), '关闭', '底部退出口应为「关闭」');
+    // 再次保存必须走 PUT 更新，不能又发一次 POST 造出重复任务。
+    const postsBefore = created.requests.filter(r => r.method === 'POST').length;
+    created.enqueue('PUT', '/api/tasks/2', { task: newTask });
+    await created.click('#form-save');
+    assert.equal(created.requests.filter(r => r.method === 'POST').length, postsBefore,
+      '保存后再次保存不得重复创建任务');
+    assert.equal(created.requests.filter(r => r.method === 'PUT').at(-1).url, '/api/tasks/2');
+    created.finish();
   }
 }
 
@@ -687,7 +753,7 @@ async function taskFormUxChecks() {
   await legacy.AD.openTaskForm(1); await flush();
   legacy.enqueue('PUT', '/api/tasks/1', {});
   await legacy.click('#form-save');
-  const legacyBody = legacy.requests.at(-1).body;
+  const legacyBody = legacy.requests.filter(r => r.method === 'PUT').at(-1).body;
   assert.equal(legacyBody.service_name, '', 'release 任务不得携带 systemd 字段');
   assert.equal(legacyBody.docker_image, '', 'release 任务不得携带 docker 字段');
   assert.equal(legacyBody.credential_id, null, '未选择凭据时显式提交空绑定');
@@ -703,7 +769,7 @@ async function taskFormUxChecks() {
   tokened.q('#f-clear_token').checked = true;
   tokened.enqueue('PUT', '/api/tasks/1', {});
   await tokened.click('#form-save');
-  const tokenBody = tokened.requests.at(-1).body;
+  const tokenBody = tokened.requests.filter(r => r.method === 'PUT').at(-1).body;
   assert.equal(tokenBody.clear_token, true);
   assert.equal('git_token' in tokenBody, false, '空令牌不得提交');
   tokened.finish();
@@ -715,7 +781,7 @@ async function taskFormUxChecks() {
   assert.equal(bound.q('#f-credential_id').value, '7', '绑定的凭据应通过占位选项保留');
   bound.enqueue('PUT', '/api/tasks/1', {});
   await bound.click('#form-save');
-  assert.equal(bound.requests.at(-1).body.credential_id, 7, '列表失败不得静默解绑');
+  assert.equal(bound.requests.filter(r => r.method === 'PUT').at(-1).body.credential_id, 7, '列表失败不得静默解绑');
   bound.finish();
 
   // 仅打包方式：打包路径始终可见（它是该方式的核心字段），发布位置隐藏。
@@ -1029,5 +1095,5 @@ function styleChecks() {
   await selectionChecks(); await raceChecks(); await pollingChecks(); await runFinishChecks();
   await runDetailIsolationChecks(); await rollbackChecks(); await deleteChecks();
   await formChecks(); await taskFormUxChecks(); styleChecks();
-  console.log('任务页 Node 回归通过：真实详情/表单 handler、日志选择与下载、异步会话隔离、增量轮询及清理、运行结束就地收敛（取消按钮消失且不重绘）、查看日志不触发整体刷新、回滚确认与错误、名称原样校验、删除两步确认与后果说明、分页表单（跨页校验、既有高级配置不留脏标记）、表单 UX（方式切换保留输入、无关字段提交清空、clear_token 协议、凭据绑定保留、仅打包显隐、默认值兜底、配置摘要、创建警告）及 CSS 契约（有限 DOM 模拟，未进行真实浏览器验收）');
+  console.log('任务页 Node 回归通过：真实详情/表单 handler、日志选择与下载、异步会话隔离、增量轮询及清理、运行结束就地收敛（取消按钮消失且不重绘）、查看日志不触发整体刷新、回滚确认与错误、名称原样校验、删除两步确认与后果说明、分页表单（跨页校验、既有高级配置不留脏标记）、保存后弹窗保持打开（编辑原地留存、新建转编辑不重复创建）、表单 UX（方式切换保留输入、无关字段提交清空、clear_token 协议、凭据绑定保留、仅打包显隐、默认值兜底、配置摘要、创建警告）及 CSS 契约（有限 DOM 模拟，未进行真实浏览器验收）');
 })().catch(error => { console.error(error); process.exitCode = 1; });
