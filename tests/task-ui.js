@@ -893,17 +893,24 @@ async function taskFormUxChecks() {
   advancedConfigured.finish();
 
   // 6c) 触发菜单已拆分为「定时触发」与「Webhook」两项，且启用开关均在第一项：
+  // 6c) 三个开关分居三页：任务总开关在「基础」，定时与 Webhook 各在本页第一项。
   const triggerSplit = await scenario();
   await triggerSplit.AD.openTaskForm(1); await flush();
   assert.ok(triggerSplit.q('[data-form-tab="schedule"]'), '应存在「定时触发」标签页');
   assert.ok(triggerSplit.q('[data-form-tab="webhook"]'), '应存在「Webhook」标签页');
   assert.equal(triggerSplit.document.querySelector('[data-form-tab="trigger"]'), null, '原「触发」标签页应已移除');
 
-  // 切到「定时触发」，第一项为启用开关
+  // 「基础」页第一项是任务总开关
+  const firstBasicInput = triggerSplit.q('[data-form-panel="basic"] input');
+  assert.equal(firstBasicInput.id, 'f-enabled', '基础页第一项应为任务总开关');
+
+  // 切到「定时触发」，第一项是定时开关（不再是任务总开关）
   await triggerSplit.click('[data-form-tab="schedule"]');
   assert.equal(triggerSplit.q('[data-form-panel="schedule"]').classList.contains('hidden'), false);
   const firstScheduleInput = triggerSplit.q('[data-form-panel="schedule"] input');
-  assert.equal(firstScheduleInput.id, 'f-enabled', '定时触发菜单第一项应为启用开关');
+  assert.equal(firstScheduleInput.id, 'f-schedule_enabled', '定时触发菜单第一项应为定时开关');
+  assert.equal(triggerSplit.document.querySelector('[data-form-panel="schedule"] #f-enabled'), null,
+    '任务总开关不应再出现在定时页');
 
   // 切到「Webhook」，第一项为启用开关
   await triggerSplit.click('[data-form-tab="webhook"]');
@@ -917,7 +924,40 @@ async function taskFormUxChecks() {
   await triggerSplit.click('#form-save');
   const putReq = triggerSplit.requests.filter(r => r.method === 'PUT').at(-1);
   assert.equal(putReq.body.webhook_enabled, false, '表单应提交 webhook_enabled 字段');
+  assert.equal(putReq.body.enabled, true, '表单应提交任务总开关字段');
+  assert.equal(putReq.body.schedule_enabled, true, '表单应提交定时开关字段');
   triggerSplit.finish();
+
+  // 6d) 摘要页把三个开关分开陈述，避免读者分不清暂停与只关定时。
+  {
+    const summaryTest = await scenario([run(30)]);
+    await summaryTest.AD.openTaskForm(1); await flush();
+    summaryTest.q('#f-schedule_enabled').checked = false;
+    summaryTest.q('#f-schedule_enabled').fire('change');
+    await summaryTest.click('[data-form-tab="summary"]');
+    const summaryText = summaryTest.q('[data-form-panel="summary"]').textContent;
+    assert.ok(/任务：已启用/.test(summaryText), '摘要应单独说明任务总开关状态: ' + summaryText.slice(0, 200));
+    assert.ok(/定时：已停用/.test(summaryText), '摘要应说明定时已停用: ' + summaryText.slice(0, 200));
+    assert.ok(/Webhook：/.test(summaryText), '摘要应说明 Webhook 状态: ' + summaryText.slice(0, 200));
+    summaryTest.finish();
+  }
+
+  // 6e) 列表里定时开关关闭时，调度列出现「定时已关」，且不再展示下次执行时间。
+  {
+    // 故意留一个旧的 next_run_at：定时关闭后它不该被展示，否则等于承诺
+    // 一次不会发生的运行。scenario() 内部已渲染任务列表，无需再调一次。
+    const paused = await scenario([], {
+      schedule_enabled: false, schedule_type: 'interval',
+      schedule_expression: '1h', next_run_at: '2026-10-28T00:00:00Z',
+    });
+    const scheduleCell = paused.q('tr[data-task-row="1"] td[data-label="调度"]');
+    assert.ok(/定时已关/.test(scheduleCell.textContent),
+      '定时关闭时调度列应标记「定时已关」: ' + scheduleCell.textContent);
+    const nextCell = paused.q('tr[data-task-row="1"] td[data-label="下次执行"]');
+    assert.ok(/定时已停用/.test(nextCell.textContent),
+      '定时关闭时下次执行应说明「定时已停用」: ' + nextCell.textContent);
+    paused.finish();
+  }
 
   // 「创建后立即运行」派发失败时后端返回 warning，必须提示而不是只报成功。
   const warned = await scenario();

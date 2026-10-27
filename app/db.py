@@ -17,7 +17,13 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
+
+# 调度索引单独成段：init_schema 在迁移之后统一执行，保证列集与最新 schema 一致。
+TASKS_INDEX_SQL = """
+DROP INDEX IF EXISTS idx_tasks_next_run;
+CREATE INDEX idx_tasks_next_run ON tasks(enabled, schedule_enabled, next_run_at);
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -88,7 +94,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 
     schedule_type            TEXT    NOT NULL DEFAULT 'interval',
     schedule_expression      TEXT    NOT NULL DEFAULT '1h',
+    -- 任务总开关：关闭后定时与 Webhook 都不触发，手动运行不受影响。
     enabled                  INTEGER NOT NULL DEFAULT 1,
+    -- 定时触发开关：只在任务总开关打开时生效。
+    schedule_enabled         INTEGER NOT NULL DEFAULT 1,
     -- Webhook 触发开关：0 = 禁用，1 = 启用
     webhook_enabled          INTEGER NOT NULL DEFAULT 1,
     -- Webhook 触发令牌：拼在触发地址路径里，持有者即可触发一次部署；
@@ -134,7 +143,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     failure_count            INTEGER NOT NULL DEFAULT 0,
     total_duration_ms        INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON tasks(enabled, next_run_at);
 
 CREATE TABLE IF NOT EXISTS runs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -335,6 +343,9 @@ class Database:
                 )
             else:
                 self._migrate(conn, int(current["version"]))
+            # 调度索引放在迁移之后统一重建：旧库的 tasks 表在 v2 整表重建时
+            # 建过双列索引，列集变化后必须换成三列版本，否则 due() 无法走索引。
+            conn.executescript(TASKS_INDEX_SQL)
 
     def _migrate(self, conn: sqlite3.Connection, current: int) -> None:
         """Apply additive migrations for databases created by older builds."""
@@ -366,6 +377,8 @@ class Database:
             self._migrate_v10_to_v11(conn)
         if current < 12:
             self._migrate_v11_to_v12(conn)
+        if current < 13:
+            self._migrate_v12_to_v13(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
@@ -401,6 +414,24 @@ class Database:
         self._add_column(
             conn, "tasks", "webhook_enabled", "INTEGER NOT NULL DEFAULT 1"
         )
+
+    def _migrate_v12_to_v13(self, conn: sqlite3.Connection) -> None:
+        """v13: 拆出独立的定时触发开关，任务总开关只保留「是否允许被触发」。
+
+        v13 之前 ``enabled`` 一位两用：既决定是否按计划排期，又被 Webhook
+        准入当作「任务已暂停」的依据。拆开后：
+
+        * ``enabled`` = 任务总开关，关闭后定时与 Webhook 都不触发
+        * ``schedule_enabled`` = 定时触发开关，只在总开关打开时起作用
+
+        回填 ``schedule_enabled = enabled``：升级前被暂停的任务在升级后既不
+        排期也不接受 Webhook，与升级前行为完全一致，不需要用户重新配置。
+        索引由 ``init_schema`` 在迁移之后统一重建，这里只管列与数据。
+        """
+        self._add_column(
+            conn, "tasks", "schedule_enabled", "INTEGER NOT NULL DEFAULT 1"
+        )
+        conn.execute("UPDATE tasks SET schedule_enabled = enabled")
 
     def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
         """v8: 新增远程主机表 hosts，并给任务/运行补主机维度。
@@ -668,6 +699,7 @@ def decode_task(row: dict[str, Any] | None) -> dict[str, Any] | None:
         return None
     task = dict(row)
     task["enabled"] = bool(task.get("enabled"))
+    task["schedule_enabled"] = bool(task.get("schedule_enabled", 1))
     task["webhook_enabled"] = bool(task.get("webhook_enabled", 1))
     task["skip_if_no_changes"] = bool(task.get("skip_if_no_changes"))
     task["run_on_create"] = bool(task.get("run_on_create"))

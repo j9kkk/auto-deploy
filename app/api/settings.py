@@ -38,7 +38,8 @@ def read_settings(
             for key, (_, low, high) in EDITABLE_SETTINGS.items()
         },
         "editable_bools": list(EDITABLE_BOOL_SETTINGS),
-        "readonly": ["host", "port", "base_url", "shell", "timezone"],
+        "editable_texts": ["base_url", "notify_webhook", "default_branch", "update_repo"],
+        "readonly": ["host", "port", "shell", "timezone"],
         "proxy_fields": [
             "proxy_enabled", "proxy_url", "proxy_username",
             "proxy_password", "proxy_no_proxy", "proxy_for_scripts",
@@ -69,8 +70,8 @@ def update_settings(
         service, "settings_updated", actor=user["username"],
         detail=f"字段: {', '.join(sorted(patch.keys()))}", ip=client_ip(request),
     )
-    # Some changes (host/port) only take effect after a restart.
-    restart_fields = {"host", "port", "base_url", "shell", "secure_cookies"}
+    # host/port 只在进程启动时读取；其余字段保存即生效。
+    restart_fields = {"host", "port", "shell"}
     needs_restart = bool(restart_fields & set(patch.keys()))
     return {
         "settings": service.export_settings(),

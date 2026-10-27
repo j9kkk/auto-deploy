@@ -720,6 +720,23 @@ def run() -> int:
     check("v4 迁移为存量任务补齐触发令牌", all(
         bool(t["webhook_secret"]) for t in store.tasks.list_all()))
 
+    # v13 拆出定时开关：旧暂停任务（enabled=0）必须回填成定时也关闭，
+    # 否则升级后它们会突然开始按计划跑。
+    store.tasks.update(task_id, {"enabled": False})
+    store.db.execute("UPDATE tasks SET schedule_enabled = 1")
+    store.db.execute("UPDATE schema_version SET version = 12")
+    store.db.init_schema()
+    migrated = store.tasks.get_decoded(task_id)
+    check("v13 迁移把旧暂停任务回填为定时关闭",
+          migrated["enabled"] is False and migrated["schedule_enabled"] is False,
+          f"enabled={migrated.get('enabled')} schedule={migrated.get('schedule_enabled')}")
+    check("v13 迁移后暂停任务仍不排期",
+          all(t["id"] != task_id for t in store.tasks.due(iso(datetime.utcnow()))))
+    # 再跑一次迁移不应报错（_add_column 幂等，索引重建可重复执行）。
+    store.db.init_schema()
+    check("v13 迁移可重复执行", store.db.schema_version() >= 13)
+    store.tasks.update(task_id, {"enabled": True, "schedule_enabled": True})
+
     # 结构护栏：校验层能产出的字段必须都能落库，否则会在某一侧被静默丢弃。
     from app import validation as _validation
     from app.store import TASK_INSERT_COLUMNS as _INSERT, TASK_UPDATE_COLUMNS as _UPDATE
@@ -1047,6 +1064,28 @@ def run() -> int:
     store.tasks.set_enabled(task_id, False, None)
     check("停用任务不再到期", len(store.tasks.due(iso(datetime.utcnow()))) == 0)
     store.tasks.set_enabled(task_id, True, iso(datetime.utcnow() - timedelta(minutes=1)))
+
+    # 三个开关正交：总开关与定时开关是叠加关系，任一关闭都不排期。
+    overdue = iso(datetime.utcnow() - timedelta(minutes=1))
+    store.tasks.update(task_id, {"enabled": True, "schedule_enabled": True})
+    store.tasks.set_next_run(task_id, overdue)
+    check("总开关+定时开关都打开才到期", len(store.tasks.due(iso(datetime.utcnow()))) == 1)
+    store.tasks.set_schedule_enabled(task_id, False, None)
+    check("只关定时开关不再到期", len(store.tasks.due(iso(datetime.utcnow()))) == 0)
+    check("只关定时开关不改总开关", store.tasks.get(task_id)["enabled"] == 1)
+    due_row = store.tasks.get_decoded(task_id)
+    check("解码后定时开关为布尔关闭", due_row["schedule_enabled"] is False)
+    check("定时关闭时定时触发不生效",
+          not sched.task_schedule_enabled(due_row))
+    store.tasks.update(task_id, {"enabled": False})
+    store.tasks.set_schedule_enabled(task_id, True, overdue)
+    check("只关总开关同样不排期", len(store.tasks.due(iso(datetime.utcnow()))) == 0)
+    check("总开关关闭时定时触发不生效",
+          not sched.task_schedule_enabled(store.tasks.get_decoded(task_id)))
+    check("定时有效的任务才进启动重排列表",
+          all(t["id"] != task_id for t in store.tasks.list_schedule_active()))
+    store.tasks.update(task_id, {"enabled": True})
+    store.tasks.set_next_run(task_id, overdue)
 
     run_id = store.runs.create(store.tasks.get(task_id), trigger="manual")
     check("运行记录创建后为活动状态", store.runs.count_active() == 1)
@@ -1782,8 +1821,20 @@ def run() -> int:
         response = client.post(f"/api/tasks/{task_id}/toggle")
         check("切换任务状态成功", response.status_code == 200)
         check("任务被暂停", response.json()["enabled"] is False)
+        check("暂停同时清空下次执行时间", response.json()["next_run_at"] is None)
+        check("暂停不改定时开关", response.json()["schedule_enabled"] is True)
         response = client.post(f"/api/tasks/{task_id}/toggle")
         check("任务被重新启用", response.json()["enabled"] is True)
+
+        # 定时开关关闭时，重新打开任务总开关不能凭空排期。
+        client.put(f"/api/tasks/{task_id}", json={"schedule_enabled": False})
+        paused = client.post(f"/api/tasks/{task_id}/toggle", json={"enabled": False})
+        check("接受显式暂停参数", paused.status_code == 200 and paused.json()["enabled"] is False)
+        resumed = client.post(f"/api/tasks/{task_id}/toggle", json={"enabled": True})
+        check("定时关闭时恢复任务不排期",
+              resumed.status_code == 200 and resumed.json()["next_run_at"] is None,
+              resumed.text[:150])
+        client.put(f"/api/tasks/{task_id}", json={"schedule_enabled": True})
 
         # --- runs list & filters ------------------------------------
         response = client.get("/api/runs?limit=10")
@@ -1912,6 +1963,46 @@ def run() -> int:
               webhook_url[:120])
         webhook_path = urlsplit(webhook_url).path
 
+        # 触发地址的 scheme/host 推导：设置的外网地址 > 反代转发头 > 请求自身。
+        from app.publicurl import normalize_base_url
+        check("外网地址规范化去尾斜杠",
+              normalize_base_url("HTTPS://Deploy.Example.com/")[0] == "https://Deploy.Example.com",
+              normalize_base_url("HTTPS://Deploy.Example.com/")[0])
+        check("外网地址缺少 scheme 被拒绝",
+              normalize_base_url("deploy.example.com")[1] != "")
+        check("外网地址带查询参数被拒绝",
+              normalize_base_url("https://a.example.com/?x=1")[1] != "")
+
+        configured = client.put(
+            "/api/settings", json={"base_url": "https://deploy.example.com"}
+        )
+        check("外网访问地址可保存", configured.status_code == 200, configured.text[:150])
+        check("外网访问地址立即生效（无需重启）",
+              configured.json()["restart_required"] is False)
+        configured_url = client.get(f"/api/tasks/{webhook_id}").json()["task"]["webhook_url"]
+        check("触发地址改用外网访问地址",
+              configured_url.startswith("https://deploy.example.com/api/webhooks/"),
+              configured_url[:120])
+        check("非法外网访问地址被拒绝",
+              client.put("/api/settings", json={"base_url": "ftp://x.example.com"}).status_code == 422)
+        client.put("/api/settings", json={"base_url": ""})
+
+        forwarded_ignored = client.get(
+            f"/api/tasks/{webhook_id}",
+            headers={"x-forwarded-proto": "https", "x-forwarded-host": "proxy.example.com"},
+        ).json()["task"]["webhook_url"]
+        check("未信任反代头时忽略转发地址",
+              forwarded_ignored.startswith("http://testserver/"), forwarded_ignored[:120])
+        client.put("/api/settings", json={"trust_proxy_headers": True})
+        forwarded_used = client.get(
+            f"/api/tasks/{webhook_id}",
+            headers={"x-forwarded-proto": "https", "x-forwarded-host": "proxy.example.com"},
+        ).json()["task"]["webhook_url"]
+        check("信任反代头后触发地址为 https",
+              forwarded_used.startswith("https://proxy.example.com/api/webhooks/"),
+              forwarded_used[:120])
+        client.put("/api/settings", json={"trust_proxy_headers": False})
+
         webhook_response = client.post(webhook_path)
         check("Webhook POST 触发部署",
               webhook_response.status_code == 200 and webhook_response.json()["run_id"] > 0,
@@ -2036,6 +2127,52 @@ def run() -> int:
             if en_status not in ("queued", "running"):
                 break
             time.sleep(0.4)
+
+        # --- 三个开关的正交关系 ----------------------------------------
+        # 定时开关只管定时，关掉它不能影响 Webhook 与手动运行。
+        sched_off = client.put(f"/api/tasks/{webhook_id}", json={"schedule_enabled": False})
+        check("更新任务可关闭定时触发", sched_off.status_code == 200
+              and sched_off.json()["task"]["schedule_enabled"] is False, sched_off.text[:150])
+        check("关定时不影响任务总开关",
+              sched_off.json()["task"]["enabled"] is True, sched_off.text[:150])
+        wh_after_sched_off = client.post(new_path)
+        check("只关定时时 Webhook 仍可触发", wh_after_sched_off.status_code == 200,
+              wh_after_sched_off.text[:150])
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            st = client.get(f"/api/runs/{wh_after_sched_off.json()['run_id']}").json()["run"]["status"]
+            if st not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        manual_after_sched_off = client.post(f"/api/tasks/{webhook_id}/run")
+        check("只关定时时仍可手动触发", manual_after_sched_off.status_code == 200,
+              manual_after_sched_off.text[:150])
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            st = client.get(f"/api/runs/{manual_after_sched_off.json()['run_id']}").json()["run"]["status"]
+            if st not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+
+        # 总开关关闭时，即使定时与 Webhook 开关都开着也不能被自动触发。
+        pause_all = client.put(f"/api/tasks/{webhook_id}",
+                               json={"enabled": False, "schedule_enabled": True,
+                                     "webhook_enabled": True})
+        check("关闭任务总开关成功", pause_all.status_code == 200
+              and pause_all.json()["task"]["enabled"] is False, pause_all.text[:150])
+        paused_wh = client.post(new_path)
+        check("总开关关闭时 Webhook 返回 409", paused_wh.status_code == 409,
+              paused_wh.text[:150])
+        check("总开关关闭的错误提示区分于 Webhook 开关",
+              "任务已暂停" in paused_wh.text and "Webhook 触发已禁用" not in paused_wh.text,
+              paused_wh.text[:150])
+        check("总开关关闭时清空下次执行时间",
+              service.store.tasks.get(webhook_id)["next_run_at"] is None)
+
+        restore_all = client.put(f"/api/tasks/{webhook_id}",
+                                 json={"enabled": True, "schedule_enabled": True})
+        check("恢复任务总开关成功", restore_all.status_code == 200
+              and restore_all.json()["task"]["enabled"] is True, restore_all.text[:150])
 
         response = client.delete(f"/api/tasks/{webhook_id}")
         check("清理 Webhook 测试任务", response.status_code == 200, response.text[:150])

@@ -301,6 +301,15 @@ def next_run_time(
     raise ScheduleError(f"不支持的调度类型: {schedule_type!r}")
 
 
+def task_schedule_enabled(task: dict) -> bool:
+    """定时触发是否生效。
+
+    两个开关是叠加关系而不是并列关系：任务总开关关闭时，无论定时开关
+    处于什么状态都不排期。判据集中在这里，避免各处各写一遍 ``and``。
+    """
+    return bool(task.get("enabled", 1)) and bool(task.get("schedule_enabled", 1))
+
+
 def describe_schedule(schedule_type: str, expression: str) -> str:
     """Short human-readable summary used in the UI."""
     kind = (schedule_type or "").strip().lower()

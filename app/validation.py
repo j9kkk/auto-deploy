@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from . import deployer, gitops
 from .config import Settings
+from .publicurl import normalize_base_url
 from .schedule import describe_schedule, validate_schedule
 from .security import password_problem
 
@@ -233,7 +234,12 @@ def validate_task_payload(
         )
         out["schedule_expression"] = expression
     if has("enabled") or not partial:
+        # 任务总开关：关闭后定时与 Webhook 都不触发，手动运行不受影响。
         out["enabled"] = _clean_bool(payload.get("enabled", existing.get("enabled", True)), True)
+    if has("schedule_enabled") or not partial:
+        out["schedule_enabled"] = _clean_bool(
+            payload.get("schedule_enabled", existing.get("schedule_enabled", True)), True
+        )
     if has("webhook_enabled") or not partial:
         out["webhook_enabled"] = _clean_bool(
             payload.get("webhook_enabled", existing.get("webhook_enabled", True)), True
@@ -863,6 +869,13 @@ def validate_settings(payload: Mapping[str, Any], current: Settings) -> dict[str
         if webhook and not webhook.startswith(("http://", "https://")):
             errors["notify_webhook"] = "通知地址必须以 http:// 或 https:// 开头"
         out["notify_webhook"] = webhook
+
+    if "base_url" in payload:
+        # 外网访问地址决定 Webhook 触发地址的 scheme 与域名；留空表示自动推断。
+        base_url, problem = normalize_base_url(payload["base_url"])
+        if problem:
+            errors["base_url"] = problem
+        out["base_url"] = base_url
 
     if "default_branch" in payload:
         branch = _clean_str(payload["default_branch"], limit=200) or "main"

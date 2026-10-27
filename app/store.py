@@ -22,7 +22,8 @@ TASK_INSERT_COLUMNS = (
     "name", "description",
     "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username", "git_token",
     "credential_id",
-    "schedule_type", "schedule_expression", "enabled", "webhook_enabled", "webhook_secret",
+    "schedule_type", "schedule_expression", "enabled", "schedule_enabled",
+    "webhook_enabled", "webhook_secret",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
     "artifact_paths", "target_dir", "keep_releases",
     "service_name", "docker_image", "docker_command", "docker_compose_file",
@@ -36,7 +37,8 @@ TASK_UPDATE_COLUMNS = (
     "name", "description",
     "repo_url", "repo_branch", "repo_subdir", "git_depth", "git_username", "git_token",
     "credential_id",
-    "schedule_type", "schedule_expression", "enabled", "webhook_enabled", "webhook_secret",
+    "schedule_type", "schedule_expression", "enabled", "schedule_enabled",
+    "webhook_enabled", "webhook_secret",
     "deploy_method", "prepare_script", "deploy_script", "rollback_script",
     "artifact_paths", "target_dir", "keep_releases",
     "service_name", "docker_image", "docker_command", "docker_compose_file",
@@ -520,7 +522,10 @@ class TaskRepository:
         payload = dict(data)
         if "env_vars" in payload:
             payload["env_vars"] = encode_env_vars(payload["env_vars"])
-        for flag in ("enabled", "webhook_enabled", "skip_if_no_changes", "run_on_create"):
+        for flag in (
+            "enabled", "schedule_enabled", "webhook_enabled",
+            "skip_if_no_changes", "run_on_create",
+        ):
             if flag in payload and isinstance(payload[flag], bool):
                 payload[flag] = 1 if payload[flag] else 0
         return payload
@@ -594,8 +599,20 @@ class TaskRepository:
     def list_decoded(self) -> list[dict[str, Any]]:
         return [decode_task(row) or {} for row in self.list_all()]
 
-    def list_enabled(self) -> list[dict[str, Any]]:
-        return self.db.query("SELECT * FROM tasks WHERE enabled = 1 ORDER BY id")
+    def list_schedule_active(self) -> list[dict[str, Any]]:
+        """定时触发有效的任务：总开关与定时开关都打开，且有真实调度表达式。
+
+        ``manual`` 类型没有下次时间，纳入重排只会写回 None，因此直接排除。
+        """
+        return self.db.query(
+            """
+            SELECT * FROM tasks
+            WHERE enabled = 1
+              AND schedule_enabled = 1
+              AND schedule_type IN ('interval', 'cron')
+            ORDER BY id
+            """
+        )
 
     def due(self, now_iso: str) -> list[dict[str, Any]]:
         """Scheduled tasks whose next fire time has passed."""
@@ -603,6 +620,7 @@ class TaskRepository:
             """
             SELECT * FROM tasks
             WHERE enabled = 1
+              AND schedule_enabled = 1
               AND next_run_at IS NOT NULL
               AND next_run_at <= ?
               AND schedule_type IN ('interval', 'cron')
@@ -621,9 +639,20 @@ class TaskRepository:
         )
 
     def set_enabled(self, task_id: int, enabled: bool, next_run_at: str | None) -> None:
+        """切换任务总开关；``next_run_at`` 由调用方按定时开关状态算好。"""
         self.db.execute_rowcount(
             "UPDATE tasks SET enabled = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
             (1 if enabled else 0, next_run_at, iso(utcnow()), task_id),
+        )
+
+    def set_schedule_enabled(
+        self, task_id: int, schedule_enabled: bool, next_run_at: str | None
+    ) -> None:
+        """只切换定时触发开关，不改任务总开关。"""
+        self.db.execute_rowcount(
+            "UPDATE tasks SET schedule_enabled = ?, next_run_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (1 if schedule_enabled else 0, next_run_at, iso(utcnow()), task_id),
         )
 
     def record_run_started(self, task_id: int) -> None:

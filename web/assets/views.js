@@ -452,9 +452,10 @@ AD.views = {};
          <div class="faint">${e(AD.formatRelative(task.last_run_at))}</div>`
       : '<span class="faint">—</span>';
 
-    const nextRun = task.next_run_at
-      ? `${e(AD.formatTime(task.next_run_at))}<div class="faint">${e(AD.scheduleText(task))}</div>`
-      : `<span class="faint">${e(task.enabled ? '仅手动触发' : '已暂停')}</span>`;
+    // 下次执行一列要分清三种「没有下次时间」：任务被暂停（总开关关）、
+    // 定时开关关、以及本来就只手动触发的任务。定时不生效时即便库里还留着
+    // 旧的 next_run_at 也不能展示，否则等于承诺一次不会发生的运行。
+    const nextRun = nextRunCellHtml(task);
 
     // 运行/停止共用一个位置：空闲时是播放（运行），运行中变为终止（取消）。
     const runButton = active
@@ -462,10 +463,11 @@ AD.views = {};
       : `<button class="icon-btn run" data-task-run="${task.id}" title="立即运行" aria-label="立即运行">${ICONS.play}</button>`;
 
     const expanded = AD.state.expandedTaskId === task.id;
-    // 行首 switch 表示整个任务的启用/禁用（含调度触发），不再是「仅调度」。
-    const enabledSwitch = `<label class="switch" title="${task.enabled ? '已启用，点击禁用' : '已禁用，点击启用'}">
+    // 行首 switch 是任务总开关：关闭后定时与 Webhook 都不触发，手动运行不受影响。
+    // 定时与 Webhook 各自的开关在任务配置里，避免一个开关身兼两职。
+    const enabledSwitch = `<label class="switch" title="${task.enabled ? '任务已启用，点击暂停' : '任务已暂停，点击启用'}">
       <input type="checkbox" data-task-toggle="${task.id}"${task.enabled ? ' checked' : ''}
-             aria-label="${task.enabled ? '禁用任务' : '启用任务'}">
+             aria-label="${task.enabled ? '暂停任务' : '启用任务'}">
       <span class="switch-track" aria-hidden="true"></span>
     </label>`;
 
@@ -480,7 +482,7 @@ AD.views = {};
         </div>
       </td>
       <td data-label="状态">${statusBadge}<div class="faint" style="margin-top:3px">${stats}</div></td>
-      <td class="mono" data-label="调度" style="font-size:11.5px">${e(task.schedule_expression || '—')}</td>
+      <td class="mono" data-label="调度" style="font-size:11.5px">${scheduleCellHtml(task)}</td>
       <td data-label="部署方式">
         <span class="badge neutral">${e(methodLabel(task.deploy_method))}</span>
         <div data-task-host class="faint truncate${task.host_id ? '' : ' hidden'}" style="margin-top:3px;max-width:160px"
@@ -509,6 +511,30 @@ AD.views = {};
     if (task.schedule_type === 'cron') return 'cron ' + task.schedule_expression;
     return '仅手动';
   };
+
+  /** 定时触发是否生效：任务总开关与定时开关都打开。
+   *  与后端 schedule.task_schedule_enabled 保持同一判据。 */
+  AD.scheduleActive = function (task) {
+    return Boolean(task && task.enabled) && task.schedule_enabled !== false;
+  };
+
+  /** 调度列的单元格：表达式 + 定时关闭提示。整表渲染与就地更新共用。 */
+  function scheduleCellHtml(task) {
+    const off = task.enabled && task.schedule_enabled === false;
+    return `${e(task.schedule_expression || '—')}${off
+      ? '<div data-schedule-off class="badge off" style="margin-top:3px">定时已关</div>' : ''}`;
+  }
+
+  /** 下次执行列的单元格。三种「没有下次时间」要说清是哪一种。 */
+  function nextRunCellHtml(task) {
+    if (AD.scheduleActive(task) && task.next_run_at) {
+      return `${e(AD.formatTime(task.next_run_at))}<div class="faint">${e(AD.scheduleText(task))}</div>`;
+    }
+    const reason = !task.enabled ? '任务已暂停'
+      : (task.schedule_enabled === false ? '定时已停用' : '仅手动触发');
+    return `<span class="faint">${e(reason)}</span>`;
+  }
+  AD.nextRunCellHtml = nextRunCellHtml;
 
   // 任务页所有动作使用事件委托：监听器只挂一次，表格随状态重绘、行内
   // 展开随启停重建都不会累积或丢失事件绑定。
@@ -581,7 +607,7 @@ AD.views = {};
             const enabled = Boolean(result.enabled);
             // 以服务端返回为准回填勾选态与提示，再刷新整行（状态徽标等）。
             syncToggleInput(input, enabled);
-            AD.toastSuccess(enabled ? '任务已启用' : '任务已禁用');
+            AD.toastSuccess(enabled ? '任务已启用' : '任务已暂停');
             await AD.refreshTaskRowsInPlace();
           } catch (err) {
             syncToggleInput(input, previous);
@@ -673,7 +699,8 @@ AD.views = {};
 
     placeholder.querySelector('td > .task-expand').innerHTML = `
       <div class="expand-toolbar">
-        <span class="badge ${t.enabled ? 'on' : 'off'}" data-inline-state>${t.enabled ? '已启用' : '已禁用'}</span>
+        <span class="badge ${t.enabled ? 'on' : 'off'}" data-inline-state>${t.enabled ? '已启用' : '已暂停'}</span>
+        <span data-inline-triggers>${inlineTriggerBadgeInner(t)}</span>
         <span class="badge neutral">${e(methodLabel(t.deploy_method))}</span>
         <span class="faint" data-inline-schedule>${dedupeIn([AD.scheduleText(t), nextRunInlineText(t)]).map((text) =>
           e(text)).join(' · ')}</span>
@@ -867,14 +894,17 @@ AD.views = {};
           if (durationCell) durationCell.textContent = AD.formatDuration(run.duration_ms);
         }
       },
-      /** 任务级字段变化（启用状态、下次执行时间）。 */
+      /** 任务级字段变化（总开关、定时/Webhook 开关、下次执行时间）。 */
       applyTask(task) {
         if (!root.isConnected) return;
         const stateBadge = root.querySelector('[data-inline-state]');
         if (stateBadge) {
           stateBadge.className = 'badge ' + (task.enabled ? 'on' : 'off');
-          stateBadge.textContent = task.enabled ? '已启用' : '已禁用';
+          stateBadge.textContent = task.enabled ? '已启用' : '已暂停';
         }
+        // 触发开关徽标随任务配置变化重画：留存一个槽位，内容整体替换。
+        const badgeSlot = root.querySelector('[data-inline-triggers]');
+        if (badgeSlot) badgeSlot.innerHTML = inlineTriggerBadgeInner(task);
         const schedule = root.querySelector('[data-inline-schedule]');
         if (schedule) {
           schedule.textContent = dedupeIn([
@@ -908,11 +938,24 @@ AD.views = {};
 
   /** 下次执行的纯文本描述（与调度描述一起做去重，避免重复展示）。 */
   function nextRunInlineText(task) {
-    if (!task.enabled) return '已禁用调度';
+    if (!task.enabled) return '任务已暂停，定时与 Webhook 均不触发';
+    if (task.schedule_enabled === false) return '定时已停用';
     if (!task.next_run_at) return '仅手动触发';
     const when = new Date(String(task.next_run_at).endsWith('Z') ? task.next_run_at : task.next_run_at + 'Z');
     const seconds = Math.max(0, Math.round((when.getTime() - Date.now()) / 1000));
     return `下次：${AD.formatTime(task.next_run_at)}（${AD.formatCountdown(seconds)}后）`;
+  }
+
+  /** 行内面板里两个触发开关的状态徽标：只在不生效时提示，避免堆满工具栏。 */
+  function inlineTriggerBadgeInner(task) {
+    const badges = [];
+    if (task.enabled && task.schedule_enabled === false) {
+      badges.push('<span class="badge off">定时已关</span>');
+    }
+    if (task.enabled && task.webhook_enabled === false) {
+      badges.push('<span class="badge off">Webhook 已关</span>');
+    }
+    return badges.join(' ');
   }
 
   /** 去除空值与重复项，保持原始顺序。 */
@@ -1129,7 +1172,11 @@ AD.views = {};
         }
       }
       const scheduleCell = row.querySelector('td[data-label="调度"]');
-      if (scheduleCell) scheduleCell.textContent = found.schedule_expression || '—';
+      if (scheduleCell) scheduleCell.innerHTML = scheduleCellHtml(found);
+      // 定时开关变化后「下次执行」也要跟着变：关掉定时仍在展示旧时间
+      // 会让用户以为下一次还会自动跑。
+      const nextCell = row.querySelector('td[data-label="下次执行"]');
+      if (nextCell) nextCell.innerHTML = nextRunCellHtml(found);
       const methodCell = row.querySelector('td[data-label="部署方式"]');
       if (methodCell) {
         const badge = methodCell.querySelector('.badge');
@@ -1159,15 +1206,15 @@ AD.views = {};
 
   /** 就地刷新全表：一次请求更新所有任务行，供运行/启停等自身触发的动作使用，
    *  避免整表重绘丢滚动位置与展开状态。 */
-  /** 同步行首启用开关的勾选态、提示与可访问名。
+  /** 同步行首任务总开关的勾选态、提示与可访问名。
    *  开关的可见状态由 CSS（input:checked）驱动，因此必须改 checked；
    *  只改外层 label 的属性会让滑块与真实状态不一致。 */
   function syncToggleInput(input, enabled) {
     if (!input) return;
     input.checked = Boolean(enabled);
-    input.setAttribute('aria-label', enabled ? '禁用任务' : '启用任务');
+    input.setAttribute('aria-label', enabled ? '暂停任务' : '启用任务');
     const label = input.closest('.switch');
-    if (label) label.title = enabled ? '已启用，点击禁用' : '已禁用，点击启用';
+    if (label) label.title = enabled ? '任务已启用，点击暂停' : '任务已暂停，点击启用';
   }
   AD.syncToggleInput = syncToggleInput;
 
@@ -1299,6 +1346,9 @@ AD.views = {};
 
         <div class="form-tab-panels">
           <section class="form-tab-panel" role="tabpanel" id="tab-panel-basic" data-form-panel="basic" aria-labelledby="tab-btn-basic">
+            ${switchRow('f-enabled', (t.enabled === undefined ? true : t.enabled), '启用任务',
+              '任务总开关：关闭后定时与 Webhook 都不会触发，手动运行不受影响')}
+
             <div class="section-title">任务标识</div>
             <div class="form-grid cols-2">
               <div class="field">
@@ -1466,8 +1516,8 @@ AD.views = {};
           </section>
 
           <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-schedule" data-form-panel="schedule" aria-labelledby="tab-btn-schedule">
-            ${switchRow('f-enabled', (t.enabled === undefined ? true : t.enabled), '启用定时触发',
-              '关闭后不会按定时调度自动执行，仍可手动或通过 Webhook 触发')}
+            ${switchRow('f-schedule_enabled', (t.schedule_enabled === undefined ? true : t.schedule_enabled), '启用定时触发',
+              '关闭后不按计划自动执行，仍可手动或通过 Webhook 触发；任务总开关关闭时本开关不生效')}
 
             <div class="section-title">定时调度</div>
             <div class="form-grid cols-2">
@@ -1727,8 +1777,15 @@ AD.views = {};
       lines.push('部署：' + methodLabel(method) + (bits.length ? ' — ' + bits.join('；') : ''));
       const scheduleType = typeSelect.value;
       const expression = value('#f-schedule_expression');
-      const enabledNode = backdrop.querySelector('#f-enabled');
-      if (enabledNode && !enabledNode.checked) lines.push('定时：已停用，不按计划自动执行');
+      // 三个开关各自的职责在摘要里分开写：合成一句会让用户分不清
+      // 「任务暂停」和「只是定时关掉」的区别。
+      const taskEnabledNode = backdrop.querySelector('#f-enabled');
+      const taskEnabled = !(taskEnabledNode && !taskEnabledNode.checked);
+      lines.push('任务：' + (taskEnabled ? '已启用' : '已暂停，定时与 Webhook 均不触发'));
+
+      const scheduleEnabledNode = backdrop.querySelector('#f-schedule_enabled');
+      const scheduleEnabled = !(scheduleEnabledNode && !scheduleEnabledNode.checked);
+      if (!scheduleEnabled) lines.push('定时：已停用，不按计划自动执行');
       else if (scheduleType === 'manual') lines.push('定时：仅手动触发');
       else if (scheduleType === 'interval') lines.push('定时：固定间隔 ' + (expression || '（未填写）'));
       else lines.push('定时：Cron ' + (expression || '（未填写）') + '（按 UTC 计算）');
@@ -2104,6 +2161,7 @@ AD.views = {};
       schedule_type: value('#f-schedule_type'),
       schedule_expression: value('#f-schedule_expression'),
       enabled: checked('#f-enabled'),
+      schedule_enabled: checked('#f-schedule_enabled'),
       webhook_enabled: checked('#f-webhook_enabled'),
       deploy_method: value('#f-deploy_method'),
       host_id: value('#f-host_id') ? Number(value('#f-host_id')) : null,
@@ -2195,7 +2253,11 @@ AD.views = {};
         <dt>仓库</dt><dd class="mono">${REPO_FREE_METHODS.includes(t.deploy_method)
           ? '<span class="faint">不拉取仓库（compose 内容直填）</span>'
           : `${e(t.repo_url)} <span class="dim">@${e(t.repo_branch)}</span>${t.repo_subdir ? ' / ' + e(t.repo_subdir) : ''}`}</dd>
-        <dt>调度</dt><dd>${e(AD.scheduleText(t))}${t.enabled ? '' : ' <span class="badge off">已暂停</span>'}</dd>
+        <dt>任务开关</dt><dd>${t.enabled
+          ? '已启用'
+          : '<span class="badge off">已暂停</span> <span class="faint">定时与 Webhook 均不触发</span>'}</dd>
+        <dt>调度</dt><dd>${e(AD.scheduleText(t))}${t.enabled && t.schedule_enabled === false
+          ? ' <span class="badge off">定时已关</span>' : ''}</dd>
         <dt>部署方式</dt><dd>${e(methodLabel(t.deploy_method))}</dd>
         <dt>发布目录</dt><dd class="mono">${e(t.releases_root || '')}</dd>
         <dt>当前版本</dt><dd class="mono">${e(t.current_link || '')}</dd>
@@ -3210,6 +3272,14 @@ AD.views = {};
                    placeholder="https://hooks.example.com/deploy">
             <div class="hint">任务未单独配置时使用；每次运行结束 POST 一条 JSON</div>
           </div>
+          <div class="field">
+            <label>外网访问地址</label>
+            <input type="text" id="s-base_url" value="${a(s.base_url || '')}"
+                   placeholder="https://deploy.example.com">
+            <div class="hint">Webhook 触发地址按它生成（含 http/https）。留空则按当前请求自动推断：
+              直连时用请求地址，开启下面的「信任反向代理头」后改用 X-Forwarded-Proto / X-Forwarded-Host。
+              反代已终止 TLS 却不透传这些头时，必须在这里填写 https 地址</div>
+          </div>
           ${switchRow('s-trust_proxy_headers', s.trust_proxy_headers,
             '信任反向代理的 X-Forwarded-For',
             '仅在应用确实位于可信反向代理之后时开启，否则客户端可伪造来源 IP')}
@@ -3344,6 +3414,7 @@ AD.views = {};
         cloud_rclone_remote: panel.querySelector('#s-cloud_rclone_remote').value.trim(),
         cloud_retention_count: read('#s-cloud_retention_count'),
         notify_webhook: panel.querySelector('#s-notify_webhook').value.trim(),
+        base_url: panel.querySelector('#s-base_url').value.trim(),
         queue_while_running: panel.querySelector('#s-queue_while_running').checked,
         trust_proxy_headers: panel.querySelector('#s-trust_proxy_headers').checked,
         secure_cookies: panel.querySelector('#s-secure_cookies').checked,
@@ -5830,8 +5901,7 @@ AD.views = {};
       </div>
       <div class="drawer-stat">
         <div class="drawer-stat-label">任务状态</div>
-        <div class="drawer-stat-value" style="font-size:14px;font-family:inherit">${mon.enabled ? '已启用' : '已暂停'}</div>
-        <div class="faint" style="font-size:11.5px;margin-top:3px">${e(AD.methodLabel(mon.deploy_method))}</div>
+        <div class="drawer-stat-value" style="font-size:14px;font-family:inherit">${mon.enabled ? '已启用' : '已暂停'}</div>        <div class="faint" style="font-size:11.5px;margin-top:3px">${e(AD.methodLabel(mon.deploy_method))}</div>
       </div>
     `;
   }

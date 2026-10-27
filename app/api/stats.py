@@ -52,13 +52,15 @@ def dashboard(
         run["status_label"] = STATUS_LABELS.get(str(run.get("status")), str(run.get("status")))
         active_runs.append(run)
 
+    # 「启用任务」统计按任务总开关，与列表行首开关一致。
     enabled = sum(1 for task in tasks if task.get("enabled"))
     failing = sum(1 for task in tasks if task.get("last_status") == "failed")
     now = utcnow()
     upcoming = []
     for task in tasks:
         next_at = task.get("next_run_at")
-        if not task.get("enabled") or not next_at:
+        # 即将执行只看会真正按计划跑的任务：总开关或定时开关关闭的都不该出现。
+        if not task.get("enabled") or not task.get("schedule_enabled", 1) or not next_at:
             continue
         upcoming.append(
             {

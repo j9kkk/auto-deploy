@@ -51,8 +51,9 @@ class Settings:
     # --- web server -------------------------------------------------------
     host: str = "127.0.0.1"
     port: int = 8770
-    # Set when the service sits behind a reverse proxy so generated links and
-    # the cookie path stay correct.
+    # 对外访问地址（如 https://deploy.example.com）。留空时按请求或反代
+    # 转发头自动推断；填写后 Webhook 触发地址一律以它为准，适用于 TLS
+    # 终止在反代但反代未透传 X-Forwarded-* 的场景。
     base_url: str = ""
     # Trust X-Forwarded-For / X-Forwarded-Proto from a fronting proxy.
     trust_proxy_headers: bool = False

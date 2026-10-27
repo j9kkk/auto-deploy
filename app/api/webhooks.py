@@ -56,7 +56,8 @@ def trigger_webhook(
         )
         raise _not_found()
 
-    # 鉴权已通过，可放心暴露具体原因；暂停任务拒绝一切自动触发。
+    # 鉴权已通过，可放心暴露具体原因。任务总开关优先判断：它关闭时连
+    # Webhook 也不工作，说成「Webhook 已禁用」会让用户去改错的开关。
     if not (row or {}).get("enabled"):
         audit(
             service, "webhook_rejected", actor="webhook", target=f"task:{task_id_num}",
@@ -64,7 +65,7 @@ def trigger_webhook(
         )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="任务已暂停，Webhook 触发被拒绝",
+            detail="任务已暂停（任务总开关关闭），Webhook 触发被拒绝",
         )
 
     if not (row or {}).get("webhook_enabled", 1):

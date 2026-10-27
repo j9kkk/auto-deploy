@@ -28,6 +28,7 @@ from .schedule import (
     iter_cron_minutes,
     next_run_time,
     parse_interval,
+    task_schedule_enabled,
     utcnow,
 )
 from .store import Store
@@ -281,7 +282,7 @@ class Scheduler:
                 task.get("schedule_type") or "manual",
                 task.get("schedule_expression") or "",
                 reference=utcnow(),
-                enabled=bool(task.get("enabled", 1)),
+                enabled=task_schedule_enabled(task),
             )
         except ScheduleError as exc:
             logger.warning("任务 %s 的调度表达式无效: %s", task_id, exc)
@@ -303,7 +304,7 @@ class Scheduler:
                 task.get("schedule_type") or "manual",
                 task.get("schedule_expression") or "",
                 reference=utcnow(),
-                enabled=bool(task.get("enabled", 1)),
+                enabled=task_schedule_enabled(task),
             )
         except ScheduleError as exc:
             logger.warning("任务 %s 的调度表达式无效: %s", task_id, exc)

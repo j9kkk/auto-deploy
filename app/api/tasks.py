@@ -29,8 +29,9 @@ from ..deployer import (
 from ..schedule import iso, next_run_time, utcnow
 from ..security import new_token
 from ..service import Service
-from ..store import TaskNameConflict, decode_task
 from ..remote import RemoteError
+from ..publicurl import external_base_url
+from ..store import TaskNameConflict, decode_task
 from ..target import TargetError, build_target, resolve_remote_layout
 from ..validation import (
     ValidationError,
@@ -64,11 +65,12 @@ def _decorate(
     enriched["method_label"] = METHOD_LABELS.get(
         str(task.get("deploy_method") or ""), str(task.get("deploy_method") or "")
     )
-    # 触发地址按请求的 scheme/host 拼接，反代后也能拿到正确的外网地址。
+    # 触发地址要交给外部系统访问：优先用设置里的外网访问地址，其次反代
+    # 转发头，最后回退到请求自身地址（见 publicurl.external_base_url）。
     secret = str(task.get("webhook_secret") or "")
     if secret and task.get("id") is not None:
-        base = str(request.base_url).rstrip("/") if request is not None else ""
-        enriched["webhook_url"] = f"{base}/api/webhooks/{task['id']}/{secret}"
+        base = external_base_url(request, service.settings)
+        enriched["webhook_url"] = f"{base}/api/webhooks/{task['id']}/{secret}" if base else ""
     else:
         enriched["webhook_url"] = ""
     enriched["active_run"] = None
@@ -470,12 +472,12 @@ def reset_task_webhook(
         raise HTTPException(status_code=404, detail="任务不存在")
     secret = new_token()
     service.store.tasks.update(task_id, {"webhook_secret": secret})
-    base = str(request.base_url).rstrip("/")
+    base = external_base_url(request, service.settings)
     audit(
         service, "webhook_reset", actor=user["username"], target=f"task:{task_id}",
         ip=client_ip(request),
     )
-    return {"ok": True, "webhook_url": f"{base}/api/webhooks/{task_id}/{secret}"}
+    return {"ok": True, "webhook_url": f"{base}/api/webhooks/{task_id}/{secret}" if base else ""}
 
 
 @router.post("/{task_id}/toggle")
@@ -486,6 +488,11 @@ def toggle_task(
     service: Service = Depends(get_service),
     user: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:
+    """切换任务总开关。
+
+    这里是「任务是否允许被自动触发」的单一位；定时与 Webhook 各自的开关
+    在任务配置里维护。总开关关闭时两个触发通道都不工作，手动运行不受影响。
+    """
     row = service.store.tasks.get(task_id)
     if row is None:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -494,8 +501,10 @@ def toggle_task(
     if enabled is None:
         enabled = not bool(row.get("enabled"))
     enabled = bool(enabled)
+    schedule_enabled = bool(row.get("schedule_enabled", 1))
     next_at = None
-    if enabled:
+    # 只有总开关与定时开关都打开时才排期；否则写回 None 以清掉残留的旧时间。
+    if enabled and schedule_enabled:
         try:
             following = next_run_time(
                 str(row.get("schedule_type") or "manual"),
@@ -510,9 +519,15 @@ def toggle_task(
     service.scheduler.poke()
     audit(
         service, "task_toggled", actor=user["username"], target=f"task:{task_id}",
-        detail=f"enabled={enabled}", ip=client_ip(request),
+        detail=f"task_enabled={enabled} schedule_enabled={schedule_enabled}",
+        ip=client_ip(request),
     )
-    return {"ok": True, "enabled": enabled, "next_run_at": next_at}
+    return {
+        "ok": True,
+        "enabled": enabled,
+        "schedule_enabled": schedule_enabled,
+        "next_run_at": next_at,
+    }
 
 
 @router.post("/{task_id}/cancel")

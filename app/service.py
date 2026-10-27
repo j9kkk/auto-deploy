@@ -158,9 +158,10 @@ class Service:
             "run_finished", {"run_id": run_id, "status": status}
         )
         self.scheduler.start()
-        # Give every enabled task a fresh next-run time so the schedule is
-        # anchored to the moment the service came up.
-        for task in self.store.tasks.list_enabled():
+        # Give every schedule-active task a fresh next-run time so the schedule
+        # is anchored to the moment the service came up. 总开关或定时开关任一
+        # 关闭的任务不在此列：重排只会写回 None，没有意义。
+        for task in self.store.tasks.list_schedule_active():
             self.scheduler.reschedule(int(task["id"]))
         logger.info("服务已启动")
 
