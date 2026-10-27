@@ -831,7 +831,7 @@ EDITABLE_SETTINGS: dict[str, tuple[type, int, int]] = {
 EDITABLE_BOOL_SETTINGS = (
     "trust_proxy_headers", "secure_cookies", "queue_while_running",
     "backup_enabled", "backup_include_logs", "backup_include_artifacts",
-    "cloud_backup_enabled",
+    "cloud_backup_enabled", "ip_geo_enabled",
 )
 
 
@@ -862,7 +862,18 @@ def validate_settings(payload: Mapping[str, Any], current: Settings) -> dict[str
         timezone = _clean_str(payload["timezone"], limit=64)
         if timezone and not re.fullmatch(r"[A-Za-z0-9_+\-/]+", timezone):
             errors["timezone"] = "时区名称包含非法字符"
+        elif timezone:
+            # 写错一个字母就会静默回退到系统时区（容器里是 UTC），用户
+            # 只会看到时间还是不对，因此这里必须真的解析一次。
+            from .schedule import resolve_timezone
+
+            if resolve_timezone(timezone) is None:
+                errors["timezone"] = (
+                    f"无法识别的时区：{timezone}（示例：Asia/Shanghai、UTC）"
+                )
         out["timezone"] = timezone
+        # 显式保存过时区后，升级迁移就不再改写它。
+        out["timezone_configured"] = True
 
     if "notify_webhook" in payload:
         webhook = _clean_str(payload["notify_webhook"], limit=1000)

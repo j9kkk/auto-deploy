@@ -147,6 +147,52 @@ def run() -> int:
         sched.to_local(datetime(2026, 10, 3, 0, 30)) == local_moment,
     )
 
+    # 展示时区以设置为准：容器内系统时区是 UTC，只靠它会让国内部署看到
+    # 的时间早 8 小时（这正是操作日志显示 UTC 的原因）。
+    check("默认识别北京时区", sched.resolve_timezone("Asia/Shanghai") is not None)
+    check("无法识别的时区返回 None", sched.resolve_timezone("Asia/NotACity") is None)
+    check("空时区名返回 None", sched.resolve_timezone("") is None)
+    shanghai = sched.resolve_timezone("Asia/Shanghai")
+    check(
+        "北京时区偏移为 +8",
+        shanghai is not None and shanghai.utcoffset(datetime(2026, 10, 3)) == timedelta(hours=8),
+        str(shanghai.utcoffset(datetime(2026, 10, 3)) if shanghai else None),
+    )
+    check(
+        "设置里的时区决定展示偏移",
+        round(sched.local_tz().utcoffset(datetime.now()).total_seconds() / 3600) == 8,
+    )
+    check(
+        "UTC 时刻在界面时区渲染为北京时间",
+        sched.format_local(datetime(2026, 10, 27, 5, 39, 37)) == "2026-10-27 13:39:37",
+        sched.format_local(datetime(2026, 10, 27, 5, 39, 37)),
+    )
+
+    # ------------------------------------------------------------------
+    section("来源 IP 识别与归属地")
+    from app import ipgeo
+
+    check("本机回环标注", ipgeo.local_label("127.0.0.1") == "本机回环")
+    check("IPv6 回环标注", ipgeo.local_label("::1") == "本机回环")
+    check("内网地址标注", ipgeo.local_label("192.168.1.10") == "内网地址")
+    check("Docker 网段标注为内网", ipgeo.local_label("172.23.0.1") == "内网地址")
+    check("链路本地地址标注", ipgeo.local_label("169.254.1.1") == "链路本地地址")
+    check("公网地址不在本地标注", ipgeo.local_label("220.181.38.148") == "")
+    check("非法地址标注为无法识别", ipgeo.local_label("not-an-ip") == "地址无法识别")
+    check("公网地址判定", ipgeo.is_public("8.8.8.8") and not ipgeo.is_public("10.0.0.1"))
+    check("私有地址判定不误报公网", not ipgeo.is_public("172.23.0.1"))
+    check("带端口的来源地址可解析", ipgeo.parse_ip("1.2.3.4:5678") is not None)
+    check("方括号 IPv6 可解析", ipgeo.parse_ip("[2400:3200::1]:443") is not None)
+    # 归属地拼接去掉相邻重复，避免「北京 北京市」这类冗余。
+    check(
+        "归属地片段去重",
+        ipgeo._join(["中国", "北京市", "北京"]) == "中国 北京市",
+        ipgeo._join(["中国", "北京市", "北京"]),
+    )
+    resolver = ipgeo.IpLocationResolver(None)
+    check("内网地址不打外部接口", resolver.resolve("172.23.0.1") == "内网地址")
+    check("空地址返回空归属地", resolver.resolve("") == "")
+
     # ------------------------------------------------------------------
     section("密码与会话安全")
     from app.security import (
@@ -1195,6 +1241,32 @@ def run() -> int:
 
     store.audit.record("login_success", actor="admin", ip="127.0.0.1")
     check("审计日志写入", store.audit.list_recent()[0]["action"] == "login_success")
+
+    # 来源 IP 归属地：内网就地标注，公网留给后台线程且不阻塞写入。
+    store.audit.record("probe_local", actor="tester", ip="172.23.0.1")
+    local_row = store.audit.list_recent()[0]
+    check("内网来源 IP 就地标注归属地", local_row["ip_location"] == "内网地址",
+          local_row["ip_location"])
+    store.audit.record("probe_public", actor="tester", ip="8.8.8.8")
+    public_row = store.audit.list_recent()[0]
+    check("公网来源 IP 写入时不阻塞解析", public_row["ip_location"] == "",
+          public_row["ip_location"])
+    pending_ids = {int(row["id"]) for row in store.audit.pending_locations()}
+    check("待解析队列只含未解析的公网地址",
+          int(public_row["id"]) in pending_ids and int(local_row["id"]) not in pending_ids,
+          str(sorted(pending_ids)))
+    store.audit.set_location(int(public_row["id"]), "美国 弗吉尼亚州 阿什本 · Google LLC")
+    refreshed = next(
+        row for row in store.audit.list_recent() if int(row["id"]) == int(public_row["id"])
+    )
+    check("归属地可回填到审计行", refreshed["ip_location"].startswith("美国"),
+          refreshed["ip_location"])
+    check("回填后退出待解析队列",
+          int(public_row["id"]) not in
+          {int(row["id"]) for row in store.audit.pending_locations()})
+    store.audit.record("probe_blank", actor="tester", ip="")
+    check("无来源地址时不进待解析队列",
+          all(row["ip"] for row in store.audit.pending_locations()))
     store.close()
 
     # ------------------------------------------------------------------
@@ -1799,12 +1871,73 @@ def run() -> int:
         check("越界设置被拒绝", response.status_code == 422)
         client.put("/api/settings", json={"max_global_workers": original_workers})
 
+        # --- 展示时区 ------------------------------------------------
+        settings_payload = client.get("/api/settings").json()
+        check("默认展示时区为北京时间",
+              settings_payload["settings"]["timezone"] == "Asia/Shanghai",
+              str(settings_payload["settings"]["timezone"]))
+        check("时区不再是只读字段", "timezone" not in settings_payload["readonly"],
+              str(settings_payload["readonly"]))
+        check("归属地解析开关默认开启",
+              settings_payload["settings"]["ip_geo_enabled"] is True)
+        response = client.put("/api/settings", json={"timezone": "Asia/NotACity"})
+        check("非法时区被拒绝", response.status_code == 422, response.text[:200])
+        response = client.put("/api/settings", json={"timezone": "UTC"})
+        check("时区可改为 UTC", response.status_code == 200, response.text[:200])
+        check("改为 UTC 后偏移为 0", response.json()["timezone_offset_minutes"] == 0,
+              str(response.json().get("timezone_offset_minutes")))
+        check("改时区无需重启", response.json()["restart_required"] is False)
+        response = client.put("/api/settings", json={"timezone": "Asia/Shanghai"})
+        check("时区可改回北京时间", response.status_code == 200, response.text[:200])
+        check("改回后偏移为 +480", response.json()["timezone_offset_minutes"] == 480,
+              str(response.json().get("timezone_offset_minutes")))
+        check("时区解析入口同步生效",
+              datetime.now().astimezone(
+                  sched.resolve_timezone("Asia/Shanghai")).utcoffset() == timedelta(hours=8))
+        response = client.put("/api/settings", json={"ip_geo_enabled": False})
+        check("归属地解析可关闭", response.status_code == 200
+              and response.json()["settings"]["ip_geo_enabled"] is False)
+        check("关闭后审计接口如实反映",
+              client.get("/api/audit").json()["ip_geo_enabled"] is False)
+        client.put("/api/settings", json={"ip_geo_enabled": True})
+
         # --- audit log ----------------------------------------------
         response = client.get("/api/audit")
-        actions = [entry["action"] for entry in response.json()["entries"]]
+        audit_payload = response.json()
+        actions = [entry["action"] for entry in audit_payload["entries"]]
         check("审计记录登录", "login_success" in actions, str(actions[:6]))
         check("审计记录任务创建", "task_created" in actions)
         check("审计记录运行触发", "run_triggered" in actions)
+        # 界面按接口下发的时区渲染，日志行必须带上归属地字段（可能为空）。
+        check("审计接口下发展示时区",
+              "Asia/Shanghai" in str(audit_payload.get("timezone", "")),
+              str(audit_payload.get("timezone")))
+        check("审计接口下发时区偏移", audit_payload.get("timezone_offset_minutes") == 480,
+              str(audit_payload.get("timezone_offset_minutes")))
+        check("审计条目带 IP 归属地字段",
+              all("ip_location" in entry for entry in audit_payload["entries"]))
+        check("审计接口下发归属地开关",
+              isinstance(audit_payload.get("ip_geo_enabled"), bool))
+        # 测试客户端的来源地址不是真实 IP（Starlette 用 "testclient"），
+        # 因此这里按「可解析的回环地址」筛选；同时验证非 IP 来源会如实
+        # 标注为无法识别，而不是留空拖住后台解析队列。
+        from app.ipgeo import parse_ip as _parse_ip
+
+        loopback_rows = [
+            e for e in audit_payload["entries"]
+            if _parse_ip(e["ip"]) is not None and str(_parse_ip(e["ip"])) == "127.0.0.1"
+        ]
+        if loopback_rows:
+            check("本机来源 IP 就地标注归属地",
+                  all(r["ip_location"] == "本机回环" for r in loopback_rows),
+                  str([(r["ip"], r["ip_location"]) for r in loopback_rows][:3]))
+        non_ip_rows = [e for e in audit_payload["entries"] if e["ip"] and _parse_ip(e["ip"]) is None]
+        check("非 IP 来源如实标注无法识别",
+              all(r["ip_location"] == "地址无法识别" for r in non_ip_rows),
+              str([(r["ip"], r["ip_location"]) for r in non_ip_rows][:3]))
+        check("来源地址非空时归属地不为空（不会无限等待解析）",
+              all(r["ip_location"] for r in audit_payload["entries"] if r["ip"]),
+              str([(r["ip"], r["ip_location"]) for r in audit_payload["entries"] if not r["ip_location"]][:3]))
 
         # --- task export / update / toggle --------------------------
         response = client.get(f"/api/tasks/{task_id}/export")
@@ -1907,6 +2040,25 @@ def run() -> int:
         check("整体导出成功", response.status_code == 200 and "tasks" in response.text)
         response = client.get("/api/audit/export")
         check("审计导出成功", response.status_code == 200 and "操作人" in response.text)
+        check("审计导出含 IP 归属地列", "IP 归属地" in response.text.splitlines()[0],
+              response.text.splitlines()[0][:120])
+        # 导出的时间必须是展示时区（北京时间），而不是库里的 UTC。
+        csv_rows = [line for line in response.text.splitlines() if "login_success" in line]
+        check("审计导出的时间按展示时区渲染",
+              bool(csv_rows) and csv_rows[0].split(",")[1].startswith("20"),
+              csv_rows[0][:80] if csv_rows else "无登录行")
+        if csv_rows:
+            exported_stamp = csv_rows[0].split(",")[1]
+            utc_rows = [
+                row for row in service.store.audit.list_recent(1000)
+                if row["action"] == "login_success"
+            ]
+            if utc_rows:
+                from app.schedule import format_local, from_iso
+
+                expected = format_local(from_iso(utc_rows[0]["ts"]))
+                check("导出时间与库内 UTC 相差展示时区",
+                      exported_stamp == expected, f"{exported_stamp} != {expected}")
         response = client.post("/api/maintenance/run")
         check("手动维护成功", response.status_code == 200 and response.json()["ok"])
 

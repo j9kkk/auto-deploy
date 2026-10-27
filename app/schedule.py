@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Iterable
 
 CRON_FIELDS = (
@@ -213,13 +213,43 @@ def iso(moment: datetime | None) -> str | None:
     return moment.replace(microsecond=0).isoformat() + "Z"
 
 
-def local_tz() -> timezone:
-    """The host system timezone as a fixed-offset tzinfo."""
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+
+def resolve_timezone(name: str | None) -> tzinfo | None:
+    """把 IANA 时区名解析成 tzinfo；无法解析时返回 None。
+
+    容器镜像里 ``/etc/localtime`` 通常指向 UTC，只靠系统时区展示时间会让
+    国内部署看到的时间比本地早 8 小时。因此展示时区以设置为准（默认北京
+    时间），系统时区只是没有配置时的兜底。
+    """
+    text = (name or "").strip()
+    if not text:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(text)
+    except Exception:  # noqa: BLE001 - 非法名称与缺失时区库都不该拖垮服务
+        return None
+
+
+def local_tz() -> tzinfo:
+    """The timezone used for every human-facing timestamp.
+
+    设置的时区优先（默认 ``Asia/Shanghai``），解析失败或留空时回退到主机
+    系统时区，保证任何环境下都有可用的偏移量。
+    """
+    from . import config
+
+    configured = resolve_timezone(getattr(config.load_settings(), "timezone", ""))
+    if configured is not None:
+        return configured
     return datetime.now().astimezone().tzinfo or timezone.utc
 
 
 def to_local(moment: datetime | None) -> datetime | None:
-    """Convert a (naive UTC) moment into the host system timezone."""
+    """Convert a (naive UTC) moment into the display timezone."""
     if moment is None:
         return None
     if moment.tzinfo is None:

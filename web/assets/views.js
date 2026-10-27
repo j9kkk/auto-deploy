@@ -106,6 +106,7 @@ AD.views = {};
   AD.views.dashboard = async function (container) {
     const data = await AD.api.get('/api/dashboard');
     AD.state.dashboard = data;
+    AD.applyTimezone(data.timezone_offset_minutes);
     const overview = data.overview || {};
     const tasks = data.tasks || {};
 
@@ -3335,19 +3336,34 @@ AD.views = {};
         </div>
       </div>
 
-      <div class="panel">
-        <div class="panel-head"><h2>网络代理</h2>
-          <div class="spacer"></div>
-          <span class="faint">当前：${e(data.proxy_description || '未启用')}</span>
+      <div class="grid cols-2">
+        <div class="panel">
+          <div class="panel-head"><h2>时间与展示</h2></div>
+          <div class="field">
+            <label>展示时区</label>
+            <input type="text" id="s-timezone" value="${a(s.timezone || 'Asia/Shanghai')}"
+                   placeholder="Asia/Shanghai" spellcheck="false">
+            <div class="hint">界面上的时间（运行记录、操作日志、下次执行）都按这个时区显示，
+              默认 <span class="code-inline">Asia/Shanghai</span>（北京时间）。填
+              <span class="code-inline">UTC</span> 可改回世界标准时间；留空则跟随服务器系统时区
+              （容器内通常是 UTC）</div>
+          </div>
+          ${switchRow('s-ip_geo_enabled', s.ip_geo_enabled, '解析来源 IP 的归属地',
+            '开启后，操作日志会把公网来源 IP 联网解析成「国家 省份 城市 · 运营商」；内网与 Docker 网桥地址只在本地标注，不会外发。关闭后不再发起任何查询')}
         </div>
-        ${switchRow('s-proxy_enabled', s.proxy_enabled, '为 Git 操作启用代理',
-          '内网或跨境访问 GitHub 不稳定时启用。代理以环境变量下发给 git，不会写入进程命令行，日志中的密码亦会被脱敏')}
-        <div class="grid cols-2">
+
+        <div class="panel">
+          <div class="panel-head"><h2>网络代理</h2>
+            <div class="spacer"></div>
+            <span class="faint">当前：${e(data.proxy_description || '未启用')}</span>
+          </div>
+          ${switchRow('s-proxy_enabled', s.proxy_enabled, '为 Git 操作启用代理',
+            '内网或跨境访问 GitHub 不稳定时启用。代理以环境变量下发给 git，不会写入进程命令行，日志中的密码亦会被脱敏')}
           <div class="field">
             <label>代理地址</label>
             <input type="text" id="s-proxy_url" value="${a(s.proxy_url || '')}"
                    placeholder="http://proxy.corp.local:8080 或 socks5://127.0.0.1:1080">
-            <div class="hint">支持 http / https / socks5</div>
+            <div class="hint">支持 http / https / socks5；来源 IP 归属地查询同样走这个代理</div>
           </div>
           <div class="field">
             <label>不使用代理的地址（no_proxy）</label>
@@ -3355,18 +3371,20 @@ AD.views = {};
                    placeholder="localhost,127.0.0.1,.corp.local">
             <div class="hint">逗号分隔；内网仓库应在此列出，否则会绕经代理而失败</div>
           </div>
-          <div class="field">
-            <label>代理用户名</label>
-            <input type="text" id="s-proxy_username" value="${a(s.proxy_username || '')}" placeholder="可选">
+          <div class="grid cols-2">
+            <div class="field">
+              <label>代理用户名</label>
+              <input type="text" id="s-proxy_username" value="${a(s.proxy_username || '')}" placeholder="可选">
+            </div>
+            <div class="field">
+              <label>代理密码</label>
+              <input type="password" id="s-proxy_password" autocomplete="new-password"
+                     placeholder="${s.proxy_password_set ? '已设置，留空表示不修改' : '可选'}">
+            </div>
           </div>
-          <div class="field">
-            <label>代理密码</label>
-            <input type="password" id="s-proxy_password" autocomplete="new-password"
-                   placeholder="${s.proxy_password_set ? '已设置，留空表示不修改' : '可选'}">
-          </div>
+          ${switchRow('s-proxy_for_scripts', s.proxy_for_scripts, '构建脚本也使用该代理',
+            '开启后 prepare/deploy 脚本中的 npm、pip 等也能联网；内网构建源通常不需要')}
         </div>
-        ${switchRow('s-proxy_for_scripts', s.proxy_for_scripts, '构建脚本也使用该代理',
-          '开启后 prepare/deploy 脚本中的 npm、pip 等也能联网；内网构建源通常不需要')}
       </div>
 
       <div class="panel">
@@ -3415,6 +3433,8 @@ AD.views = {};
         cloud_retention_count: read('#s-cloud_retention_count'),
         notify_webhook: panel.querySelector('#s-notify_webhook').value.trim(),
         base_url: panel.querySelector('#s-base_url').value.trim(),
+        timezone: panel.querySelector('#s-timezone').value.trim(),
+        ip_geo_enabled: panel.querySelector('#s-ip_geo_enabled').checked,
         queue_while_running: panel.querySelector('#s-queue_while_running').checked,
         trust_proxy_headers: panel.querySelector('#s-trust_proxy_headers').checked,
         secure_cookies: panel.querySelector('#s-secure_cookies').checked,
@@ -3435,6 +3455,13 @@ AD.views = {};
         const box = panel.querySelector('#settings-result');
         box.innerHTML = '<div class="alert success">设置已保存'
           + (result.restart_required ? '；部分设置需要重启服务后生效' : '') + '</div>';
+        // 时区改了要让页面上的时间立刻跟着变，而不是等下一次轮询才纠正。
+        if (typeof result.timezone_offset_minutes === 'number') {
+          AD.applyTimezone(result.timezone_offset_minutes);
+          AD.toastSuccess('设置已保存');
+          AD.render('settings');
+          return;
+        }
         AD.toastSuccess('设置已保存');
         AD.setBusy(event.currentTarget, false);
       } catch (err) {
@@ -3659,25 +3686,70 @@ AD.views = {};
       run_deleted: '删除记录', run_interrupted: '运行中断', rollback: '回滚',
       settings_updated: '更新设置', maintenance_run: '执行清理', sessions_revoked: '撤销会话',
     };
+    // 归属地由后台联网解析，可能比日志本身晚几秒落地；这里用接口带来的
+    // 时区渲染时间，避免 /api/health 还没回来时先按浏览器时区闪一屏。
+    AD.applyTimezone(audit.timezone_offset_minutes);
     panel.innerHTML = `
       <div class="panel">
         <div class="panel-head"><h2>操作日志</h2>
           <div class="spacer"></div>
-          <span class="faint">最近 ${entries.length} 条</span>
+          <span class="faint">最近 ${entries.length} 条 · 时间按 ${e(audit.timezone || '服务器时区')}</span>
         </div>
         ${entries.length ? `<div class="table-wrap"><table>
-          <thead><tr><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th><th>来源 IP</th></tr></thead>
-          <tbody>${entries.map((entry) => `<tr>
-            <td class="dim nowrap">${e(AD.formatTime(entry.ts, true))}</td>
-            <td>${e(entry.actor || '系统')}</td>
-            <td>${e(ACTION_LABELS[entry.action] || entry.action)}</td>
-            <td class="mono dim">${e(entry.target || '—')}</td>
-            <td class="truncate" style="max-width:280px" title="${a(entry.detail)}">${e(entry.detail || '—')}</td>
-            <td class="mono dim">${e(entry.ip || '—')}</td>
-          </tr>`).join('')}</tbody>
+          <thead><tr><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th><th>来源 IP</th><th>IP 归属地</th></tr></thead>
+          <tbody>${entries.map(auditRow).join('')}</tbody>
         </table></div>` : '<div class="empty">暂无操作记录</div>'}
+        ${audit.ip_geo_enabled === false ? `<div class="hint" style="margin-top:10px">
+          来源 IP 归属地解析已关闭，可在「常规」页重新开启。</div>` : ''}
       </div>
     `;
+
+    function auditRow(entry) {
+      return `<tr data-audit-id="${entry.id}">
+        <td class="dim nowrap">${e(AD.formatTime(entry.ts, true))}</td>
+        <td>${e(entry.actor || '系统')}</td>
+        <td>${e(ACTION_LABELS[entry.action] || entry.action)}</td>
+        <td class="mono dim">${e(entry.target || '—')}</td>
+        <td class="truncate" style="max-width:280px" title="${a(entry.detail)}">${e(entry.detail || '—')}</td>
+        <td class="mono dim">${e(entry.ip || '—')}</td>
+        <td class="dim truncate" style="max-width:220px">${auditLocationCell(entry)}</td>
+      </tr>`;
+    }
+
+    function auditLocationCell(entry) {
+      const location = String(entry.ip_location || '');
+      if (location) return e(location);
+      if (!entry.ip) return '<span class="faint">—</span>';
+      return audit.ip_geo_enabled === false
+        ? '<span class="faint">未解析</span>'
+        : '<span class="faint" title="正在查询归属地">解析中…</span>';
+    }
+
+    // 只补空白的归属地单元格，不重建整张表：用户可能正在选中文本或
+    // 滚动表格，整表重绘会把位置与选区一起丢掉。
+    const pending = entries.filter((entry) => entry.ip && !entry.ip_location);
+    if (pending.length && audit.ip_geo_enabled !== false) {
+      let attempts = 0;
+      const timer = setInterval(async () => {
+        attempts += 1;
+        if (!panel.isConnected || attempts > 12) { clearInterval(timer); return; }
+        let fresh;
+        try {
+          fresh = await AD.api.get('/api/audit?limit=' + Math.max(entries.length, 40));
+        } catch (err) { clearInterval(timer); return; }
+        const byId = new Map((fresh.entries || []).map((row) => [String(row.id), row]));
+        let remaining = 0;
+        entries.forEach((entry) => {
+          const row = byId.get(String(entry.id));
+          if (!row || !row.ip_location || entry.ip_location) return;
+          entry.ip_location = row.ip_location;
+          const cell = panel.querySelector(`tr[data-audit-id="${entry.id}"] td:last-child`);
+          if (cell) cell.textContent = row.ip_location;
+        });
+        entries.forEach((entry) => { if (entry.ip && !entry.ip_location) remaining += 1; });
+        if (!remaining) clearInterval(timer);
+      }, 4000);
+    }
   }
 
   // ======================================================================

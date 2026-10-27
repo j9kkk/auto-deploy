@@ -106,10 +106,16 @@ window.AD = window.AD || {};
   // ------------------------------------------------------------- formatting
   function pad(value) { return String(value).padStart(2, '0'); }
 
-  /** Render an ISO timestamp in the server's system timezone. The offset
+  /** Render an ISO timestamp in the server's display timezone. The offset
    * (minutes east of UTC) arrives via /api/health and /api/dashboard; until
    * it is known we fall back to the browser's own timezone. */
   AD.tzOffsetMinutes = null;
+
+  /** 采用接口下发的展示时区。视图里已经拿到偏移时立即生效，不必等心跳，
+   * 否则首次进入页面会先按浏览器时区显示一帧。 */
+  AD.applyTimezone = function (offsetMinutes) {
+    if (typeof offsetMinutes === 'number') AD.tzOffsetMinutes = offsetMinutes;
+  };
 
   function applyOffset(date) {
     if (AD.tzOffsetMinutes === null) return date;

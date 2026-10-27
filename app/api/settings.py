@@ -38,7 +38,8 @@ def read_settings(
             for key, (_, low, high) in EDITABLE_SETTINGS.items()
         },
         "editable_bools": list(EDITABLE_BOOL_SETTINGS),
-        "readonly": ["host", "port", "shell", "timezone"],
+        # 时区已可编辑（0.4.8 之前它只是只读展示，从未影响任何时间）。
+        "readonly": ["host", "port", "shell"],
         "proxy_fields": [
             "proxy_enabled", "proxy_url", "proxy_username",
             "proxy_password", "proxy_no_proxy", "proxy_for_scripts",
@@ -76,7 +77,18 @@ def update_settings(
         "settings": service.export_settings(),
         "changed": sorted(patch.keys()),
         "restart_required": needs_restart,
+        # 改了时区后界面要立刻按新偏移重渲染，返回新偏移省一次轮询。
+        "timezone_offset_minutes": _timezone_offset_minutes(),
     }
+
+
+def _timezone_offset_minutes() -> int:
+    from datetime import datetime
+
+    from ..schedule import local_tz
+
+    offset = local_tz().utcoffset(datetime.now())
+    return int(offset.total_seconds() // 60) if offset else 0
 
 
 @router.post("/schedule/preview")

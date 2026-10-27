@@ -130,7 +130,15 @@ class Settings:
     update_repo: str = UPDATE_REPO_DEFAULT
 
     # --- misc -------------------------------------------------------------
-    timezone: str = "UTC"
+    # 界面与日志展示使用的时间；容器内系统时区通常是 UTC，靠它才能看到
+    # 北京时间。留空表示跟随主机系统时区。
+    timezone: str = "Asia/Shanghai"
+    # 是否由用户显式选过时区。旧版本把该字段当只读的「系统时区」展示，
+    # 存量配置里普遍存着 UTC；没有这个标记就无法区分「旧默认值」与
+    # 「用户真的选了 UTC」，升级时会把后者一并改掉。
+    timezone_configured: bool = False
+    # 操作日志的来源 IP 是否联网解析成归属地；关闭后不再发起外部请求。
+    ip_geo_enabled: bool = True
     notify_webhook: str = ""
     default_branch: str = "main"
     git_http_timeout_seconds: int = 300
@@ -176,9 +184,16 @@ def load_settings() -> Settings:
             stored = {}
         if isinstance(stored, dict):
             valid = {f.name: f.type for f in fields(Settings)}
+            legacy_timezone = "timezone" in stored and "timezone_configured" not in stored
             for key, value in stored.items():
                 if key in valid:
                     setattr(settings, key, value)
+            if legacy_timezone:
+                # 旧版本把 timezone 当只读的「系统时区」展示，配置文件里那个
+                # UTC 从没影响过任何展示。升级后它才开始生效，必须丢弃旧值，
+                # 否则所有人升级完仍看到 UTC。
+                settings.timezone = Settings().timezone
+                settings.timezone_configured = False
 
     for field_info in fields(Settings):
         env_name = _ENV_PREFIX + field_info.name.upper()

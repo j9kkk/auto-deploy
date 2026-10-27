@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from . import config
 from .db import Database
+from .ipgeo import IpLocationResolver
 from .runner import DeployRunner
 from .selfupdate import SelfUpdateManager
 from .scheduler import Scheduler
@@ -52,6 +53,7 @@ class Service:
         self.scheduler = Scheduler(self.store, self.runner)
         self.selfupdate = SelfUpdateManager(self.store, self.scheduler._lock)
         self.scheduler.deployment_blocked = self.selfupdate.deployment_blocked
+        self.ipgeo = IpLocationResolver(self.store)
         self.throttle = LoginThrottle(
             self.settings.login_max_attempts, self.settings.login_lockout_seconds
         )
@@ -158,6 +160,7 @@ class Service:
             "run_finished", {"run_id": run_id, "status": status}
         )
         self.scheduler.start()
+        self.ipgeo.start()
         # Give every schedule-active task a fresh next-run time so the schedule
         # is anchored to the moment the service came up. 总开关或定时开关任一
         # 关闭的任务不在此列：重排只会写回 None，没有意义。
@@ -166,6 +169,8 @@ class Service:
         logger.info("服务已启动")
 
     def stop(self) -> None:
+        # 先停解析线程再关数据库：它正在写报表，反过来关会撞上已关闭的连接。
+        self.ipgeo.stop()
         self.scheduler.stop()
         self.db.close()
         logger.info("服务已停止")

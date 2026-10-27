@@ -1082,14 +1082,38 @@ class AuditRepository:
     def record(
         self, action: str, *, actor: str = "", target: str = "", detail: str = "", ip: str = ""
     ) -> int:
+        """写入一条审计记录。
+
+        内网 / 回环地址在这里就地标注（零网络开销），公网地址留空由后台
+        解析线程补齐——写日志是请求主路径，不能被外部接口的延迟绑住。
+        """
+        from .ipgeo import local_label_cached
+
+        ip_text = (ip or "")[:64]
+        location = local_label_cached(ip_text) if ip_text else ""
         return self.db.execute(
-            "INSERT INTO audit_logs (ts, actor, action, target, detail, ip) VALUES (?, ?, ?, ?, ?, ?)",
-            (iso(utcnow()), actor, action, target, detail[:2000], ip),
+            "INSERT INTO audit_logs (ts, actor, action, target, detail, ip, ip_location) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (iso(utcnow()), actor, action, target, detail[:2000], ip_text, location),
         )
 
     def list_recent(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
         return self.db.query(
             "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+        )
+
+    def pending_locations(self, limit: int = 20) -> list[dict[str, Any]]:
+        """还没有归属地、且有来源 IP 的记录，最新的优先。"""
+        return self.db.query(
+            "SELECT id, ip FROM audit_logs "
+            "WHERE ip_location = '' AND ip <> '' ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+
+    def set_location(self, audit_id: int, location: str) -> None:
+        self.db.execute_rowcount(
+            "UPDATE audit_logs SET ip_location = ? WHERE id = ?",
+            (location[:120], audit_id),
         )
 
     def purge_old(self, keep: int = 2000) -> int:

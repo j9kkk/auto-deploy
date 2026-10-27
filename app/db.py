@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # 调度索引单独成段：init_schema 在迁移之后统一执行，保证列集与最新 schema 一致。
 TASKS_INDEX_SQL = """
@@ -186,7 +186,10 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     action  TEXT NOT NULL,
     target  TEXT NOT NULL DEFAULT '',
     detail  TEXT NOT NULL DEFAULT '',
-    ip      TEXT NOT NULL DEFAULT ''
+    ip      TEXT NOT NULL DEFAULT '',
+    -- 来源 IP 的归属地（「中国 北京市 北京 · 联通」或「Docker 网桥网关」）。
+    -- 空串表示待解析：内网地址写入时即标注，公网地址由后台线程补齐。
+    ip_location TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(id DESC);
 
@@ -379,6 +382,8 @@ class Database:
             self._migrate_v11_to_v12(conn)
         if current < 13:
             self._migrate_v12_to_v13(conn)
+        if current < 14:
+            self._migrate_v13_to_v14(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
@@ -432,6 +437,33 @@ class Database:
             conn, "tasks", "schedule_enabled", "INTEGER NOT NULL DEFAULT 1"
         )
         conn.execute("UPDATE tasks SET schedule_enabled = enabled")
+
+    def _migrate_v13_to_v14(self, conn: sqlite3.Connection) -> None:
+        """v14: 操作日志记录来源 IP 的归属地。
+
+        存量行的归属地留空（不是 NULL）：后台解析线程只挑公网地址且未解析
+        的行补齐，内网地址在写入时即已标注，因此空串在语义上就是「待解析」。
+
+        已能就地判断的地址在这里直接标注（回环 / 内网 / 保留），否则升级后
+        最老的一批记录会把解析队列占满，新记录反而要排在后面。
+        """
+        self._add_column(conn, "audit_logs", "ip_location", "TEXT NOT NULL DEFAULT ''")
+
+        from .ipgeo import local_label
+
+        seen: dict[str, str] = {}
+        rows = conn.execute(
+            "SELECT DISTINCT ip FROM audit_logs WHERE ip_location = '' AND ip <> ''"
+        ).fetchall()
+        for row in rows:
+            ip = str(row[0] or "")
+            if ip not in seen:
+                seen[ip] = local_label(ip)
+            if seen[ip]:
+                conn.execute(
+                    "UPDATE audit_logs SET ip_location = ? WHERE ip = ? AND ip_location = ''",
+                    (seen[ip], ip),
+                )
 
     def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
         """v8: 新增远程主机表 hosts，并给任务/运行补主机维度。

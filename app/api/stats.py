@@ -133,7 +133,41 @@ def audit_log(
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
     entries = service.store.audit.list_recent(limit=limit, offset=offset)
-    return {"entries": entries, "limit": limit, "offset": offset}
+    reported = {int(row["id"]) for row in entries if row.get("ip_location")}
+    # 这一页里还有待解析的地址时叫醒后台线程：用户正看着这一屏，
+    # 等的就是地点出现，没必要再等下一次 60 秒轮询。
+    if len(reported) < len(entries):
+        service.ipgeo.wake()
+    return {
+        "entries": entries,
+        "limit": limit,
+        "offset": offset,
+        "timezone": _timezone_label(),
+        "timezone_offset_minutes": _timezone_offset_minutes(),
+        "ip_geo_enabled": bool(getattr(service.settings, "ip_geo_enabled", True)),
+    }
+
+
+def _timezone_offset_minutes() -> int:
+    from ..schedule import local_tz
+
+    offset = local_tz().utcoffset(datetime.now())
+    return int(offset.total_seconds() // 60) if offset else 0
+
+
+def _timezone_label() -> str:
+    """当前展示时区的可读名称，供界面标明「时间按哪个时区显示」。"""
+    from ..schedule import DEFAULT_TIMEZONE, local_tz
+
+    name = str(getattr(config.load_settings(), "timezone", "") or DEFAULT_TIMEZONE)
+    offset = local_tz().utcoffset(datetime.now())
+    if offset is None:
+        return name
+    minutes = int(offset.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    hours, rest = divmod(abs(minutes), 60)
+    label = f"UTC{sign}{hours}" + (f":{rest:02d}" if rest else "")
+    return f"{name}（{label}）"
 
 
 @router.get("/sessions")
@@ -270,15 +304,22 @@ def export_audit(
 
     from fastapi.responses import PlainTextResponse
 
+    from ..schedule import format_local, from_iso
+
     entries = service.store.audit.list_recent(limit=1000)
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["id", "时间", "操作人", "动作", "对象", "详情", "IP"])
+    writer.writerow(["id", "时间", "操作人", "动作", "对象", "详情", "IP", "IP 归属地"])
     for entry in entries:
         writer.writerow(
             [
-                entry["id"], entry["ts"], entry["actor"], entry["action"],
+                # 导出的是给人看的表格：时间必须与界面一致的展示时区，
+                # 而不是库里存储用的 UTC（否则导出后差 8 小时）。
+                entry["id"],
+                format_local(from_iso(entry["ts"])),
+                entry["actor"], entry["action"],
                 entry["target"], entry["detail"], entry["ip"],
+                entry.get("ip_location", ""),
             ]
         )
     # A BOM keeps Excel from mangling the Chinese column headers.

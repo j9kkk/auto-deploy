@@ -131,10 +131,8 @@
     const badge = document.getElementById('scheduler-status');
     try {
       const health = await AD.api.get('/api/health');
-      // 服务器系统时区偏移随心跳送达，所有时间展示都按服务器时区渲染。
-      if (typeof health.timezone_offset_minutes === 'number') {
-        AD.tzOffsetMinutes = health.timezone_offset_minutes;
-      }
+      // 展示时区随心跳送达（默认北京时间），所有时间展示都按它渲染。
+      AD.applyTimezone(health.timezone_offset_minutes);
       if (badge) {
         badge.className = 'badge ' + (health.scheduler_running ? 'success' : 'failed');
         badge.textContent = health.scheduler_running ? '调度运行中' : '调度已停止';

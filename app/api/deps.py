@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import Depends, HTTPException, Request, Response, status
 
 from .. import config
+from ..ipgeo import parse_ip
 from ..schedule import iso, utcnow
 from ..security import token_fingerprint
 from ..service import Service
@@ -28,7 +29,14 @@ def client_ip(request: Request) -> str:
     if settings.trust_proxy_headers:
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
-            return forwarded.split(",")[0].strip()[:64]
+            # 多级代理时最左侧最接近客户端；但链里可能混入 "unknown" 之类
+            # 的占位值，跳过它们取第一个能解析的地址。
+            candidates = [item.strip() for item in forwarded.split(",") if item.strip()]
+            for candidate in candidates:
+                if parse_ip(candidate) is not None:
+                    return candidate[:64]
+            if candidates:
+                return candidates[0][:64]
         real_ip = request.headers.get("x-real-ip", "")
         if real_ip:
             return real_ip.strip()[:64]
@@ -122,6 +130,11 @@ def audit(
     ip: str = "",
 ) -> None:
     service.store.audit.record(action, actor=actor, target=target, detail=detail, ip=ip)
+    # 公网地址的归属地要联网查，交给后台线程补齐；顺手唤醒它，新记录
+    # 不必等下一次轮询（最多 60 秒）才显示地点。
+    resolver = getattr(service, "ipgeo", None)
+    if ip and resolver is not None:
+        resolver.wake()
 
 
 def now_iso() -> str:
