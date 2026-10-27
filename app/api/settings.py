@@ -38,7 +38,6 @@ def read_settings(
             for key, (_, low, high) in EDITABLE_SETTINGS.items()
         },
         "editable_bools": list(EDITABLE_BOOL_SETTINGS),
-        "editable_texts": ["base_url", "notify_webhook", "default_branch", "update_repo"],
         "readonly": ["host", "port", "shell", "timezone"],
         "proxy_fields": [
             "proxy_enabled", "proxy_url", "proxy_username",

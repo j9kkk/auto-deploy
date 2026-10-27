@@ -3,6 +3,9 @@
 # 用途：把 AutoDeploy 暴露在 443 端口，并为会话 Cookie 提供 HTTPS。
 # 使用前请替换 server_name 与证书路径，然后在「设置」页面勾选
 # 「仅通过 HTTPS 发送会话 Cookie」和「信任反向代理的 X-Forwarded-For」。
+# 本示例已转发 X-Forwarded-Proto / X-Forwarded-Host，勾选「信任反向代理头」
+# 后 Webhook 触发地址会自动是 https；若你的反代连这些头都不转发，
+# 改在「设置 → 安全 → 外网访问地址」里直接填 https 域名。
 #
 # 注意：部署任务可以执行任意脚本，控制台等同于服务器 root 权限，
 # 请勿直接暴露到公网而不加访问限制。
@@ -50,6 +53,9 @@ server {
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # Webhook 触发地址的域名取自这个头（0.4.5 起支持）；不转发时
+        # 应用只能用回源地址拼出 http://127.0.0.1 之类的不可用地址。
+        proxy_set_header X-Forwarded-Host  $host;
         proxy_set_header Connection        "";
     }
 
