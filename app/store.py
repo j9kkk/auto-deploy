@@ -30,7 +30,8 @@ TASK_INSERT_COLUMNS = (
     "compose_content",
     "rsync_target", "rsync_options",
     "host_id", "source_mode", "data_sources",
-    "env_vars", "timeout_seconds", "notify_webhook", "skip_if_no_changes", "run_on_create",
+    "env_vars", "timeout_seconds", "notify_webhook", "skip_if_no_changes",
+    "webhook_skip_if_no_changes", "run_on_create",
 )
 
 TASK_UPDATE_COLUMNS = (
@@ -45,7 +46,8 @@ TASK_UPDATE_COLUMNS = (
     "compose_content",
     "rsync_target", "rsync_options",
     "host_id", "source_mode", "data_sources",
-    "env_vars", "timeout_seconds", "notify_webhook", "skip_if_no_changes", "run_on_create",
+    "env_vars", "timeout_seconds", "notify_webhook", "skip_if_no_changes",
+    "webhook_skip_if_no_changes", "run_on_create",
 )
 
 # Statuses a run can be in.  ``queued`` and ``running`` are the live ones.
@@ -524,7 +526,7 @@ class TaskRepository:
             payload["env_vars"] = encode_env_vars(payload["env_vars"])
         for flag in (
             "enabled", "schedule_enabled", "webhook_enabled",
-            "skip_if_no_changes", "run_on_create",
+            "skip_if_no_changes", "webhook_skip_if_no_changes", "run_on_create",
         ):
             if flag in payload and isinstance(payload[flag], bool):
                 payload[flag] = 1 if payload[flag] else 0

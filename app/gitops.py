@@ -311,18 +311,97 @@ def _looks_transient(output: str) -> bool:
     return any(marker in lowered for marker in _TRANSIENT_MARKERS)
 
 
-def _credential_hint(output: str) -> str:
+def _is_http_url(repo_url: str) -> bool:
+    return (repo_url or "").strip().lower().startswith(("http://", "https://"))
+
+
+def _is_ssh_url(repo_url: str) -> bool:
+    text = (repo_url or "").strip()
+    return text.lower().startswith(("ssh://", "git@")) or bool(_SCP_LIKE.match(text))
+
+
+def rewrite_url_for_credential(
+    repo_url: str, credential: "GitCredential | None"
+) -> tuple[str, str | None]:
+    """当仓库 URL 协议与所选凭据类型不匹配时，能无损转换的自动重写。
+
+    典型误配：用户在任务里绑定了「SSH 私钥」凭据，却从浏览器地址栏复制了
+    ``https://github.com/owner/repo.git``。Git 对 ``https://`` 只走 HTTP 认证，
+    完全忽略 ``GIT_SSH_COMMAND``，最终报 ``could not read Username``。
+    此时把标准 ``http(s)://<host>/<path>``（无自定义端口）转为 ``git@<host>:<path>``
+    即可直接用所选的 SSH 密钥拉取。
+
+    反过来（``git@<host>:<path>`` 配了「HTTPS 访问令牌」），则说明协议冲突但
+    不贸然改写（内网自建 Git 可能未开 HTTPS），交给提示层明确报错。
+    """
+    text = (repo_url or "").strip()
+    if not text or credential is None or not credential.has_secret:
+        return text, None
+    if credential.is_ssh and _is_http_url(text):
+        from urllib.parse import urlparse
+
+        try:
+            parsed = urlparse(text)
+        except ValueError:
+            return text, None
+        host = parsed.hostname
+        path = (parsed.path or "").lstrip("/")
+        if host and path and parsed.port is None:
+            user = (credential.username or "git").strip() or "git"
+            rewritten = f"{user}@{host}:{path}"
+            return (
+                rewritten,
+                f"仓库地址为 HTTPS 协议，已按所选 SSH 私钥凭据自动转换为 {rewritten}",
+            )
+    return text, None
+
+
+def credential_url_mismatch_hint(
+    repo_url: str, credential: "GitCredential | None"
+) -> str:
+    """检查仓库地址协议与凭据类型是否冲突，返回可操作的中文说明。"""
+    text = (repo_url or "").strip()
+    if not text or credential is None:
+        return ""
+    if credential.kind == "ssh_key" and _is_http_url(text):
+        return (
+            "仓库地址为 HTTP(S) 协议，但当前使用的是 SSH 私钥凭据："
+            "请将仓库地址改为 git@host:owner/repo.git，或改选 HTTPS 访问令牌凭据"
+        )
+    if credential.kind == "https_token" and credential.token and _is_ssh_url(text):
+        return (
+            "仓库地址为 SSH 格式，但当前使用的是 HTTPS 访问令牌凭据："
+            "请将仓库地址改为 https://...，或改选 SSH 私钥凭据"
+        )
+    return ""
+
+
+def _credential_hint(
+    output: str,
+    *,
+    repo_url: str = "",
+    credential: "GitCredential | None" = None,
+) -> str:
     """把「需要认证但没有可用凭据」的 git 输出翻译成可操作的中文提示。
 
     私有仓库未配置凭据时，git 只会给出 ``could not read Username ...: terminal
     prompts disabled``，最终上报的却只是「命令退出码 128」，看不出该去配凭据。
+    若明明配了凭据却因 URL 协议与凭据类型不匹配（如 SSH 私钥配 https:// 或
+    HTTPS 令牌配 git@）导致认证失败，优先点明协议冲突。
     """
     lowered = (output or "").lower()
+    mismatch = credential_url_mismatch_hint(repo_url, credential)
     if "could not read username" in lowered or "could not read password" in lowered:
+        if mismatch:
+            return mismatch
         return "私有仓库需要认证，但任务未配置可用凭据：请在任务中选择凭据，或配置任务内访问令牌"
     if "authentication failed" in lowered or "invalid username or password" in lowered:
+        if mismatch:
+            return mismatch
         return "认证失败：凭据无效或已过期，请在「凭据」页面测试并更新"
     if "permission denied" in lowered and "publickey" in lowered:
+        if mismatch:
+            return mismatch
         return "认证失败：SSH 密钥不被接受，请确认公钥已登记到仓库的 Deploy Keys"
     return ""
 
@@ -537,6 +616,15 @@ def sync_checkout(
     fetched and hard-reset to the remote branch, which makes the result
     independent of any local edits a build step may have left behind.
     """
+    effective_cred = credential or GitCredential(
+        kind="https_token" if token else "none",
+        username=username,
+        token=token,
+    )
+    repo_url, rewrite_note = rewrite_url_for_credential(repo_url, effective_cred)
+    if rewrite_note and log:
+        log(f"! {rewrite_note}")
+
     problem = validate_repo_url(repo_url) or validate_branch(branch)
     if problem:
         raise GitError(problem)
@@ -554,7 +642,7 @@ def sync_checkout(
     git_dir = workspace / ".git"
     env = _git_env(
         token=token, username=username, tmp_dir=tmp_dir,
-        credential=credential, proxy=proxy, home=home,
+        credential=effective_cred, proxy=proxy, home=home,
     )
     info = CheckoutInfo(branch=branch)
 
@@ -592,7 +680,10 @@ def sync_checkout(
             # git's raw output.
             if "Remote branch" in result.output and "not found" in result.output:
                 raise GitError(f"远程分支 {branch!r} 不存在")
-            hint = _credential_hint(result.output) or _network_hint(result.output)
+            hint = (
+                _credential_hint(result.output, repo_url=repo_url, credential=effective_cred)
+                or _network_hint(result.output)
+            )
             if hint:
                 raise GitError(hint)
             raise GitError(result.error or "git clone 失败")
@@ -604,6 +695,15 @@ def sync_checkout(
                 pass
         info.result = result
     else:
+        # 任务在已克隆后改过仓库地址或切换了 SSH/HTTPS 凭据时，同步更新 origin URL，
+        # 避免 git fetch 继续访问旧协议地址导致认证失败。
+        run_command(
+            ["git", "remote", "set-url", "origin", "--", repo_url],
+            cwd=workspace,
+            env=env,
+            timeout=30,
+            log=None,
+        )
         info.previous_commit = rev_parse(workspace, "HEAD", env=env, timeout=60)
         fetch_args = ["fetch", "--prune", "origin", branch]
         if depth and depth > 0:
@@ -621,7 +721,10 @@ def sync_checkout(
             retry_budget_seconds=timeout,
         )
         if not result.ok:
-            hint = _credential_hint(result.output) or _network_hint(result.output)
+            hint = (
+                _credential_hint(result.output, repo_url=repo_url, credential=effective_cred)
+                or _network_hint(result.output)
+            )
             if hint:
                 raise GitError(hint)
             raise GitError(result.error or "git fetch 失败")
@@ -811,6 +914,7 @@ def test_credentials(
     走 ``git ls-remote``：它只协商认证并列出引用，不会写入任何本地状态，
     因此可以在界面上安全地反复测试。凭据错误、网络不通都能给出具体原因。
     """
+    repo_url, rewrite_note = rewrite_url_for_credential(repo_url, credential)
     problem = validate_repo_url(repo_url)
     if problem:
         return False, problem
@@ -819,6 +923,10 @@ def test_credentials(
         return False, "SSH 凭据缺少私钥"
     if credential.kind == "https_token" and not credential.token:
         return False, "HTTPS 凭据缺少访问令牌"
+
+    mismatch = credential_url_mismatch_hint(repo_url, credential)
+    if mismatch:
+        return False, mismatch
 
     unreachable = check_reachable(
         repo_url, proxy_url=_proxy_url_of(proxy), no_proxy=_no_proxy_of(proxy)
@@ -839,8 +947,12 @@ def test_credentials(
     )
     if result.ok:
         branches = [line for line in result.output.splitlines() if line.strip()]
-        return True, f"连接成功，远端有 {len(branches)} 个分支"
+        suffix = f"（已按 SSH 凭据转换为 {repo_url}）" if rewrite_note else ""
+        return True, f"连接成功，远端有 {len(branches)} 个分支{suffix}"
 
+    hint = _credential_hint(result.output, repo_url=repo_url, credential=credential)
+    if hint:
+        return False, hint
     output = (result.output or "").lower()
     if "authentication failed" in output or "invalid username or password" in output:
         return False, "认证失败：凭据无效或已过期"

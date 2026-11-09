@@ -142,6 +142,16 @@ def resolve_git_depth(task: Mapping[str, Any]) -> int:
         return 1
 
 
+def should_skip_if_no_changes(task: Mapping[str, Any], trigger: str) -> bool:
+    """按触发来源读取「代码无变化时跳过部署」开关。
+
+    Webhook 触发走独立的 ``webhook_skip_if_no_changes``；定时与手动运行走
+    ``skip_if_no_changes``，两边的开关互不影响。
+    """
+    key = "webhook_skip_if_no_changes" if trigger == "webhook" else "skip_if_no_changes"
+    return bool(task.get(key, True))
+
+
 class DeployRunner:
     """Owns run execution, cancellation and the worker pool."""
 
@@ -434,7 +444,7 @@ class DeployRunner:
             changes_detected=info.changes_detected,
         )
 
-        if task.get("skip_if_no_changes", True) and not info.changes_detected:
+        if should_skip_if_no_changes(task, trigger) and not info.changes_detected:
             log("代码无变化，跳过本次部署。")
             return "skipped", 0
 
@@ -742,7 +752,7 @@ class DeployRunner:
             changes_detected=info.changes_detected,
         )
 
-        if task.get("skip_if_no_changes", True) and not info.changes_detected:
+        if should_skip_if_no_changes(task, trigger) and not info.changes_detected:
             log("代码无变化，跳过本次部署。")
             return "skipped", 0
 

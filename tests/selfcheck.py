@@ -641,7 +641,12 @@ def run() -> int:
           bypassed is None and probed == [("github.com", 443)], f'{bypassed!r} {probed}')
 
     # 私有仓库未配凭据时，必须给出可操作提示而不是只报「命令退出码 128」。
-    from app.gitops import _credential_hint
+    from app.gitops import (
+        GitCredential,
+        _credential_hint,
+        credential_url_mismatch_hint,
+        rewrite_url_for_credential,
+    )
 
     _private_repo_output = (
         "Cloning into '/var/lib/autodeploy/workspaces/x'...\n"
@@ -655,6 +660,30 @@ def run() -> int:
     check("本地权限错误不误报为密钥问题",
           _credential_hint("fatal: could not create work tree dir '/x': Permission denied") == "")
     check("无认证问题时不给凭据提示", _credential_hint("fatal: Remote branch nope not found") == "")
+
+    _ssh_cred = GitCredential(kind="ssh_key", private_key="KEY", username="git")
+    _https_cred = GitCredential(kind="https_token", token="ghp_xxx", username="git")
+    rewritten_url, rewrite_msg = rewrite_url_for_credential(
+        "https://github.com/j9kkk/iphotoer_backend.git", _ssh_cred
+    )
+    check("SSH 凭据配 HTTPS 地址自动转换为 git@ 地址",
+          rewritten_url == "git@github.com:j9kkk/iphotoer_backend.git" and bool(rewrite_msg),
+          f"{rewritten_url!r} / {rewrite_msg!r}")
+    unchanged_url, unchanged_msg = rewrite_url_for_credential(
+        "https://github.com:8443/j9kkk/repo.git", _ssh_cred
+    )
+    check("带自定义端口的 HTTPS 地址不盲目改写",
+          unchanged_url == "https://github.com:8443/j9kkk/repo.git" and unchanged_msg is None)
+    check("SSH 凭据配 HTTPS 地址冲突提示准确",
+          "SSH 私钥凭据" in _credential_hint(
+              _private_repo_output,
+              repo_url="https://github.com:8443/j9kkk/repo.git",
+              credential=_ssh_cred,
+          ))
+    check("HTTPS 令牌配 SSH 地址冲突提示准确",
+          "HTTPS 访问令牌凭据" in credential_url_mismatch_hint(
+              "git@github.com:j9kkk/iphotoer_backend.git", _https_cred
+          ))
 
     # git 自己的解析失败同样要给可操作提示，且不得断言「不可达」——
     # 抖动重试后仍失败时，用户拿到的应是指向 DNS 的说明。
@@ -782,6 +811,23 @@ def run() -> int:
     store.db.init_schema()
     check("v13 迁移可重复执行", store.db.schema_version() >= 13)
     store.tasks.update(task_id, {"enabled": True, "schedule_enabled": True})
+
+    # v15 拆出 Webhook 无变化跳过开关：存量任务按原 skip_if_no_changes 回填。
+    store.tasks.update(task_id, {"skip_if_no_changes": False})
+    store.db.execute("UPDATE tasks SET webhook_skip_if_no_changes = 1")
+    store.db.execute("UPDATE schema_version SET version = 14")
+    store.db.init_schema()
+    migrated_v15 = store.tasks.get_decoded(task_id)
+    check(
+        "v15 迁移把存量 skip_if_no_changes 回填到 webhook_skip_if_no_changes",
+        migrated_v15["skip_if_no_changes"] is False
+        and migrated_v15["webhook_skip_if_no_changes"] is False,
+        f"schedule={migrated_v15.get('skip_if_no_changes')} "
+        f"webhook={migrated_v15.get('webhook_skip_if_no_changes')}",
+    )
+    store.tasks.update(
+        task_id, {"skip_if_no_changes": True, "webhook_skip_if_no_changes": True}
+    )
 
     # 结构护栏：校验层能产出的字段必须都能落库，否则会在某一侧被静默丢弃。
     from app import validation as _validation
@@ -2326,6 +2372,71 @@ def run() -> int:
         check("恢复任务总开关成功", restore_all.status_code == 200
               and restore_all.json()["task"]["enabled"] is True, restore_all.text[:150])
 
+        # --- 定时与 Webhook 的「代码无变化跳过」开关独立生效 ------------
+        # 1) Webhook 关闭跳过、定时保持跳过：Webhook 无变化也正常部署，手动/定时仍跳过。
+        wh_no_skip = client.put(
+            f"/api/tasks/{webhook_id}",
+            json={"skip_if_no_changes": True, "webhook_skip_if_no_changes": False},
+        )
+        check(
+            "可单独关闭 Webhook 无变化跳过",
+            wh_no_skip.status_code == 200
+            and wh_no_skip.json()["task"]["skip_if_no_changes"] is True
+            and wh_no_skip.json()["task"]["webhook_skip_if_no_changes"] is False,
+            wh_no_skip.text[:150],
+        )
+        wh_deploy_run = client.post(new_path).json()["run_id"]
+        deadline = time.monotonic() + 60
+        wh_deploy_status = "queued"
+        while time.monotonic() < deadline:
+            wh_deploy_status = client.get(f"/api/runs/{wh_deploy_run}").json()["run"]["status"]
+            if wh_deploy_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        check("Webhook 关闭跳过后无变化仍正常部署", wh_deploy_status == "success", wh_deploy_status)
+
+        sched_skip_run = client.post(f"/api/tasks/{webhook_id}/run").json()["run_id"]
+        deadline = time.monotonic() + 60
+        sched_skip_status = "queued"
+        while time.monotonic() < deadline:
+            sched_skip_status = client.get(f"/api/runs/{sched_skip_run}").json()["run"]["status"]
+            if sched_skip_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        check("定时/手动开关保持开启时无变化仍跳过", sched_skip_status == "skipped", sched_skip_status)
+
+        # 2) 反过来：定时关闭跳过、Webhook 开启跳过：Webhook 无变化跳过，手动/定时正常部署。
+        sched_no_skip = client.put(
+            f"/api/tasks/{webhook_id}",
+            json={"skip_if_no_changes": False, "webhook_skip_if_no_changes": True},
+        )
+        check(
+            "可单独开启 Webhook 无变化跳过并关闭定时跳过",
+            sched_no_skip.status_code == 200
+            and sched_no_skip.json()["task"]["skip_if_no_changes"] is False
+            and sched_no_skip.json()["task"]["webhook_skip_if_no_changes"] is True,
+            sched_no_skip.text[:150],
+        )
+        wh_skip_run = client.post(new_path).json()["run_id"]
+        deadline = time.monotonic() + 60
+        wh_skip_status = "queued"
+        while time.monotonic() < deadline:
+            wh_skip_status = client.get(f"/api/runs/{wh_skip_run}").json()["run"]["status"]
+            if wh_skip_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        check("Webhook 开启跳过时不受定时开关影响仍跳过", wh_skip_status == "skipped", wh_skip_status)
+
+        sched_deploy_run = client.post(f"/api/tasks/{webhook_id}/run").json()["run_id"]
+        deadline = time.monotonic() + 60
+        sched_deploy_status = "queued"
+        while time.monotonic() < deadline:
+            sched_deploy_status = client.get(f"/api/runs/{sched_deploy_run}").json()["run"]["status"]
+            if sched_deploy_status not in ("queued", "running"):
+                break
+            time.sleep(0.4)
+        check("定时关闭跳过时无变化仍正常部署", sched_deploy_status == "success", sched_deploy_status)
+
         response = client.delete(f"/api/tasks/{webhook_id}")
         check("清理 Webhook 测试任务", response.status_code == 200, response.text[:150])
         check("Webhook 触发写入审计日志", any(
@@ -3419,6 +3530,58 @@ def run() -> int:
         {"id": 9003, "name": "Inline_Rb", "deploy_method": "compose_inline"},
         log=lambda _m: None)
     check("无仓库方式拒绝回滚", ok is False and "compose 内容改回旧内容" in message, message)
+
+    # Compose .env 自动生成与错误诊断提示
+    from app.validation import _normalise_env_vars
+
+    parsed_dotenv, dotenv_err = _normalise_env_vars(
+        "# 注释行\nexport PORT=8080 # 行尾注释\nAPP_SECRET=\"my#secret value\"\nEMPTY=\n"
+    )
+    check(".env 粘贴支持 export 前缀、行尾注释与引号包裹",
+          dotenv_err is None
+          and parsed_dotenv == {"PORT": "8080", "APP_SECRET": "my#secret value", "EMPTY": ""},
+          f"{dotenv_err!r} / {parsed_dotenv!r}")
+
+    dotenv_release = tmp_root / "dotenv-release"
+    (dotenv_release / "docker").mkdir(parents=True, exist_ok=True)
+    (dotenv_release / "docker" / "docker-compose-ali.yml").write_text("services: {}\n", encoding="utf-8")
+    dotenv_ctx = deployer_mod2.DeployContext(
+        task={"id": 9004, "name": "Dotenv_Test", "deploy_method": "docker_compose",
+              "docker_compose_file": "docker/docker-compose-ali.yml"},
+        run_id=1,
+        workspace=dotenv_release,
+        release_dir=dotenv_release,
+        releases_root=inline_root,
+        current_link=inline_root / "current",
+        artifact_path=tmp_root / "dotenv.tar.gz",
+        env={"DB_PASS": "s3cr#t val", "PORT": "8080"},
+    )
+    written_dotenvs = deployer_mod2._write_dotenv_if_missing(
+        dotenv_ctx, [dotenv_release, dotenv_release / "docker"]
+    )
+    check("自动在发布目录与 compose 目录生成缺失的 .env",
+          len(written_dotenvs) == 2
+          and (dotenv_release / ".env").exists()
+          and (dotenv_release / "docker" / ".env").exists(),
+          str(written_dotenvs))
+    check("自动生成的 .env 包含任务环境变量且带特殊字符转义",
+          'DB_PASS="s3cr#t val"' in (dotenv_release / ".env").read_text(encoding="utf-8")
+          and "PORT=8080" in (dotenv_release / ".env").read_text(encoding="utf-8"))
+    (dotenv_release / ".env").write_text("CUSTOM=1\n", encoding="utf-8")
+    deployer_mod2._write_dotenv_if_missing(dotenv_ctx, [dotenv_release])
+    check("已有 .env 文件时不覆盖",
+          (dotenv_release / ".env").read_text(encoding="utf-8") == "CUSTOM=1\n")
+
+    check("Compose 缺失 .env 错误提示准确",
+          "环境文件不存在" in deployer_mod2._compose_error_hint(
+              "env file /app/data/releases/task-6/releases/20261108/.env not found: "
+              "stat /app/data/releases/task-6/releases/20261108/.env: no such file or directory"
+          ))
+    check("Compose 端口占用错误提示准确",
+          "端口 8080" in deployer_mod2._compose_error_hint(
+              "Error response from daemon: Ports are not available: "
+              "listen tcp 0.0.0.0:8080: bind: address already in use"
+          ))
 
     # ------------------------------------------------------------------
     section("持久化数据的备份、恢复与删除语义")

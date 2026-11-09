@@ -1439,6 +1439,7 @@ AD.views = {};
                 ${isEdit && t.has_token ? `${switchRow('f-clear_token', false, '清除已保存的令牌',
                   '保存后该任务不再使用任务内令牌；如仍在用私有仓库请先切换到集中凭据')}` : ''}
               </div>
+              <div class="field span-2 hidden" id="auth-protocol-hint"></div>
             </div>
           </section>
 
@@ -1578,6 +1579,12 @@ AD.views = {};
                 <div class="hint">部署结束后把结果发送到该地址，留空使用全局设置；与上面的触发地址无关</div>
               </div>
             </div>
+
+            <div data-method-field="artifact script release systemd docker docker_compose rsync">
+              <div class="section-title">执行策略</div>
+              ${switchRow('f-webhook_skip_if_no_changes', (t.webhook_skip_if_no_changes === undefined ? true : t.webhook_skip_if_no_changes),
+                '代码无变化时跳过部署', 'Webhook 触发时提交哈希未变化直接标记为「已跳过」，不执行构建与发布；与定时触发中的同名开关分开生效')}
+            </div>
           </section>
 
           <section class="form-tab-panel hidden" role="tabpanel" id="tab-panel-advanced" data-form-panel="advanced" aria-labelledby="tab-btn-advanced">
@@ -1599,9 +1606,15 @@ AD.views = {};
             <div class="section-title">环境变量</div>
             <div class="form-grid cols-2">
               <div class="field span-2">
-                <label>环境变量</label>
-                <textarea id="f-env_vars" rows="6" placeholder="NODE_ENV=production&#10;API_BASE=https://api.example.com">${e(envToText(t.env_vars))}</textarea>
-                <div class="hint">每行一条 <code class="code-inline">KEY=value</code>，会导出到准备与部署脚本（回滚脚本不注入这些变量）</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+                  <label for="f-env_vars" style="margin:0">环境变量 / .env 内容</label>
+                  <div style="display:flex;gap:6px;align-items:center">
+                    <input type="file" id="env-file-input" accept=".env,text/plain" class="hidden">
+                    <button type="button" class="sm" id="env-import-btn">导入 .env 文件</button>
+                  </div>
+                </div>
+                <textarea id="f-env_vars" rows="7" spellcheck="false" placeholder="# 支持直接粘贴 .env 文件全文（含 # 注释、export 前缀与引号）&#10;NODE_ENV=production&#10;API_BASE=https://api.example.com">${e(envToText(t.env_vars))}</textarea>
+                <div class="hint">每行一条 <code class="code-inline">KEY=value</code>（可直接粘贴 <code class="code-inline">.env</code> 文件内容，自动忽略 <code class="code-inline">#</code> 注释与 <code class="code-inline">export </code> 前缀）。除导出到构建与部署脚本外，Docker Compose 部署时若目录缺少 <code class="code-inline">.env</code> 文件会自动按此生成（权限 0600，不打入构建产物包）。</div>
               </div>
             </div>
           </section>
@@ -1858,17 +1871,126 @@ AD.views = {};
     };
     methodSelect.addEventListener('change', applyMethodUI);
 
+    const protocolHintBox = backdrop.querySelector('#auth-protocol-hint');
+    const repoUrlInput = backdrop.querySelector('#f-repo_url');
+
+    const convertHttpToSsh = (url) => {
+      const m = String(url || '').trim().match(/^https?:\/\/([^/:?#]+)\/(.+)$/i);
+      if (!m) return '';
+      return `git@${m[1]}:${m[2].replace(/^\/+/, '')}`;
+    };
+    const convertSshToHttps = (url) => {
+      const text = String(url || '').trim();
+      const scp = text.match(/^[\w.\-]+@([\w.\-]+):([\w./\-~]+)$/);
+      if (scp) return `https://${scp[1]}/${scp[2].replace(/^\/+/, '')}`;
+      const ssh = text.match(/^ssh:\/\/(?:[\w.\-]+@)?([^/:?#]+)\/(.+)$/i);
+      if (ssh) return `https://${ssh[1]}/${ssh[2].replace(/^\/+/, '')}`;
+      return '';
+    };
+
+    const updateProtocolHint = () => {
+      if (!protocolHintBox) return;
+      const mode = scanAuthMode();
+      const url = value('#f-repo_url');
+      if (!url || mode === 'none') {
+        protocolHintBox.classList.add('hidden');
+        protocolHintBox.innerHTML = '';
+        return;
+      }
+      const isHttp = /^https?:\/\//i.test(url);
+      const isSsh = /^ssh:\/\//i.test(url) || /^[\w.\-]+@[\w.\-]+:[\w./\-~]+$/.test(url);
+      let credKind = '';
+      if (mode === 'credential') {
+        const selectedId = credSelect ? credSelect.value : '';
+        const found = (AD.state.credentials || []).find((c) => String(c.id) === String(selectedId));
+        credKind = found ? String(found.kind || '') : '';
+      } else if (mode === 'token') {
+        credKind = 'https_token';
+      }
+      if (credKind === 'ssh_key' && isHttp) {
+        const sshUrl = convertHttpToSsh(url);
+        protocolHintBox.classList.remove('hidden');
+        protocolHintBox.innerHTML = `
+          <div class="alert warning" style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0">
+            <span>仓库地址为 HTTPS 协议，而所选凭据是 <strong>SSH 私钥</strong>（部署时会自动按 SSH 地址拉取，也建议直接转换地址）。</span>
+            ${sshUrl ? `<button type="button" class="sm" id="convert-repo-url" data-target-url="${a(sshUrl)}">转为 SSH 地址</button>` : ''}
+          </div>`;
+        const btn = protocolHintBox.querySelector('#convert-repo-url');
+        if (btn && repoUrlInput) {
+          btn.addEventListener('click', () => {
+            repoUrlInput.value = btn.dataset.targetUrl;
+            tabDirty.source = true;
+            formDirty = true;
+            updateProtocolHint();
+            renderSummary();
+          });
+        }
+        return;
+      }
+      if (credKind === 'https_token' && isSsh) {
+        const httpsUrl = convertSshToHttps(url);
+        protocolHintBox.classList.remove('hidden');
+        protocolHintBox.innerHTML = `
+          <div class="alert warning" style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0">
+            <span>仓库地址为 SSH 格式，但当前使用的是 <strong>HTTPS 访问令牌</strong>，拉取时将无法通过认证。</span>
+            ${httpsUrl ? `<button type="button" class="sm" id="convert-repo-url" data-target-url="${a(httpsUrl)}">转为 HTTPS 地址</button>` : ''}
+          </div>`;
+        const btn = protocolHintBox.querySelector('#convert-repo-url');
+        if (btn && repoUrlInput) {
+          btn.addEventListener('click', () => {
+            repoUrlInput.value = btn.dataset.targetUrl;
+            tabDirty.source = true;
+            formDirty = true;
+            updateProtocolHint();
+            renderSummary();
+          });
+        }
+        return;
+      }
+      protocolHintBox.classList.add('hidden');
+      protocolHintBox.innerHTML = '';
+    };
+
     const applyAuthMode = () => {
       const mode = scanAuthMode();
       const credWrap = backdrop.querySelector('#auth-credential-wrap');
       const tokenWrap = backdrop.querySelector('#auth-token-wrap');
       if (credWrap) credWrap.classList.toggle('hidden', mode !== 'credential');
       if (tokenWrap) tokenWrap.classList.toggle('hidden', mode !== 'token');
+      updateProtocolHint();
       renderSummary();
     };
     backdrop.querySelectorAll('input[name="f-auth_mode"]').forEach((radio) => {
       radio.addEventListener('change', applyAuthMode);
     });
+    if (credSelect) credSelect.addEventListener('change', updateProtocolHint);
+    if (repoUrlInput) repoUrlInput.addEventListener('input', updateProtocolHint);
+
+    // 环境变量区：支持一键导入本地 .env 文件
+    const envImportBtn = backdrop.querySelector('#env-import-btn');
+    const envFileInput = backdrop.querySelector('#env-file-input');
+    const envTextarea = backdrop.querySelector('#f-env_vars');
+    if (envImportBtn && envFileInput && envTextarea) {
+      envImportBtn.addEventListener('click', () => envFileInput.click());
+      envFileInput.addEventListener('change', () => {
+        const file = envFileInput.files && envFileInput.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const content = String(reader.result || '').trim();
+          if (content) {
+            const existingText = envTextarea.value.trim();
+            envTextarea.value = existingText ? (existingText + '\n' + content) : content;
+            tabDirty.advanced = true;
+            formDirty = true;
+            renderSummary();
+            AD.toastSuccess(`已导入 ${file.name}`);
+          }
+          envFileInput.value = '';
+        };
+        reader.readAsText(file, 'utf-8');
+      });
+    }
 
     // 凭据区：内联新建（叠层表单，保存后回填选择）与就地测试当前仓库。
     const createButton = backdrop.querySelector('#cred-create');
@@ -2185,6 +2307,7 @@ AD.views = {};
       timeout_seconds: Number(value('#f-timeout_seconds') || 1800),
       notify_webhook: value('#f-notify_webhook'),
       skip_if_no_changes: checked('#f-skip_if_no_changes'),
+      webhook_skip_if_no_changes: checked('#f-webhook_skip_if_no_changes'),
     };
 
     // 方式无关的字段在提交时就地清空：界面上切换方式保留输入（可切回），

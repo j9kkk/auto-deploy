@@ -409,6 +409,14 @@ def validate_task_payload(
         out["skip_if_no_changes"] = _clean_bool(
             payload.get("skip_if_no_changes", existing.get("skip_if_no_changes", True)), True
         )
+    if has("webhook_skip_if_no_changes") or not partial:
+        out["webhook_skip_if_no_changes"] = _clean_bool(
+            payload.get(
+                "webhook_skip_if_no_changes",
+                existing.get("webhook_skip_if_no_changes", True),
+            ),
+            True,
+        )
     if has("run_on_create") or not partial:
         out["run_on_create"] = _clean_bool(
             payload.get("run_on_create", existing.get("run_on_create", False)), False
@@ -555,18 +563,35 @@ def _normalise_env_vars(raw: Any) -> tuple[dict[str, str], str | None]:
 
 
 def _parse_lines(text: str) -> dict[str, str] | None:
+    """解析 ``KEY=value`` 或直接粘贴的 ``.env`` 文件内容。
+
+    兼容真实 ``.env`` 的常见写法：
+    * 空行与 ``#`` 注释行跳过；
+    * 允许 ``export KEY=value`` 前缀；
+    * 双引号/单引号包裹的值原样取内部，未加引号的值去掉行尾 `` # 注释``。
+    """
     result: dict[str, str] = {}
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        if stripped.startswith("export ") and "=" in stripped[7:]:
+            stripped = stripped[7:].strip()
         if "=" not in stripped:
             return None
         key, _, value = stripped.partition("=")
         key = key.strip()
         if not key:
             return None
-        result[key] = value.strip().strip('"').strip("'")
+        val = value.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1]
+        else:
+            # 未加引号的行允许出现空白后的 `#` 行尾注释（如 `PORT=8080 # http`）
+            comment_idx = re.search(r"\s+#", val)
+            if comment_idx:
+                val = val[: comment_idx.start()].rstrip()
+        result[key] = val
     return result
 
 

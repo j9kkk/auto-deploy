@@ -850,6 +850,111 @@ def compose_project_name(task: dict[str, Any]) -> str:
     return f"autodeploy-{_safe_task_slug(task.get('name') or '')}"
 
 
+def _format_dotenv(env_vars: Mapping[str, str]) -> str:
+    """将任务环境变量格式化为 ``.env`` 文件内容。"""
+    lines: list[str] = []
+    for key, raw_value in env_vars.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        val = "" if raw_value is None else str(raw_value)
+        if any(ch in val for ch in ('\n', '\r', '"', '#', ' ', '\t', "'")):
+            escaped = val.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+            lines.append(f'{name}="{escaped}"')
+        else:
+            lines.append(f"{name}={val}")
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def _write_dotenv_if_missing(
+    ctx: DeployContext,
+    directories: Sequence[Any],
+) -> list[str]:
+    """当任务配置了环境变量且目标目录缺少 ``.env`` 时，自动写入 ``.env``（权限 0600）。
+
+    为什么在部署阶段（打包之后）执行：
+    * 许多仓库的 ``docker-compose.yml`` 声明了 ``env_file: .env``（或 ``../.env``），
+      而 ``.env`` 属于敏感配置在 ``.gitignore`` 中，每次新建的发布目录里必然不存在；
+    * 在 ``create_bundle`` 打包完成后再落盘，既让 ``docker compose`` 能直接读取
+      ``.env``，又保证 ``artifacts/*.tar.gz`` 产物包里不会混入线上密钥；
+    * 若仓库或准备脚本已自行生成 ``.env``，保持原文件不动，绝不覆盖。
+    """
+    if not ctx.env:
+        return []
+    content = _format_dotenv(ctx.env)
+    if not content:
+        return []
+    target = ctx._exec_target()
+    written: list[str] = []
+    seen: set[str] = set()
+    for directory in directories:
+        dir_str = str(directory or "").rstrip("/")
+        if not dir_str or dir_str in seen:
+            continue
+        seen.add(dir_str)
+        env_path = f"{dir_str}/.env"
+        check_exists = getattr(target, "exists", None)
+        exists = (
+            bool(check_exists(env_path))
+            if callable(check_exists)
+            else (Path(env_path).exists() if not ctx.is_remote else False)
+        )
+        if exists:
+            continue
+        if not ctx.is_remote:
+            path_obj = Path(env_path)
+            path_obj.parent.mkdir(parents=True, exist_ok=True)
+            path_obj.write_text(content, encoding="utf-8")
+            try:
+                path_obj.chmod(0o600)
+            except OSError:
+                pass
+        else:
+            _write_compose_file(ctx, env_path, content)
+            target.run(["chmod", "600", env_path], timeout=15, log=None)
+        written.append(env_path)
+    if written:
+        ctx.log(
+            f"已将任务配置的 {len(ctx.env)} 项环境变量写入 {', '.join(written)}（0600）"
+        )
+    return written
+
+
+def _compose_error_hint(output: str) -> str:
+    """从 ``docker compose`` 失败输出中提取可操作的中文诊断提示。"""
+    text = output or ""
+    lowered = text.lower()
+    env_match = re.search(r"env file\s+([^\s:]+)\s+not found", text, re.IGNORECASE)
+    if env_match or ("env file" in lowered and "no such file or directory" in lowered):
+        missing_path = env_match.group(1) if env_match else ".env"
+        return (
+            f"compose 引用的环境文件不存在（{missing_path}）："
+            "请在任务「高级 → 环境变量」中配置变量（部署时将自动生成 .env），"
+            "或在 compose 文件中将 env_file 设为 required: false"
+        )
+    port_match = re.search(
+        r"(?:bind for [^:]+:(\d+)\s+failed:\s*port is already allocated"
+        r"|:(\d+):\s*bind:\s*address already in use)",
+        text,
+        re.IGNORECASE,
+    )
+    if port_match or "port is already allocated" in lowered or "address already in use" in lowered:
+        port = (port_match.group(1) or port_match.group(2)) if port_match else ""
+        port_desc = f"（端口 {port}）" if port else ""
+        return f"宿主机端口已被占用{port_desc}，请检查是否有其它容器或进程监听该端口"
+    if (
+        "pull access denied" in lowered
+        or "repository does not exist" in lowered
+        or ("manifest for" in lowered and "not found" in lowered)
+    ):
+        return "镜像拉取失败：镜像不存在或私有镜像仓库未登录（可在目标主机先执行 docker login）"
+    if "cannot connect to the docker daemon" in lowered or "is the docker daemon running" in lowered:
+        return "无法连接 Docker 守护进程，请确认目标主机上的 Docker 服务已启动且当前用户有权限访问"
+    if "no space left on device" in lowered:
+        return "目标主机磁盘空间不足（no space left on device），请清理无用镜像或历史数据后重试"
+    return ""
+
+
 def deploy_docker_compose(ctx: DeployContext) -> None:
     """Bring up the compose project from the release directory."""
     target = ctx._exec_target()
@@ -863,6 +968,9 @@ def deploy_docker_compose(ctx: DeployContext) -> None:
     candidate = f"{str(cwd).rstrip('/')}/{compose_file}"
     if not target.exists(candidate):
         raise DeployError(f"发布目录中不存在 compose 文件: {compose_file}")
+
+    compose_dir = str(Path(candidate).parent)
+    _write_dotenv_if_missing(ctx, [cwd, compose_dir])
 
     env = ctx.script_env()
     ctx.log(f"--- 阶段: docker compose up ({compose_file}) ---")
@@ -901,6 +1009,10 @@ def deploy_docker_compose(ctx: DeployContext) -> None:
                     label="compose",
                 )
     if not result.ok:
+        hint = "" if result.cancelled else _compose_error_hint(result.output)
+        if hint:
+            ctx.log(f"! {hint}")
+            raise DeployError(f"docker compose 启动失败: {hint}")
         reason = "已取消" if result.cancelled else (result.error or f"退出码 {result.exit_code}")
         raise DeployError(f"docker compose 启动失败: {reason}")
 
@@ -978,6 +1090,19 @@ def deploy_compose_inline(ctx: DeployContext) -> None:
     ctx.log(f"--- 阶段: 写入 compose 文件 ({compose_path}) ---")
     _write_compose_file(ctx, compose_path, content)
     ctx.log(_COMPOSE_REPO_FREE_NOTE.format(dir=work_dir))
+    if ctx.env:
+        env_path = f"{work_dir}/.env"
+        dotenv_content = _format_dotenv(ctx.env)
+        if dotenv_content:
+            _write_compose_file(ctx, env_path, dotenv_content)
+            if not ctx.is_remote:
+                try:
+                    Path(env_path).chmod(0o600)
+                except OSError:
+                    pass
+            else:
+                target.run(["chmod", "600", env_path], timeout=15, log=None)
+            ctx.log(f"已将任务配置的 {len(ctx.env)} 项环境变量写入 {env_path}（0600）")
 
     env = ctx.script_env()
     base = ["docker", "compose"] if _supports_compose_v2(target) else ["docker-compose"]
@@ -1031,6 +1156,10 @@ def deploy_compose_inline(ctx: DeployContext) -> None:
                     label="compose",
                 )
     if not result.ok:
+        hint = "" if result.cancelled else _compose_error_hint(result.output)
+        if hint:
+            ctx.log(f"! {hint}")
+            raise DeployError(f"docker compose 启动失败: {hint}")
         reason = "已取消" if result.cancelled else (result.error or f"退出码 {result.exit_code}")
         raise DeployError(f"docker compose 启动失败: {reason}")
 

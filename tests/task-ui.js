@@ -912,18 +912,26 @@ async function taskFormUxChecks() {
   assert.equal(triggerSplit.document.querySelector('[data-form-panel="schedule"] #f-enabled'), null,
     '任务总开关不应再出现在定时页');
 
-  // 切到「Webhook」，第一项为启用开关
+  // 切到「Webhook」，第一项为启用开关，且含独立的「代码无变化时跳过部署」开关
   await triggerSplit.click('[data-form-tab="webhook"]');
   assert.equal(triggerSplit.q('[data-form-panel="webhook"]').classList.contains('hidden'), false);
   const firstWebhookInput = triggerSplit.q('[data-form-panel="webhook"] input');
   assert.equal(firstWebhookInput.id, 'f-webhook_enabled', 'Webhook 菜单第一项应为启用开关');
+  const webhookSkipInput = triggerSplit.q('[data-form-panel="webhook"] #f-webhook_skip_if_no_changes');
+  assert.ok(webhookSkipInput, 'Webhook 页应存在独立的代码无变化跳过开关');
+  assert.equal(webhookSkipInput.checked, true, 'Webhook 无变化跳过默认开启');
 
-  // 关闭 Webhook 启用开关并保存
+  // 关闭 Webhook 启用开关与无变化跳过开关并保存（定时跳过开关保持开启）
   firstWebhookInput.checked = false;
-  triggerSplit.enqueue('PUT', '/api/tasks/1', { task: { ...triggerSplit.task, webhook_enabled: false } });
+  webhookSkipInput.checked = false;
+  triggerSplit.enqueue('PUT', '/api/tasks/1', {
+    task: { ...triggerSplit.task, webhook_enabled: false, webhook_skip_if_no_changes: false },
+  });
   await triggerSplit.click('#form-save');
   const putReq = triggerSplit.requests.filter(r => r.method === 'PUT').at(-1);
   assert.equal(putReq.body.webhook_enabled, false, '表单应提交 webhook_enabled 字段');
+  assert.equal(putReq.body.webhook_skip_if_no_changes, false, '表单应提交 webhook_skip_if_no_changes 字段');
+  assert.equal(putReq.body.skip_if_no_changes, true, 'Webhook 跳过开关不应影响定时跳过开关');
   assert.equal(putReq.body.enabled, true, '表单应提交任务总开关字段');
   assert.equal(putReq.body.schedule_enabled, true, '表单应提交定时开关字段');
   triggerSplit.finish();

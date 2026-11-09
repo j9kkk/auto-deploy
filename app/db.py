@@ -17,7 +17,7 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from . import config
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # 调度索引单独成段：init_schema 在迁移之后统一执行，保证列集与最新 schema 一致。
 TASKS_INDEX_SQL = """
@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     timeout_seconds          INTEGER NOT NULL DEFAULT 1800,
     notify_webhook           TEXT    NOT NULL DEFAULT '',
     skip_if_no_changes       INTEGER NOT NULL DEFAULT 1,
+    webhook_skip_if_no_changes INTEGER NOT NULL DEFAULT 1,
     run_on_create            INTEGER NOT NULL DEFAULT 0,
 
     created_at               TEXT    NOT NULL,
@@ -384,6 +385,8 @@ class Database:
             self._migrate_v12_to_v13(conn)
         if current < 14:
             self._migrate_v13_to_v14(conn)
+        if current < 15:
+            self._migrate_v14_to_v15(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, datetime('now'))",
             (SCHEMA_VERSION,),
@@ -464,6 +467,18 @@ class Database:
                     "UPDATE audit_logs SET ip_location = ? WHERE ip = ? AND ip_location = ''",
                     (seen[ip], ip),
                 )
+
+    def _migrate_v14_to_v15(self, conn: sqlite3.Connection) -> None:
+        """v15: Webhook 触发拆出独立的「代码无变化时跳过部署」开关。
+
+        v15 之前 ``skip_if_no_changes`` 同时控制定时/手动与 Webhook 触发；
+        拆出 ``webhook_skip_if_no_changes`` 后，Webhook 与定时触发各自独立生效。
+        存量任务按原 ``skip_if_no_changes`` 回填，升级后既有 Webhook 行为保持不变。
+        """
+        self._add_column(
+            conn, "tasks", "webhook_skip_if_no_changes", "INTEGER NOT NULL DEFAULT 1"
+        )
+        conn.execute("UPDATE tasks SET webhook_skip_if_no_changes = skip_if_no_changes")
 
     def _migrate_v7_to_v8(self, conn: sqlite3.Connection) -> None:
         """v8: 新增远程主机表 hosts，并给任务/运行补主机维度。
@@ -734,6 +749,7 @@ def decode_task(row: dict[str, Any] | None) -> dict[str, Any] | None:
     task["schedule_enabled"] = bool(task.get("schedule_enabled", 1))
     task["webhook_enabled"] = bool(task.get("webhook_enabled", 1))
     task["skip_if_no_changes"] = bool(task.get("skip_if_no_changes"))
+    task["webhook_skip_if_no_changes"] = bool(task.get("webhook_skip_if_no_changes", 1))
     task["run_on_create"] = bool(task.get("run_on_create"))
     raw_env = task.get("env_vars") or "{}"
     try:
